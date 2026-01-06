@@ -109,5 +109,42 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 *   Depth Anything V2 by TikTok/ByteDance.
 *   ACE-Zero by Niantic Labs.
 
+## 📑 BibTeX & Citations
+
+If you use HyperSplat or its components in your research, please cite the following original works:
+
+```bibtex
+@article{kerbl3Dgaussians,
+    author={Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
+    title={3D Gaussian Splatting for Real-Time Radiance Field Rendering},
+    journal={ACM Transactions on Graphics},
+    year={2023},
+    volume={42},
+    number={4}
+}
+
+@article{gsplat2023,
+    title={gsplat: An Open-Source Library for Gaussian Splatting},
+    author={Ye, Vickie and Fan, Ziyi and Kanazawa, Angjoo and others},
+    journal={GitHub Repository},
+    year={2023},
+    url={https://github.com/nerfstudio-project/gsplat}
+}
+
+@article{yang2024depth,
+    title={Depth Anything V2: Monocular Depth Estimation is All You Need},
+    author={Yang, Lihe and Kang, Bingyi and Huang, Zilong and Xu, Xiaogang and Feng, Jiashi and Zhao, Hengshuang},
+    journal={arXiv preprint arXiv:2406.09414},
+    year={2024}
+}
+
+@inproceedings{brachmann2024acezero,
+    title={ACE-Zero: Parallelized Acceleration of Camera Estimation},
+    author={Brachmann, Eric and Cavallari, Tommaso and Niessner, Matthias},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2024}
+}
+```
+
 ---
 *Created for the SIH 2025 Professional Competition. Re-engineered for high-velocity spatial generation.*
