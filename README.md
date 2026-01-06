@@ -144,6 +144,20 @@ If you use HyperSplat or its components in your research, please cite the follow
     booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
     year={2024}
 }
+
+@article{wu2025dgut,
+    title={3DGUT: Enabling Distorted Cameras and Secondary Rays in Gaussian Splatting},
+    author={Wu, Qi and Martinez Esturo, Janick and Mirzaei, Ashkan and Moenne-Loccoz, Nicolas and Gojcic, Zan},
+    journal={CVPR},
+    year={2025}
+}
+
+@article{moenneloccoz2024grt,
+    title={3D Gaussian Ray Tracing: Fast Tracing of Particle Scenes},
+    author={Moenne-Loccoz, Nicolas and Mirzaei, Ashkan and Perel, Or and De Lutio, Riccardo and Martinez Esturo, Janick and State, Gavriel and Fidler, Sanja and Sharp, Nicholas and Gojcic, Zan},
+    journal={SIGGRAPH Asia},
+    year={2024}
+}
 ```
 
 ---
