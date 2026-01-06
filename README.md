@@ -27,12 +27,21 @@ The **HyperSplat Interactive Demo** provides a WebSocket-powered web interface. 
 
 HyperSplat uses a dual-environment strategy to maximize compatibility between Windows hosts and WSL2.
 
-### Prerequisites
-*   **Windows 10/11** with **WSL2** (Ubuntu 22.04 recommended).
-*   **NVIDIA GPU** with 8GB+ VRAM (e.g., RTX 30/40 series).
-*   **Conda** or **Miniconda** installed.
+### 🪄 One-Click Setup (Recommended)
+We provide a unified script that automatically builds both the Windows (`hypersplat`) and WSL (`ace0`) environments.
+1.  Ensure you have **Conda** installed and **WSL2** enabled.
+2.  Run the setup script from your Windows terminal:
+    ```powershell
+    ./setup_env.bat
+    ```
+    *Follow the on-screen prompts. The script will handle all dependency resolution.*
 
-### Step 1: Main Reconstruction Environment (Windows)
+---
+
+### Manual Setup (Alternative)
+If you prefer to configure environments manually:
+
+#### Step 1: Main Reconstruction Environment (Windows)
 This environment handles the training engine, RAG indexing, and the UI server.
 ```powershell
 conda create -n hypersplat python=3.10 -y
@@ -48,7 +57,7 @@ pip install -e .
 pip install -r examples/requirements.txt
 ```
 
-### Step 2: Pose Estimation Environment (WSL2)
+#### Step 2: Pose Estimation Environment (WSL2)
 This environment handles the ACE-Zero scripts inside the Linux kernel for maximum speed.
 ```bash
 # Inside your WSL2 terminal
