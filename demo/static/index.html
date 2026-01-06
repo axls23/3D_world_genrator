@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GSplat Pro | Advanced 3D Pipeline</title>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <!-- Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Styles -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="icon-wrapper">
+                    <i class="fa-solid fa-cube"></i>
+                </div>
+                <span>GSplat <span class="highlight">Pro</span></span>
+            </div>
+
+            <nav class="nav-menu">
+                <div class="nav-item active" data-tab="dashboard">
+                    <i class="fa-solid fa-gauge-high"></i>
+                    <span>Dashboard</span>
+                </div>
+                <div class="nav-item" data-tab="checkpoints">
+                    <i class="fa-solid fa-layer-group"></i>
+                    <span>Checkpoints</span>
+                </div>
+                <div class="nav-item" data-tab="renders">
+                    <i class="fa-solid fa-image"></i>
+                    <span>Renders</span>
+                </div>
+                <div class="nav-item" data-tab="settings">
+                    <i class="fa-solid fa-sliders"></i>
+                    <span>Settings</span>
+                </div>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="server-status">
+                    <div class="status-indicator online"></div>
+                    <span>Server Online</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="top-bar">
+                <div class="breadcrumbs">
+                    <span class="crumb-root">Pipeline</span>
+                    <i class="fa-solid fa-chevron-right"></i>
+                    <span class="crumb-current activity-name">Dashboard</span>
+                </div>
+                <div class="actions">
+                    <button id="upload-btn" class="btn btn-secondary">
+                        <i class="fa-solid fa-cloud-arrow-up"></i> Upload Video
+                    </button>
+                    <input type="file" id="video-upload" hidden accept="video/*">
+                </div>
+            </header>
+
+            <!-- Content Area -->
+            <div class="content-wrapper">
+                
+                <!-- Status Cards -->
+                <div class="kpi-grid">
+                    <div class="kpi-card" id="status-card">
+                        <div class="card-header">
+                            <span class="label">Status</span>
+                            <i class="fa-solid fa-wave-square icon"></i>
+                        </div>
+                        <div class="value" id="status-value">Idle</div>
+                        <div class="subtext">Pipeline ready</div>
+                    </div>
+                    
+                    <div class="kpi-card">
+                        <div class="card-header">
+                            <span class="label">Progress</span>
+                            <i class="fa-solid fa-spinner icon"></i>
+                        </div>
+                        <div class="value" id="progress-value">0%</div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="progress-bar-fill"></div>
+                        </div>
+                    </div>
+
+                    <div class="kpi-card">
+                        <div class="card-header">
+                            <span class="label">Mode</span>
+                            <i class="fa-solid fa-microchip icon"></i>
+                        </div>
+                        <div class="value" id="mode-value">ACE-Zero</div>
+                        <div class="subtext">Level 2 Pipeline</div>
+                    </div>
+                    
+                    <div class="kpi-card action-card">
+                        <button id="train-btn" class="btn btn-primary full-width" disabled>
+                            <i class="fa-solid fa-bolt"></i> Start Training
+                        </button>
+                        <button id="stop-btn" class="btn btn-danger full-width hidden">
+                            <i class="fa-solid fa-stop"></i> Stop
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Split View: Visualizer & Terminal -->
+                <div class="split-view">
+                    <!-- Visualizer -->
+                    <div class="panel visualizer-panel">
+                        <div class="panel-header">
+                            <div class="title">
+                                <i class="fa-solid fa-eye"></i> 3D Viewport
+                            </div>
+                            <div class="controls">
+                                <button id="launch-viewer-btn" class="btn btn-sm btn-outline">
+                                    <i class="fa-solid fa-external-link-alt"></i> Launch Viewer
+                                </button>
+                            </div>
+                        </div>
+                        <div class="panel-body video-container">
+                            <div id="placeholder-view" class="placeholder">
+                                <i class="fa-solid fa-cube fa-3x"></i>
+                                <p>No Active Session</p>
+                                <span class="hint">Upload a video and start training to see results</span>
+                            </div>
+                            <iframe id="viewer-frame" src="" frameborder="0" class="hidden"></iframe>
+                        </div>
+                    </div>
+
+                    <!-- Terminal -->
+                    <div class="panel terminal-panel">
+                        <div class="panel-header">
+                            <div class="title">
+                                <i class="fa-solid fa-terminal"></i> Pipeline Logs
+                            </div>
+                            <div class="controls">
+                                <span class="badge" id="log-count">0 lines</span>
+                                <button id="clear-logs-btn" class="btn-icon" title="Clear Logs">
+                                    <i class="fa-solid fa-trash-can"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="panel-body terminal-body" id="terminal-output">
+                            <div class="log-line system">Waiting for process...</div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Scripts -->
+    <script src="script.js"></script>
+</body>
+</html>
