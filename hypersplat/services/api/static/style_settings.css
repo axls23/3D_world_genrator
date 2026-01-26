@@ -1,0 +1,70 @@
+/* ... existing styles ... */
+
+/* Settings Panel */
+.settings-panel {
+    margin-bottom: 24px;
+    flex-shrink: 0;
+}
+
+.settings-grid {
+    padding: 20px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 16px;
+    align-items: end;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.form-group label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.form-group input[type="number"],
+.form-group input[type="text"],
+.form-group select {
+    background-color: #0d1117;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text-primary);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.9rem;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    border-color: var(--accent-primary);
+}
+
+.form-group.full-width {
+    grid-column: 1 / -1;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    user-select: none;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent-primary);
+    background-color: #0d1117;
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+}
