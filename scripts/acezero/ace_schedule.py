@@ -1,4 +1,5 @@
 import logging
+import torch
 from torch import optim
 from torch.cuda.amp import GradScaler
 
@@ -12,7 +13,13 @@ class ScheduleACE:
     def __init__(self, ace_network, options):
 
         # Setup optimization parameters.
-        self.optimizer = optim.AdamW(ace_network.parameters(), lr=options.learning_rate_min)
+        # [OPTIMIZATION] Use FusedAdamW on CUDA for specific speedup
+        # [OPTIMIZATION] Tuned betas (0.9, 0.95) for faster convergence in reduced iteration regimes
+        use_fused = torch.cuda.is_available()
+        self.optimizer = optim.AdamW(ace_network.parameters(), 
+                                     lr=options.learning_rate_min,
+                                     betas=(0.9, 0.95),
+                                     fused=use_fused)
 
         if options.learning_rate_schedule not in ["circle", "constant", "1cyclepoly"]:
             raise ValueError(f"Unknown learning rate schedule: {options.learning_rate_schedule}")

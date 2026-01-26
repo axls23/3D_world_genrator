@@ -1,0 +1,34 @@
+services:
+  gsplat-server:
+    build: .
+    image: gsplat-pipeline:latest
+    container_name: gsplat-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      # Expose visualization port (if needed)
+      - "8092:8092"
+    volumes:
+      # Persist output data
+      - ./demo/output:/app/demo/output
+      # Mount inputs if needed (optional)
+      # - ./inputs:/app/inputs
+      # Cache huggingface models
+      - hf_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - MAX_JOBS=4 # Limit build parallelism to avoid OOM
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    command: python demo/demo_server.py
+
+volumes:
+  hf_cache:
+  torch_cache:

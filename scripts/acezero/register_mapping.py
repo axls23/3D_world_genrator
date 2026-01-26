@@ -3,9 +3,9 @@
 
 import os
 
-os.environ["MKL_NUM_THREADS"] = "12"  # noqa: E402
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "16")  # noqa: E402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa: E402
-os.environ["OMP_NUM_THREADS"] = "12"  # noqa: E402
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "16")  # noqa: E402
 os.environ["OPENBLAS_NUM_THREADS"] = "1"  # noqa: E402
 
 import dataset_io

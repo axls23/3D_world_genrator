@@ -1,0 +1,113 @@
+OAL: Build a DQN Director Agent for Iterative 3DGS-GeNVS Reconstruction that automatically discovers optimal interpolation strategies
+
+You are implementing a reinforcement learning agent (DQN) that governs the iterative refinement loop between 3D Gaussian Splatting (3DGS) reconstruction and Generative Novel View Synthesis (GeNVS). The agent replaces hardcoded rules for Random vs. Deterministic interpolation by learning context-sensitive policies that balance speed and fidelity.
+
+ Core Objective
+Train a DQN that decides when and how to generate synthetic views to fill gaps in sparse camera data, maximizing reconstruction quality while minimizing compute cost.
+
+ MDP Formulation (Implement First)
+text
+STATE (Input to DQN): 32-dim vector
+├── 8-dim: Uncertainty map statistics (variance, entropy of Gaussians in largest gap)
+├── 4-dim: Training progress (step/1000, PSNR trend, loss delta)  
+├── 8-dim: Geometric health (floater count, opacity entropy, Gaussian sparsity)
+├── 8-dim: Dataset coverage (angular gaps, view density histogram)
+└── 4-dim: Recent action history (last 4 actions one-hot encoded)
+
+ACTIONS (4 discrete choices):
+0: "DETERMINISTIC_FILL" - Generate exact midpoint between largest gap
+1: "RANDOM_JITTER"     - Generate random t∈[0.3,0.7] between neighbors  
+2: "PURGE_WORST_VIEW"  - Remove the view causing highest reconstruction loss
+3: "WAIT_FINE_TUNE"    - Do nothing, let 3DGS train 100 more iterations
+
+ENVIRONMENT: Your 3DGS+GeNVS training loop
+EPISODE: 5000 training steps or PSNR>35dB
+ CRITICAL: Reward Function (Bake This In FIRST)
+python
+def compute_reward(state_before, state_after, action_taken):
+    # 1. FIDELITY GAIN (Primary signal - 80% weight)
+    psnr_gain = (state_after['psnr'] - state_before['psnr']) * 100.0
+    
+    # 2. EFFICIENCY COST (Prevents over-generation - 15% weight)
+    action_costs = {
+        0: -0.5,  # Deterministic (fast)
+        1: -5.0,  # Random (expensive GeNVS)
+        2: -1.0,  # Purge (moderate)
+        3: -0.1   # Wait (nearly free)
+    }
+    compute_cost = action_costs[action_taken]
+    
+    # 3. ARTIFACT PENALTY (Prevents cheating - 5% weight)
+    artifact_penalty = state_after['floater_count'] * 0.5 + state_after['opacity_entropy'] * 2.0
+    
+    # COMPOSITE REWARD
+    return psnr_gain + compute_cost - artifact_penalty
+DQN Architecture (PyTorch Implementation)
+python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import random
+
+class DQN(nn.Module):
+    def __init__(self, state_dim=32, action_dim=4, hidden_dim=256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(), 
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, action_dim)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+# Training components
+q_network = DQN()
+target_network = DQN()
+optimizer = optim.Adam(q_network.parameters(), lr=1e-4)
+replay_buffer = deque(maxlen=10000)
+epsilon = 1.0  # Exploration starts high
+Training Loop Structure
+text
+Episode Structure:
+1. Reset 3DGS model to initial sparse views
+2. For t=1 to 5000:
+   a. Extract state vector from current 3DGS
+   b. DQN selects action ε-greedy
+   c. Execute action (generate/purge/wait)
+   d. Train 3DGS for 50 iterations
+   e. Extract next_state, compute_reward()
+   f. Store (state, action, reward, next_state) in replay_buffer
+   g. Sample mini-batch, train DQN with TD-targets
+3. Episode ends when PSNR>35 or t>5000
+Expected Agent Behavior (Emerges from Rewards)
+text
+Early Training (0-1000 steps): 
+→ SPAMS "DETERMINISTIC_FILL" to build basic geometry fast
+
+Mid Training (1000-3000 steps):
+→ Switches to "RANDOM_JITTER" when detecting reflective surfaces/uncertainty
+
+Late Training (3000+ steps):
+→ Learns "PURGE_WORST_VIEW" to remove early hallucinations
+→ Defaults to "WAIT_FINE_TUNE" (lazy/efficient)
+🚀 Success Metrics
+Primary: Final PSNR >34dB with <200 synthetic views generated
+
+Secondary: Training completes in <24 GPU hours
+
+Tertiary: Zero visible floaters in final render
+
+⚠️ Implementation Priority
+text
+1. ✅ Reward function (most important - shapes all behavior)
+2. ✅ State extraction (uncertainty maps from 3DGS density field)
+3. ✅ PyTorch DQN + replay buffer
+4. ✅ 3DGS-GeNVS environment wrapper
+5. ❌ Hyperparameter tuning (comes last)
+The agent will discover that "less is more" - generating 50 smart views beats 5000 dumb ones.

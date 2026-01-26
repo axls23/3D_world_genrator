@@ -8,7 +8,55 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from pycolmap import SceneManager
+import pycolmap
+try:
+    if hasattr(pycolmap, "SceneManager"):
+        SceneManager = pycolmap.SceneManager
+    elif hasattr(pycolmap, "scene_manager") and hasattr(pycolmap.scene_manager, "SceneManager"):
+        SceneManager = pycolmap.scene_manager.SceneManager
+    else:
+        from pycolmap import SceneManager
+except ImportError:
+    # Shim for newer pycolmap versions where SceneManager was renamed/removed
+    class SceneManager:
+        def __init__(self, colmap_dir):
+            import pycolmap
+            self.reconstruction = pycolmap.Reconstruction(colmap_dir)
+            self.cameras = self.reconstruction.cameras
+            self.images = self.reconstruction.images
+            self.points3D_dict = self.reconstruction.points3D
+            
+        def load_cameras(self): pass
+        def load_images(self): pass
+        def load_points3D(self): pass
+        
+        @property
+        def points3D(self):
+            return np.array([p.xyz for p in self.points3D_dict.values()])
+        
+        @property
+        def point3D_errors(self):
+            return np.array([p.error for p in self.points3D_dict.values()])
+            
+        @property
+        def point3D_colors(self):
+            return np.array([p.color for p in self.points3D_dict.values()])
+
+        @property
+        def name_to_image_id(self):
+            return {im.name: im_id for im_id, im in self.images.items()}
+
+        @property
+        def point3D_id_to_images(self):
+             # Simplified mapping for shim
+             res = {}
+             for p_id, p in self.points3D_dict.items():
+                 res[p_id] = [(tr.image_id, tr.point2D_idx) for tr in p.track.elements]
+             return res
+             
+        @property
+        def point3D_id_to_point3D_idx(self):
+            return {p_id: i for i, p_id in enumerate(self.points3D_dict.keys())}
 from tqdm import tqdm
 from typing_extensions import assert_never
 
@@ -67,7 +115,11 @@ class Parser:
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
+        self.normalize = normalize
         self.test_every = test_every
+        
+        # [GeNVS] In-Memory Injection
+        self.tensor_cache = {}  # index -> dict (pre-processed data)
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -400,6 +452,56 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
+        
+        # [GeNVS] Check for In-Memory Data first
+        if index in self.parser.tensor_cache:
+            # Return cached data directly (skip disk IO)
+            # CLONE tensors to avoid computational graph leakage between steps
+            cached_item = self.parser.tensor_cache[index]
+            data = {}
+            for k, v in cached_item.items():
+                if isinstance(v, torch.Tensor):
+                    data[k] = v.clone()
+                else:
+                    data[k] = v
+            
+            data['image_id'] = item # Update image_id to match current dataset index
+            
+            # [GeNVS] Handle depth-only supervision
+            if self.load_depths and "genvs_depth" in data:
+                depth_map = data["genvs_depth"] # [1, H, W]
+                if isinstance(depth_map, torch.Tensor):
+                    depth_map = depth_map.detach().cpu().numpy()
+                
+                # Squeeze to (H, W) if needed
+                if depth_map.ndim == 3:
+                     depth_map = depth_map[0]
+                
+                # Placeholder image resolution
+                img_h, img_w = data["image"].shape[:2]
+                
+                # Resize depth map to match image resolution if needed
+                if depth_map.shape[0] != img_h or depth_map.shape[1] != img_w:
+                    # Use INTER_NEAREST to avoid artifacts in depth
+                    depth_map = cv2.resize(depth_map, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                
+                # Sample pixels for supervision
+                num_samples = min(2000, img_h * img_w) # Increased sampling for better geometry
+                indices = np.random.choice(img_h * img_w, num_samples, replace=False)
+                ys, xs = np.unravel_index(indices, (img_h, img_w))
+                
+                # Final safeguard against OOB
+                ys = np.clip(ys, 0, depth_map.shape[0] - 1)
+                xs = np.clip(xs, 0, depth_map.shape[1] - 1)
+                
+                points = np.stack([xs, ys], axis=-1).astype(np.float32) 
+                depths = depth_map[ys, xs].astype(np.float32)
+                
+                data["points"] = torch.from_numpy(points).float()
+                data["depths"] = torch.from_numpy(depths).float()
+                
+            return data
+            
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K

@@ -220,47 +220,72 @@ def get_depth_model(init=False, model_type='depth_anything'):
             _logger.info("Loading Depth Anything V2 (fast mode ~30ms/frame)...")
             from pathlib import Path
             
-            # Try loading via depth_anything_v2 package
+            # Option 1: Try transformers pipeline (most reliable in Docker)
             try:
-                from depth_anything_v2.dpt import DepthAnythingV2
-                model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
-                model = DepthAnythingV2(**model_configs['vits'])
-                
-                # Download weights if needed
-                weights_path = Path.home() / ".cache" / "depth_anything_v2" / "depth_anything_v2_vits.pth"
-                if not weights_path.exists():
-                    weights_path.parent.mkdir(parents=True, exist_ok=True)
-                    url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth"
-                    _logger.info("Downloading Depth Anything V2 weights...")
-                    torch.hub.download_url_to_file(url, str(weights_path))
-                
-                model.load_state_dict(torch.load(weights_path, map_location='cpu'))
-                model = model.to('cuda').eval()
-                model._is_depth_anything = True  # Tag for estimate_depth
-                _logger.info("Depth Anything V2 loaded successfully!")
-                return model
-                
-            except ImportError:
-                _logger.info("depth_anything_v2 package not found, trying transformers...")
                 from transformers import pipeline
+                _logger.info("Attempting load via transformers pipeline...")
                 model = pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf", device=0)
                 model._is_depth_anything = True
                 model._is_transformers = True
                 _logger.info("Depth Anything V2 loaded via transformers!")
                 return model
+            except Exception as e:
+                _logger.info(f"Transformers load failed: {e}. Trying standalone package...")
+
+            # Option 2: Try loading via depth_anything_v2 package
+            from depth_anything_v2.dpt import DepthAnythingV2
+            model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
+            model = DepthAnythingV2(**model_configs['vits'])
+            
+            # Download weights if needed
+            weights_path = Path.home() / ".cache" / "depth_anything_v2" / "depth_anything_v2_vits.pth"
+            if not weights_path.exists():
+                weights_path.parent.mkdir(parents=True, exist_ok=True)
+                url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth"
+                _logger.info("Downloading Depth Anything V2 weights...")
+                torch.hub.download_url_to_file(url, str(weights_path))
+            
+            model.load_state_dict(torch.load(weights_path, map_location='cpu'))
+            model = model.to('cuda').eval()
+            model._is_depth_anything = True
+            _logger.info("Depth Anything V2 loaded via standalone package!")
+            return model
                 
         except Exception as e:
             _logger.warning(f"Depth Anything V2 failed: {e}. Falling back to ZoeDepth...")
     
     # Fallback: ZoeDepth (slower but metric depth)
     _logger.info("Loading ZoeDepth model...")
-    torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo="check")
-    repo = "isl-org/ZoeDepth"
-    model_zoe_nk = torch.hub.load(repo, "ZoeD_NK", pretrained=True, force_reload=init, trust_repo="check")
-    model_zoe_nk.eval().cuda()
-    model_zoe_nk._is_depth_anything = False
-    _logger.info("ZoeDepth loaded (fallback).")
-    return model_zoe_nk
+    try:
+        # MiDaS dependency
+        torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=init, trust_repo=True)
+        repo = "isl-org/ZoeDepth"
+        
+        # We try to load ZoeDepth. If it fails due to state_dict mismatch (common with new timm versions),
+        # we catch the error and try a different approach if possible.
+        try:
+             model_zoe_nk = torch.hub.load(repo, "ZoeD_NK", pretrained=True, force_reload=init, trust_repo=True)
+        except RuntimeError as e:
+             if "Unexpected key(s) in state_dict" in str(e) and "relative_position_index" in str(e):
+                 _logger.warning("Caught known ZoeDepth state_dict mismatch. Attempting robust load...")
+                 # Load without weights first
+                 model_zoe_nk = torch.hub.load(repo, "ZoeD_NK", pretrained=False, trust_repo=True)
+                 # Manually download and load state dict with strict=False
+                 # The URL is usually embedded in the model or found in hubconf.py
+                 checkpoint_url = "https://github.com/isl-org/ZoeDepth/releases/download/v1.0/ZoeD_M12_NK.pt"
+                 state_dict = torch.hub.load_state_dict_from_url(checkpoint_url, map_location='cpu')
+                 model_zoe_nk.load_state_dict(state_dict, strict=False)
+                 _logger.info("ZoeDepth loaded successfully with strict=False fallback.")
+             else:
+                 raise e
+                 
+        model_zoe_nk.eval().cuda()
+        model_zoe_nk._is_depth_anything = False
+        _logger.info("ZoeDepth loaded.")
+        return model_zoe_nk
+    except Exception as e:
+        _logger.error(f"Critical Failure: Could not load ANY depth model. {e}")
+        raise e
 
 
 def estimate_depth(model: torch.nn.Module, image_rgb: np.ndarray, image_path: str = None) -> np.ndarray:

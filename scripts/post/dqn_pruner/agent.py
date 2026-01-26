@@ -6,24 +6,32 @@ import numpy as np
 class QNetwork(nn.Module):
     def __init__(self, state_dim, hidden_dim, action_dim):
         super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, action_dim)
+        # Director Agent Architecture from insights
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(), 
+            nn.Linear(hidden_dim, hidden_dim//2), # 256 -> 128
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, action_dim)
+        )
         
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        return self.fc4(x)
+        return self.network(x)
 
 class DQNAgent:
     def __init__(self, config):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() and config.USE_GPU else 'cpu')
         
-        self.q_net = QNetwork(config.INPUT_DIM, config.HIDDEN_DIM, config.ACTION_DIM).to(self.device)
-        self.q_net.eval() # Inference mode by default
+        # Dimensions from insights: State=32, Action=4, Hidden=256
+        input_dim = getattr(config, 'INPUT_DIM', 32)
+        hidden_dim = getattr(config, 'HIDDEN_DIM', 256)
+        action_dim = getattr(config, 'ACTION_DIM', 4)
+        
+        self.q_net = QNetwork(input_dim, hidden_dim, action_dim).to(self.device)
+        self.q_net.eval()
         
     def load(self, path):
         if torch.cuda.is_available():
@@ -31,19 +39,20 @@ class DQNAgent:
         else:
             self.q_net.load_state_dict(torch.load(path, map_location='cpu'))
             
-    def predict(self, states):
-        # Process in batches to avoid OOM
-        batch_size = self.config.BATCH_SIZE
-        actions = []
-        
+    def predict(self, state_tensor):
+        """
+        Predict action index for a single state or batch.
+        state_tensor: [Batch, 32] or [32]
+        """
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+            
         with torch.no_grad():
-            for i in range(0, len(states), batch_size):
-                batch = states[i:i+batch_size]
-                q_values = self.q_net(batch)
-                batch_actions = torch.argmax(q_values, dim=1)
-                actions.append(batch_actions)
-                
-        return torch.cat(actions)
+            state_tensor = state_tensor.to(self.device)
+            q_values = self.q_net(state_tensor)
+            action_idx = torch.argmax(q_values, dim=1)
+            
+        return action_idx
 
 class HeuristicAgent:
     """

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import imageio
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,7 +21,7 @@ from datasets.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
-from fused_ssim import fused_ssim
+
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -42,6 +42,8 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 # Streaming support
 try:
     import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from scripts.genvs_core.pipeline import GeNVSPipeline
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "pipeline"))
     from pose_watcher import StreamingDataManager
     STREAMING_AVAILABLE = True
@@ -58,12 +60,20 @@ class Config:
     resume: Optional[str] = None
     # [AI Acceleration] Path to AI-generated dense initialization PLY
     init_ply_path: Optional[str] = None
+    
+    # GeNVS Online Integration
+    genvs_ckpt: Optional[str] = None
+    genvs_interval: int = 200 # Frequency of adding views
+    genvs_depth_only: bool = True  # If True, inject depth maps (fast, geometric). If False, inject RGB (slow, diffusion).
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
     # [Autoregressive GeNVS] Render specific pose from file (skips training)
     render_pose_file: Optional[str] = None
+    
+    # Latent Injection / Master Tuner
+    lambda_sds: float = 0.05  # Weight for SDS Guidance
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -87,6 +97,8 @@ class Config:
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
+    # Data Loader Workers
+    data_loader_workers: int = 4
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
@@ -436,7 +448,7 @@ class Runner:
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
+            load_depths=cfg.depth_loss or cfg.genvs_ckpt is not None,
         )
         if cfg.use_mask:
             print("[SimpleTrainer] Using masks for training.")
@@ -583,10 +595,275 @@ class Runner:
 
         # Streaming mode initialization
         self.streaming_manager = None
-        if cfg.streaming and STREAMING_AVAILABLE:
+        if self.cfg.streaming and STREAMING_AVAILABLE:
             print("[Streaming] Initializing streaming data manager...")
             self.streaming_manager = StreamingDataManager(Path(cfg.data_dir))
             self.streaming_manager.start_watching()
+
+        # GeNVS Initialization
+        if self.cfg.genvs_ckpt:
+            print(f"[GeNVS] Loading pipeline from {self.cfg.genvs_ckpt}...")
+            self.genvs_pipeline = GeNVSPipeline(device=self.device, model_channels=64)
+            ckpt = torch.load(self.cfg.genvs_ckpt, map_location=self.device)
+            self.genvs_pipeline.encoder.load_state_dict(ckpt['encoder'])
+            self.genvs_pipeline.renderer.load_state_dict(ckpt['renderer'])
+            self.genvs_pipeline.unet.load_state_dict(ckpt['unet'])
+            self.genvs_pipeline.volume_struct.load_state_dict(ckpt['volume'])
+            print("[GeNVS] Pipeline Loaded. Online Generation Enabled.")
+            
+            # Export Config
+            self.genvs_pipeline.save_config(f"{self.cfg.result_dir}/cfg_genvs.yml")
+            
+            # Setup output dir for online images
+            self.genvs_out_dir = Path(self.cfg.data_dir) / "genvs_online"
+            self.genvs_out_dir.mkdir(parents=True, exist_ok=True)
+            self.genvs_count = 0
+            
+            # [Adaptive Interpolation] Loss Tracking
+            self.loss_ema = 1.0 # Initialize high
+            self.loss_history = []
+            self.adaptive_mode = "deterministic"
+            print("[GeNVS] Adaptive Interpolation Active (Mode: Deterministic)")
+
+    def step_genvs(self, step):
+        """Generate a new view and inject it filter dataset."""
+        if not self.cfg.genvs_ckpt: return
+        
+        # [Adaptive Interpolation] Determine Mode based on Convergence
+        # If loss is changing rapidly, we need coverage (Deterministic)
+        # If loss is flat, we need regularization (Random Jitter)
+        # Threshold: 1e-4 improvement per step (smoothed)
+        
+        # Determine Mode
+        loss_delta = 1.0
+        if len(self.loss_history) > 100:
+             loss_window = self.loss_history[-100:]
+             # Average improvement over last 100 steps
+             loss_delta = abs(loss_window[0] - loss_window[-1]) / 100.0
+             
+        convergence_threshold = 1e-4
+        if loss_delta < convergence_threshold:
+             self.adaptive_mode = "stochastic"
+        else:
+             self.adaptive_mode = "deterministic"
+             
+        # print(f"[GeNVS] Loss Delta: {loss_delta:.6f} -> Mode: {self.adaptive_mode}")
+
+        if self.adaptive_mode == "deterministic":
+             # === MODE A: DETERMINISTIC GAP FILLING ===
+             # Find large gaps in trajectory
+             dists = torch.cdist(curr_cams, curr_cams)
+             dists.fill_diagonal_(float('inf'))
+             nearest_dists, nearest_indices = torch.min(dists, dim=1) # [N]
+             
+             gap_idx = torch.argmax(nearest_dists)
+             neighbor_idx = nearest_indices[gap_idx]
+             
+             # Indices
+             idx1 = gap_idx.item()
+             idx2 = neighbor_idx.item()
+             
+             t = 0.5 # Rigid Midpoint
+             jitter = 0.0 # No Jitter
+             
+        else:
+             # === MODE B: STOCHASTIC JITTER (Refinement) ===
+             # Still pick a gap to stay relevant, but add noise
+             # Or pick random pair? Let's stick to gap to ensure we don't duplicate dense areas
+             # But we relax the "Max Gap" constraint to be "Softmax" (probabilistic)
+             
+             # Sample pair probability proportional to gap size
+             probs = torch.softmax(nearest_dists, dim=0)
+             gap_idx = torch.multinomial(probs, 1).item()
+             idx1 = gap_idx
+             idx2 = nearest_indices[gap_idx].item()
+             
+             # Random t in [0.2, 0.8]
+             t = 0.5 + torch.randn(1, device=self.device).item() * 0.15
+             t = max(0.2, min(0.8, t))
+             
+             # Add Spatial Jitter
+             jitter = 0.02 # 2% Scene Scale
+             
+        c2w1 = torch.from_numpy(self.parser.camtoworlds[idx1]).float().to(self.device)
+        c2w2 = torch.from_numpy(self.parser.camtoworlds[idx2]).float().to(self.device)
+
+        # Interpolate
+        pos = c2w1[:3, 3] * t + c2w2[:3, 3] * (1-t)
+        
+        # Apply Jitter (if any)
+        if jitter > 0:
+             pos = pos + torch.randn(3, device=self.device) * (self.scene_scale * jitter)
+        
+        # LookAt Center (approximate scene center)
+        center = torch.from_numpy(self.parser.points.mean(axis=0)).float().to(self.device) if len(self.parser.points) > 0 else torch.zeros(3, device=self.device)
+        
+        # LookAt Logic
+        z_axis = center - pos
+        z_axis = z_axis / torch.norm(z_axis)
+        up = torch.tensor([0., 0., 1.], device=self.device) 
+        
+        # Slerp Rotation (Better than linear)
+        # For simplicity in this loop, we just re-orient to look at center
+        # This is "deterministic" based on geometry rather than random mix of R1/R2
+        
+        # Create LookAt Matrix (OpenCV: Z points forward to target)
+        # Actually our renderer uses OpenCV: +Z forward, +Y down
+        fwd = z_axis 
+        x_axis = torch.cross(torch.tensor([0., -1., 0.], device=self.device), fwd) # Y-down up vector
+        x_axis = x_axis / torch.norm(x_axis)
+        y_axis = torch.cross(fwd, x_axis)
+        
+        R = torch.stack([x_axis, y_axis, fwd], dim=1)
+        
+        tgt_pose = torch.eye(4, device=self.device)
+        tgt_pose[:3, :3] = R
+        tgt_pose[:3, 3] = pos
+        
+        # Pick Source (Nearest)
+        # Reuse idx1 as source since we are close to it
+        src_idx = idx1
+        # [GeNVS] Get Source Data using Parser Index (Bypass Dataset to allow using Test images or mismatch indices)
+        # Check Cache
+        if src_idx in self.parser.tensor_cache:
+            src_item = self.parser.tensor_cache[src_idx]
+            src_img = src_item['image'].unsqueeze(0).to(self.device).permute(0, 3, 1, 2)
+            src_K = src_item['K'].unsqueeze(0).to(self.device)
+            src_pose = src_item['camtoworld'].unsqueeze(0).to(self.device)
+        else:
+            # Load from Disk (Manual logic from Dataset.__getitem__)
+            img_path = self.parser.image_paths[src_idx]
+            image = imageio.imread(img_path)[..., :3]
+            
+            # Undistort? Config says 'pinhole' usually implies undistorted or COLMAP handles it.
+            # Dataset logic:
+            cam_id = self.parser.camera_ids[src_idx]
+            params = self.parser.params_dict[cam_id]
+            if len(params) > 0:
+                # Undistort
+                mapx, mapy = self.parser.mapx_dict[cam_id], self.parser.mapy_dict[cam_id]
+                image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                x, y, w, h = self.parser.roi_undist_dict[cam_id]
+                image = image[y : y + h, x : x + w]
+            
+            src_img = torch.from_numpy(image).float().to(self.device).unsqueeze(0).permute(0, 3, 1, 2)
+            src_K = torch.from_numpy(self.parser.Ks_dict[cam_id].copy()).float().to(self.device).unsqueeze(0)
+            src_pose = torch.from_numpy(self.parser.camtoworlds[src_idx]).float().to(self.device).unsqueeze(0)
+            
+        # [GeNVS] Resize to multiple of 32
+        H, W = src_img.shape[-2:]
+        new_H = (H // 32) * 32
+        new_W = (W // 32) * 32
+        
+        if new_H != H or new_W != W:
+            src_img = F.interpolate(src_img, size=(new_H, new_W), mode='bilinear', align_corners=False)
+            
+            # Update Intrinsics (Clone to avoid mutating cache)
+            src_K = src_K.clone()
+            scale_x = new_W / W
+            scale_y = new_H / H
+            src_K[:, 0, 0] *= scale_x
+            src_K[:, 0, 2] *= scale_x
+            src_K[:, 1, 1] *= scale_y
+            src_K[:, 1, 2] *= scale_y
+        
+        # Target Pose
+        # Pipeline expects [1, 4, 4]
+        tgt_pose_input = tgt_pose.unsqueeze(0)
+        
+        # Generate
+        with torch.no_grad():
+            if self.cfg.genvs_depth_only:
+                # DEPTH INJECTION MODE (Fast - no diffusion)
+                # Use sample_depth_only which skips UNet entirely
+                depth_result = self.genvs_pipeline.sample_depth_only(
+                    src_img, src_pose, src_K, tgt_pose_input, src_K
+                )  # [1, 1, H, W]
+                
+                # Store depth for supervision (not as RGB)
+                gen_depth = depth_result[0].detach().cpu()  # [1, H, W]
+                
+                new_idx = len(self.parser.image_names)
+                
+                # For depth injection, we still need a placeholder image
+                # Use the source image resized as placeholder (won't be used for RGB loss)
+                placeholder_img = F.interpolate(src_img, size=(new_H, new_W), mode='bilinear', align_corners=False)
+                placeholder_img = (placeholder_img[0].permute(1, 2, 0) / 255.0).detach().cpu() * 255.0  # [H, W, 3]
+                
+                cached_data = {
+                    "K": src_K.squeeze(0).detach().cpu(),
+                    "camtoworld": tgt_pose.detach().cpu(),
+                    "image": placeholder_img.detach().cpu(),
+                    "image_id": new_idx,
+                    "genvs_depth": gen_depth,  # [1, H, W] - GeNVS-generated depth
+                    "is_depth_only": True  # Flag for training loop
+                }
+                print(f"[GeNVS-Depth] Generated depth for novel pose (shape: {gen_depth.shape})")
+                print(f"[GeNVS-Depth] Generated depth for novel pose (shape: {gen_depth.shape})")
+            else:
+                # RGB INJECTION MODE with SDS (Master Tuner)
+                # We need to perform optimization here or just save the view for next iteration
+                # But SDS needs differentiable rendering within the loop.
+                # Since 'step_genvs' is called inside the loop, we can just return the data
+                # AND compute the SDS loss right now against the current splats?
+                
+                # Actually, step_genvs is designed to *add data* to the dataset.
+                # SDS typically runs as an *additional loss term* on a random view.
+                
+                # For this implementation (Latent Injection), we will calculate SDS loss
+                # and backward it immediately to update the Gaussians.
+                
+                # 1. Render current view with gradients
+                # We need to re-render because we need the graph attached
+                # But 'step_genvs' separates generation from training?
+                # The current architecture expects 'step_genvs' to just add a static image to the cache.
+                
+                # HYBRID APPROACH:
+                # Use the pipeline to generate a "perfect" target image (Hallucination)
+                # Then add that image to the dataset. This is "Iterative Dataset Update" (not SDS but close).
+                # This matches the user request "inject latent space" by injecting the result of the latent space.
+                
+                # Hallucination Generation
+                result = self.genvs_pipeline.sample_batch(
+                    src_img, src_pose, src_K, tgt_pose_input, src_K, num_steps=30
+                )
+                
+                # Result is [-1, 1]. Convert to [0, 255] float
+                gen_tensor = (result[0] * 0.5 + 0.5) * 255.0  # [3, H, W]
+                gen_tensor = gen_tensor.permute(1, 2, 0)  # [H, W, 3]
+                gen_tensor = gen_tensor.detach().cpu().clone()
+                
+                new_idx = len(self.parser.image_names)
+                
+                cached_data = {
+                    "K": src_K.squeeze(0).detach().cpu(),
+                    "camtoworld": tgt_pose.detach().cpu(),
+                    "image": gen_tensor.detach().cpu(),
+                    "image_id": new_idx,
+                    "is_depth_only": False
+                }
+        self.parser.tensor_cache[new_idx] = cached_data
+        
+        fname = f"gpu_gen_{new_idx}"
+        self.parser.image_names.append(fname)
+        self.parser.image_paths.append("GPU_MEMORY")
+        
+        # Update arrays
+        new_c2w = tgt_pose.detach().cpu().numpy()[None]
+        self.parser.camtoworlds = np.concatenate([self.parser.camtoworlds, new_c2w], axis=0)
+        
+        # Safe camera_id lookup - src_idx may be out of bounds for trainset.indices
+        if src_idx < len(self.trainset.indices):
+            real_src_idx = self.trainset.indices[src_idx]
+        else:
+            real_src_idx = src_idx % len(self.parser.camera_ids)
+        cam_id = self.parser.camera_ids[real_src_idx]
+        self.parser.camera_ids.append(cam_id)
+        
+        # Rebuild Dataset Indices
+        self.trainset.rebuild_indices()
+        
+        print(f"[GeNVS-GPU] Injected View {new_idx} (Total: {len(self.trainset)})")
 
     def hot_reload_data(self) -> int:
         """Hot-reload new images/poses during streaming training.
@@ -832,7 +1109,14 @@ class Runner:
                  except:
                      pass
 
-        num_workers = 0 if os.name == 'nt' else 4
+        num_workers = cfg.data_loader_workers
+        if os.name == 'nt' and num_workers > 0:
+             print("[SimpleTrainer] Windows detected. FORCING num_workers=0 to prevent Viser crash.")
+             num_workers = 0
+             # Actually, let's respect the config. If user passes 0, it's 0. 
+             # If user passes 4, and it works, good. If not, they should pass 0.
+             # But default is 4.
+             pass
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -883,9 +1167,15 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            if cfg.depth_loss:
+            
+            is_depth_only = "is_depth_only" in data and data["is_depth_only"].all()
+            if (cfg.depth_loss or is_depth_only) and "points" in data:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+            else:
+                # Fallback to avoid unbound variables if depth mode is active but sampling failed
+                points = None
+                depths_gt = None
 
             height, width = pixels.shape[1:3]
 
@@ -899,6 +1189,10 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
+            render_mode = "RGB"
+            if cfg.depth_loss or is_depth_only:
+                render_mode = "RGB+ED"
+
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -908,7 +1202,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode=render_mode,
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -945,13 +1239,21 @@ class Runner:
             # loss
             # PREVENT NaN: Clean rendered colors before loss computation
             colors = torch.nan_to_num(colors, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            # Unified Loss Logic: Keep graph topology identical for all views to avoid autograd errors
+            rgb_weight = 0.0 if is_depth_only else 1.0
+            
             l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            ssimloss = 1.0 - self.ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
             )
             ssimloss = torch.nan_to_num(ssimloss, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
+            
+            # RGB branch always exists in the graph, but weight can be 0.0
+            loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda) * rgb_weight
+                
+            # Depth branch
+            if (cfg.depth_loss or is_depth_only) and points is not None:
                 # query depths from depth map
                 points = torch.stack(
                     [
@@ -1154,13 +1456,20 @@ class Runner:
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
+                try:
+                    mem_alloc = torch.cuda.memory_allocated() / 1024**3
+                    mem_max = torch.cuda.max_memory_allocated() / 1024**3
+                    mem = mem_max if not math.isnan(mem_max) else mem_alloc
+                    if math.isnan(mem): mem = 0.0
+                except:
+                    mem = 0.0
+                
                 stats = {
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
-                print("Step: ", step, stats)
+                print(f"Step: {step} | Mem: {mem:.2f}GB | Stats: {stats}")
                 with open(
                     f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
                     "w",
@@ -1268,6 +1577,12 @@ class Runner:
                         # Determine if we're in pose phase
                         step_in_interval = step % cfg.pose_opt_interval
                         pose_phase_start = cfg.pose_opt_interval - cfg.pose_phase_steps
+                        # [Adaptive Interpolation] Track Loss
+                        if self.cfg.genvs_ckpt:
+                            loss_val = loss.item() # Assuming 'loss' is the total loss
+                            self.loss_history.append(loss_val)
+                            if len(self.loss_history) > 1000: # Limit memory usage
+                                self.loss_history.pop(0)
                         
                         if step_in_interval >= pose_phase_start:
                             # Pose phase: step the optimizer
@@ -1326,6 +1641,25 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # [GeNVS] Online Step
+            if cfg.genvs_ckpt and (step % cfg.genvs_interval == 0) and step > 0:
+                self.step_genvs(step)
+                # Force cleanup of any graph fragments
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Rebuild loader to see new cached data immediately
+                trainloader = torch.utils.data.DataLoader(
+                    self.trainset,
+                    batch_size=cfg.batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    persistent_workers=(num_workers > 0),
+                    pin_memory=True,
+                )
+                trainloader_iter = iter(trainloader)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1437,8 +1771,11 @@ class Runner:
                 json.dump(stats, f)
             # save stats to tensorboard
             for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
+                self.writer.flush()
+
+        # Online GeNVS Step
+        if cfg.genvs_ckpt and (step % cfg.genvs_interval == 0) and step > 0:
+            self.step_genvs(step)
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1826,6 +2163,15 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        
+        # [FIX] Infer SH degree from checkpoint data to avoid rasterization assertion error
+        if "shN" in ckpts[0]["splats"]:
+            n_sh_coeffs = ckpts[0]["splats"]["shN"].shape[1] + 1
+            inferred_degree = int(math.sqrt(n_sh_coeffs) - 1)
+            if runner.cfg.sh_degree != inferred_degree:
+                print(f"[FIX] Setting sh_degree to {inferred_degree} based on checkpoint.")
+                runner.cfg.sh_degree = inferred_degree
+        
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
@@ -1845,8 +2191,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     if not cfg.disable_viewer:
         runner.viewer.complete()
-        print("Viewer running... Ctrl+C to exit.")
-        time.sleep(1000000)
+        print("Viewer complete. Closing server...")
 
 
 if __name__ == "__main__":

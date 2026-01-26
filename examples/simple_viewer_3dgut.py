@@ -122,19 +122,34 @@ def main(local_rank: int, world_rank, world_size: int, args):
 
     # register and open viewer
     @torch.no_grad()
-    def viewer_render_fn(camera_state: nerfview.CameraState, img_wh: Tuple[int, int]):
-        width, height = img_wh
+    def viewer_render_fn(camera_state: nerfview.CameraState, img_wh):
+        # Handle Nerfview/Viser signature change
+        if hasattr(img_wh, "canvas_width"):
+             width = int(img_wh.canvas_width)
+             height = int(img_wh.canvas_height)
+        else:
+             width, height = img_wh
+             
         c2w = camera_state.c2w
-        K = camera_state.get_K(img_wh)
+        K = camera_state.get_K((width, height)) # Update to pass tuple if needed
         c2w = torch.from_numpy(c2w).float().to(device)
         K = torch.from_numpy(K).float().to(device)
         viewmat = c2w.inverse()
 
         if args.backend == "gsplat":
-            rasterization_fn = rasterization
+            try:
+                rasterization_fn = rasterization
+                # Check if backend is actually loaded
+                from gsplat import csrc
+            except ImportError:
+                print("[Viewer Error] 'gsplat' C++ extension is missing!")
+                print("[Viewer Error] Please install Visual Studio Build Tools (C++) and reinstall gsplat.")
+                print("[Viewer Error] Command: pip install -e .")
+                print("Returning empty image to prevent crash.")
+                return np.zeros((height, width, 3), dtype=np.uint8)
+
         elif args.backend == "inria":
             from gsplat import rasterization_inria_wrapper
-
             rasterization_fn = rasterization_inria_wrapper
         else:
             raise ValueError

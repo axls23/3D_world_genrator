@@ -41,3 +41,17 @@ class PrunerConfig:
     # Context-aware mode
     CONTEXT_AWARE: bool = True   # Enable context-aware pruning by default
     CAMERAS_PATH: Optional[str] = None  # Path to camera poses for visibility check
+
+from enum import IntEnum
+
+class ActionSpace(IntEnum):
+    STEADY = 0
+    FIX_POSES = 1
+    FILL_HOLES = 2
+    PRUNE_POLISH = 3
+
+class StateSpace(IntEnum):
+    ACE_CONFIDENCE = 0
+    DENSITY = 1
+    PSNR = 2
+    GENVS_AGG = 3

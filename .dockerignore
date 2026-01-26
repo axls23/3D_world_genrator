@@ -1,0 +1,38 @@
+
+# Version control
+.git/
+.gitignore
+.gitmodules
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environment
+.venv/
+env/
+venv/
+.conda/
+environment_windows.yml
+
+# IDE settings
+.vscode/
+.idea/
+.cursor/
+
+# Output data
+demo/output/
+debug_output/
+assets/
+examples/
+tests/
+
+# Temporary files
+*.log
+.DS_Store

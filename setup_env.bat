@@ -8,6 +8,8 @@ echo.
 echo [1/2] Creating Windows Environment (hypersplat)...
 if exist "environment_windows.yml" (
     call conda env create -f environment_windows.yml
+    call conda activate 3dgrut
+    pip install -e .
 ) else (
     echo Error: environment_windows.yml not found!
     exit /b 1
