@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import sys
+import collections
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -42,7 +43,7 @@ class TrainingManager:
         # State
         self.current_video_path = None
         self.process = None
-        self.logs = []
+        self.logs = collections.deque(maxlen=1000)
         self.status = "idle"  # idle, training_running, training_complete, error
         self.progress = 0
         self.training_viewer_url = None
@@ -93,7 +94,7 @@ class TrainingManager:
         self.current_video_path = video_path
         self.current_mode = mode
         self.status = "training_running"
-        self.logs = []
+        self.logs.clear()
         self.progress = 0
         self.training_viewer_url = None
         
@@ -182,8 +183,11 @@ class TrainingManager:
         quality_mode = self.training_config.get("quality_mode", "balanced")
         cmd.extend(["--quality-mode", quality_mode])
         
-        min_conf = self.training_config.get("min_confidence", 1000)
-        cmd.extend(["--min-confidence", str(min_conf)])
+        min_conf = self.training_config.get("min_registration_confidence", 1000)
+        cmd.extend(["--min-registration-confidence", str(min_conf)])
+        
+        depth_model = self.training_config.get("depth_model", "depth_anything")
+        cmd.extend(["--depth-model", depth_model])
 
         # Advanced config
         if "sh_degree" in self.training_config:
@@ -198,8 +202,10 @@ class TrainingManager:
             cmd.extend(["--ssim_lambda", str(self.training_config["ssim_lambda"])])
         if self.training_config.get("random_bkgd"):
             cmd.append("--random_bkgd")
-        if self.training_config.get("pose_opt"):
-            cmd.append("--pose_opt")
+        if self.training_config.get("pose_opt", True):
+            cmd.append("--pose-opt")
+        else:
+            cmd.append("--no-pose-opt")
         if self.training_config.get("app_opt"):
             cmd.append("--app_opt")
         
@@ -222,7 +228,9 @@ class TrainingManager:
         # This is the definitive sign that ACE-Zero finished successfully
         sparse_dir = expected_ace_output / "sparse" / "0"
         if (sparse_dir / "images.bin").exists() or (sparse_dir / "images.txt").exists():
-            logger.info("Found existing ACE-Zero COLMAP output. Auto-enabling --skip-ace to resume.")
+            msg = "Found existing ACE-Zero COLMAP output. Auto-enabling --skip-ace to resume."
+            print(msg)
+            self.logs.append(msg)
             cmd.append("--skip-ace")
         
         self.logs.append(f"Command: {' '.join(cmd)}")
@@ -334,7 +342,7 @@ class TrainingManager:
             "status": self.status,
             "progress": self.progress,
             "mode": self.current_mode,
-            "logs": self.logs[-50:],  # Return last 50 logs
+            "logs": list(self.logs)[-50:],  # Return last 50 logs
             "training_viewer_url": self.training_viewer_url
         }
 
@@ -360,9 +368,6 @@ class TrainingManager:
                             f.write(decoded_line + "\n")
                     except:
                         pass
-
-                    if len(self.logs) > 1000:
-                        self.logs.pop(0)
                         
                     self._parse_log_line(decoded_line)
                     
@@ -448,10 +453,6 @@ class TrainingManager:
         if "PIPELINE COMPLETE" in line or "PIPELINE SUMMARY" in line: 
             self.progress = 100
             self.status = "training_complete"
-        
-        # Parse loss for early stopping
-        if "loss:" in line.lower() or "Loss:" in line:
-            self._check_early_stopping(line)
     
     def _check_early_stopping(self, line: str):
         """Check if training should stop early based on loss convergence."""

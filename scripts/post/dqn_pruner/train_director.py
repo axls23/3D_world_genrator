@@ -450,7 +450,6 @@ class DirectorTrainer:
         else:
             print(f"Cache miss at {nested_ace_output}. Running ACE-Zero Pose Estimation...")
             ace_out = self.pipeline._run_pose_estimation(self.scene_path)
-            self.pipeline._filter_poses_by_confidence(ace_out)
             
         for episode in range(EPISODES):
             print(f"\n--- Episode {episode+1}/{EPISODES} ---")

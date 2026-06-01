@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   acezero:
     restart: always
@@ -21,7 +19,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # Mount the pipeline data directory for processing local videos
-      - ../pipeline/data:/workspace/data
+      # Mount the whole project root to /workspace for zero-copy data flow
+      - ../../:/workspace
       # Mount user's Downloads folder for input videos
       - C:/Users/sxhil_25660/Downloads:/workspace/downloads:ro

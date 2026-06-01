@@ -13,3 +13,4 @@ from .encoder import GeometryEncoder
 from .feature_volume import FrustumFeatureVolume
 from .rendering import NeuralVolumeRenderer
 from .unet_2d import DiffusionUNet
+from .dit_2d import DiT, DiT_S_2

@@ -484,3 +484,189 @@ iframe {
 ::-webkit-scrollbar-thumb:hover {
     background: #484f58;
 }
+
+/* Job Queue styling */
+.queue-panel {
+    background-color: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.queue-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 16px;
+    gap: 8px;
+}
+
+.queue-empty {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.queue-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background-color: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all var(--transition-speed);
+}
+
+.queue-item:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+    border-color: var(--text-muted);
+}
+
+.queue-item.active {
+    border-color: var(--accent-primary);
+    background-color: rgba(51, 224, 255, 0.05);
+}
+
+.queue-item-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+}
+
+.queue-item-title {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.queue-item-sub {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.queue-item-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Badges */
+.badge-status {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.badge-queued { background-color: rgba(139, 148, 158, 0.15); color: var(--text-secondary); }
+.badge-running { background-color: rgba(51, 224, 255, 0.15); color: var(--accent-primary); }
+.badge-processing { background-color: rgba(188, 59, 255, 0.15); color: var(--accent-secondary); }
+.badge-completed { background-color: rgba(46, 160, 67, 0.15); color: var(--accent-success); }
+.badge-failed { background-color: rgba(218, 54, 51, 0.15); color: var(--accent-danger); }
+.badge-cancelled { background-color: rgba(210, 153, 34, 0.15); color: var(--accent-warning); }
+
+.badge {
+    background-color: var(--border-color);
+    color: var(--text-secondary);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+}
+
+/* Data Table for Checkpoints */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+.data-table th, 
+.data-table td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.data-table th {
+    background-color: rgba(0, 0, 0, 0.2);
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.data-table tbody tr:hover {
+    background-color: rgba(255, 255, 255, 0.02);
+}
+
+.data-table .text-center {
+    text-align: center;
+    padding: 32px;
+    color: var(--text-secondary);
+}
+
+/* Renders Grid */
+.renders-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 20px;
+    padding: 16px;
+}
+
+.render-card {
+    background-color: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: all var(--transition-speed);
+}
+
+.render-card:hover {
+    border-color: var(--accent-primary);
+    transform: translateY(-2px);
+}
+
+.render-img-wrapper {
+    aspect-ratio: 16/9;
+    background-color: #000;
+    overflow: hidden;
+    position: relative;
+}
+
+.render-img-wrapper img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.render-card-body {
+    padding: 12px;
+}
+
+.render-card-title {
+    font-size: 0.85rem;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text-primary);
+}
+
+.render-card-actions {
+    margin-top: 8px;
+    display: flex;
+    justify-content: flex-end;
+}
+

@@ -172,6 +172,27 @@ def estimate_depth_and_create_ply(
     print(f"Saved dense init points to {output_ply}")
 
 
+class DepthEstimator:
+    """Unified depth estimator class wrapping underlying model backends."""
+    def __init__(self, model: str = "zoedepth", device: str = "cuda"):
+        from scripts.acezero.dataset_io import get_depth_model
+        self.model_type = model
+        self.device = device
+        self.model = get_depth_model(model_type=model)
+
+    def __call__(self, image_rgb: np.ndarray) -> np.ndarray:
+        from scripts.acezero.dataset_io import estimate_depth
+        return estimate_depth(self.model, image_rgb)
+
+    def unload(self):
+        if hasattr(self, 'model'):
+            del self.model
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--images_dir", required=True, type=Path)

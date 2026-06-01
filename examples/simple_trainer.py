@@ -1,10 +1,13 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+
 import json
 import math
 import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio.v2 as imageio
@@ -571,17 +574,28 @@ class Runner:
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+        self.lpips = None
+        try:
+            if cfg.lpips_net == "alex":
+                self.lpips = LearnedPerceptualImagePatchSimilarity(
+                    net_type="alex", normalize=True
+                ).to(self.device)
+            elif cfg.lpips_net == "vgg":
+                # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
+                self.lpips = LearnedPerceptualImagePatchSimilarity(
+                    net_type="vgg", normalize=False
+                ).to(self.device)
+            else:
+                raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+        except Exception as e:
+            print(f"\n[Warning] Failed to initialize LPIPS (likely offline / network error): {e}")
+            print("Using a dummy LPIPS metric to prevent pipeline crash.\n")
+            class DummyLPIPS:
+                def to(self, device):
+                    return self
+                def __call__(self, x, y):
+                    return torch.tensor(0.0, device=x.device)
+            self.lpips = DummyLPIPS()
 
         # Viewer
         if not self.cfg.disable_viewer:

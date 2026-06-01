@@ -24,13 +24,15 @@ try:
         # Add minimal required args for basic run
         parser.add_argument("--quality_mode", type=str, default="balanced")
         parser.add_argument("--min_confidence", type=int, default=1000)
+        parser.add_argument("--use_docker", action="store_true", help="Run via Docker instead of WSL")
         
         args, unknown = parser.parse_known_args()
         
         estimator = ACEZeroPoseEstimator(
             args.output_dir,
             quality_mode=args.quality_mode,
-            min_confidence=args.min_confidence
+            min_confidence=args.min_confidence,
+            use_docker=args.use_docker
         )
         estimator.process_video(args.video_path, fps=args.fps)
         

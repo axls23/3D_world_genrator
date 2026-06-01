@@ -1,5 +1,5 @@
 """
-ACE-Zero Pose Estimator Wrapper for 3DGS Pipeline (WSL Support)
+ACE-Zero Pose Estimator Wrapper for 3DGS Pipeline (Docker Support)
 
 This module replaces COLMAP with ACE-Zero (Niantic, ECCV 2024) for camera pose estimation.
 It outputs data in COLMAP format compatible with gsplat's simple_trainer.py.
@@ -7,11 +7,11 @@ It outputs data in COLMAP format compatible with gsplat's simple_trainer.py.
 Key Features:
 - Lightweight: Runs on 8-12GB VRAM GPUs
 - Scalable: Handles thousands of images efficiently
-- WSL Support: Uses 'ace0' conda environment in WSL
+- Docker Support: Runs via `docker exec acezero` on Windows, natively on Linux
 
 Requirements:
-    - ACE-Zero repository cloned to ../acezero/
-    - WSL installed with 'ace0' environment in ~/miniconda3/envs/ace0
+    - ACE-Zero repository at scripts/acezero/
+    - Docker container `acezero` running (docker compose up -d)
 """
 
 import os
@@ -46,10 +46,13 @@ class ACEZeroPoseEstimator:
                  pose_refinement: str = "mlp", pose_refinement_wait: int = 5000, 
                  pose_refinement_lr: float = 0.001, refinement_ortho: str = "gram-schmidt",
                  quality_mode: str = "balanced", min_confidence: int = 1000,
-                 depth_model: str = "depth_anything"):
+                 depth_model: str = "depth_anything", use_docker: bool = False,
+                 use_hybrid: bool = True):
         self.output_dir = Path(output_dir).resolve()  # Ensure absolute path
         self.acezero_root = acezero_root or ACEZERO_ROOT
         self.use_depth_init = use_depth_init
+        self.use_docker = use_docker
+        self.use_hybrid = use_hybrid  # Single-shot hybrid mode (SIFT init + single ACE pass)
         
         # Pose refinement settings (significantly improves pose quality for 3DGS)
         # Options: 'mlp' (best quality), 'naive' (direct backprop), 'none'
@@ -63,39 +66,22 @@ class ACEZeroPoseEstimator:
         self.min_confidence = min_confidence  # Filter poses below this confidence
         self.video_info = {}  # Populated by _analyze_video()
         
+        # New adaptive options defaults
+        self.cooldown_iterations = 5000
+        self.cooldown_threshold = 0.7
+        self.aug_rotation = 15
+        self.registration_threshold = 0.99
+        
         # Depth model selection: 'depth_anything' (default, fast), 'zoedepth' (metric), 'midas' (lightweight)
         self.depth_model = depth_model if depth_model in self.DEPTH_MODELS else 'depth_anything'
-        logger.info(f"Depth estimator: {self.depth_model}")
+        logger.info(f"Depth estimator: {self.depth_model}, Docker routing: {self.use_docker}")
         
         self.images_dir = self.output_dir / "images"
         self.sparse_dir = self.output_dir / "sparse" / "0"
         self.acezero_output = self.output_dir / "acezero_output"
         self.streaming_status_file = self.output_dir / "streaming_status.json"
         
-        # Debug logging
-        try:
-            import json
-            from pathlib import Path as PathType
-            debug_log_path = PathType(__file__).parent.parent.parent.parent / ".cursor" / "debug.log"
-            log_entry = {
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "H5",
-                "location": "ace_zero_wrapper.py:36",
-                "message": "ACEZeroPoseEstimator __init__",
-                "data": {
-                    "output_dir_input": str(output_dir),
-                    "output_dir_resolved": str(self.output_dir),
-                    "acezero_output": str(self.acezero_output),
-                    "is_absolute": self.output_dir.is_absolute()
-                },
-                "timestamp": int(__import__('time').time() * 1000)
-            }
-            debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(debug_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
-        except Exception:
-            pass  # Silently fail if logging fails
+        logger.info(f"ACEZeroPoseEstimator init: output={self.output_dir}, acezero_root={self.acezero_root}")
         
         self.image_width = 0
         self.image_height = 0
@@ -109,24 +95,31 @@ class ACEZeroPoseEstimator:
         self.is_docker = os.path.exists('/.dockerenv')
         
         # Python path depends on environment
+        # The lean Dockerfile installs deps into the base PyTorch image,
+        # so the correct Python is /opt/conda/bin/python (NOT ace0 env).
+        self.use_wsl = False
         if self.is_docker:
-            # Docker uses /opt/conda (see Dockerfile)
-            self.wsl_python = "/opt/conda/bin/python"
+            # Running inside the container itself
+            self.docker_python = os.environ.get("HYPERSPLAT_PYTHON", "/opt/conda/bin/python")
         elif self.is_linux:
-            # Native Linux (rare case)
-            self.wsl_python = "python"
+            # Native Linux (bare metal, no docker)
+            self.docker_python = os.environ.get("HYPERSPLAT_PYTHON", "python")
         else:
-            # Windows + WSL
-            self.wsl_python = "~/miniconda3/envs/ace0/bin/python"
+            if self.use_docker:
+                # Windows host → commands routed via `docker exec acezero`
+                self.docker_python = "/opt/conda/bin/python"
+            else:
+                # Windows host → commands routed via WSL
+                self.use_wsl = True
+                self.docker_python = "/home/axls23/miniconda3/envs/ace0/bin/python"
 
     @staticmethod
     def _remove_readonly(func, path, _):
-        """Clear the readonly bit and reattempt the removal"""
-        try:
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        except Exception:
-            pass
+        """Helper for shutil.rmtree to handle read-only files on Windows."""
+        import os
+        import stat
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
 
     def _write_streaming_status(self, iteration: int, pose_file: str, is_running: bool, total_images: int = 0):
         """Write streaming status for the pose watcher to read."""
@@ -222,22 +215,28 @@ class ACEZeroPoseEstimator:
         
         # === Quality mode adjustments ===
         if self.quality_mode == "fast":
-            self.seed_iterations = 2000   # Fast coarse seed
-            self.refit_iterations = 5000  # Lean final mapping
-            self.learning_rate_max = 0.005 # [OPTIMIZATION] Higher LR for faster convergence
-            self.cooldown_threshold = 0.7
+            self.seed_iterations = 3000   # Coarse seed (V2 optimized)
+            self.refit_iterations = 10000  # Lean final mapping
+            self.learning_rate_max = 0.006 # Higher LR for faster convergence
+            self.cooldown_threshold = 0.75
+            self.cooldown_iterations = 2000
+            self.aug_rotation = 5
             self.registration_threshold = 0.95
         elif self.quality_mode == "quality":
             self.seed_iterations = 10000  # High-quality seed
             self.refit_iterations = 50000 # Exhaustive mapping
             self.learning_rate_max = 0.003
             self.cooldown_threshold = 0.6
+            self.cooldown_iterations = 5000
+            self.aug_rotation = 15
             self.registration_threshold = 0.99
         else: # balanced
             self.seed_iterations = 5000
-            self.refit_iterations = 25000
-            self.learning_rate_max = 0.003
+            self.refit_iterations = 18000
+            self.learning_rate_max = 0.004
             self.cooldown_threshold = 0.7
+            self.cooldown_iterations = 4000
+            self.aug_rotation = 10
             self.registration_threshold = 0.99
         
         # Scale iterations by expected frames
@@ -249,39 +248,69 @@ class ACEZeroPoseEstimator:
         self.adaptive_iterations = self.seed_iterations + self.refit_iterations # Sum of seed and refit iterations
         self.adaptive_iterations = min(100000, self.adaptive_iterations)
         
+        # === Hybrid mode parameters ===
+        if self.use_hybrid:
+            if self.quality_mode == "fast":
+                self.hybrid_train_iterations = 8000
+                self.hybrid_pose_wait = 1000
+            elif self.quality_mode == "quality":
+                self.hybrid_train_iterations = 25000
+                self.hybrid_pose_wait = 3000
+            else:  # balanced
+                self.hybrid_train_iterations = 15000
+                self.hybrid_pose_wait = 2000
+        
         logger.info(f"Adaptive Params [mode={self.quality_mode}, motion={avg_motion:.1f}]: "
                     f"repro_clamp={self.repro_loss_soft_clamp}, reg_conf={self.registration_confidence}, "
                     f"seeds={self.adaptive_try_seeds}, iters={self.adaptive_iterations}")
+        if self.use_hybrid:
+            logger.info(f"Hybrid Mode: train_iters={self.hybrid_train_iterations}, pose_wait={self.hybrid_pose_wait}")
     
     def _filter_poses(self) -> tuple:
-        """Filter poses by confidence, return (good_count, bad_count, filtered_path)."""
+        """Filter low-confidence poses from self.poses dict.
+        
+        This is the SINGLE authoritative filter in the pipeline.
+        It removes entries from self.poses so that write_colmap_format()
+        only outputs good poses to the binary files consumed by 3DGS.
+        
+        Returns: (good_count, bad_count, filtered_path_or_None)
+        """
         pose_file = self.acezero_output / "poses_final.txt"
         if not pose_file.exists():
             return (0, 0, None)
         
-        good_poses = []
-        bad_count = 0
+        # Build a set of image names that fail the confidence check
+        bad_names = set()
+        good_lines = []
         
         with open(pose_file, 'r') as f:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) >= 10:
                     conf = float(parts[-1])
-                    if conf >= self.min_confidence:
-                        good_poses.append(line)
+                    if conf < self.min_confidence:
+                        bad_names.add(Path(parts[0]).name)
                     else:
-                        bad_count += 1
+                        good_lines.append(line)
                 else:
-                    good_poses.append(line)
+                    good_lines.append(line)
         
-        if bad_count > 0:
+        # Actually remove bad poses from self.poses dict
+        if bad_names:
+            before_count = len(self.poses)
+            for name in bad_names:
+                self.poses.pop(name, None)
+            after_count = len(self.poses)
+            removed = before_count - after_count
+            
+            # Write filtered text file for debugging/provenance
             filtered_path = self.acezero_output / "poses_final_filtered.txt"
             with open(filtered_path, 'w') as f:
-                f.writelines(good_poses)
-            logger.info(f"Pose Filtering: {len(good_poses)} good, {bad_count} filtered (conf < {self.min_confidence})")
-            return (len(good_poses), bad_count, str(filtered_path))
+                f.writelines(good_lines)
+            logger.info(f"Pose Filtering: {after_count} kept, {removed} removed (conf < {self.min_confidence})")
+            return (after_count, removed, str(filtered_path))
         
-        return (len(good_poses), 0, None)
+        return (len(self.poses), 0, None)
         
     def process_video(self, video_path: str, fps: float = 2.0, streaming: bool = False) -> bool:
         """Run the full ACE-Zero pipeline: Frames -> Poses -> COLMAP Format"""
@@ -344,23 +373,21 @@ class ACEZeroPoseEstimator:
         This runs ZoeDepth once, saves depths as .npy files, then the model
         is unloaded. ACE-Zero will load cached depths instead of recomputing.
         """
-        if sys.platform != 'win32':
-            # On Linux, just run the precompute script directly
+        if sys.platform != 'win32' and not self.is_docker:
+            # On Linux native
             from hypersplat.pipeline.steps.depth import precompute_depths
             precompute_depths(self.images_dir)
             return
         
-        # On Windows, run via WSL with ace0 conda env
-        logger.info("Pre-computing depths via WSL (frees ~2GB VRAM)...")
+        logger.info("Pre-computing depths via Docker (frees ~2GB VRAM)...")
         
-        wsl_images_dir = self._windows_to_wsl_path(str(self.images_dir.resolve()))
-        wsl_acezero = self._windows_to_wsl_path(str(self.acezero_root.resolve()))
+        docker_images_dir = self._windows_to_docker_path(str(self.images_dir.resolve()))
+        docker_acezero = self._windows_to_docker_path(str(self.acezero_root.resolve()))
         
-        # Use ace0 conda env for depth computation - User-selected depth model
         # depth_model options: 'depth_anything' (fast, ~30ms), 'zoedepth' (metric, ~200ms), 'midas' (~100ms)
         depth_model_choice = self.depth_model
         precompute_cmd = f'''
-cd {wsl_acezero} && {self.wsl_python} -c "
+cd {docker_acezero} && {self.docker_python} -c "
 import sys
 sys.path.insert(0, '.')
 import numpy as np
@@ -368,7 +395,7 @@ import cv2
 from pathlib import Path
 import torch
 
-images_dir = Path('{wsl_images_dir}')
+images_dir = Path('{docker_images_dir}')
 depths_dir = images_dir.parent / 'depths'
 depths_dir.mkdir(exist_ok=True)
 
@@ -480,68 +507,93 @@ print('Done! VRAM freed for ACE training.')
 "
 '''
         try:
-            self._run_wsl_command(precompute_cmd.strip(), timeout=600)
+            self._run_docker_command(precompute_cmd.strip(), timeout=600)
             logger.info("Depth pre-computation complete.")
         except Exception as e:
             logger.warning(f"Depth pre-computation failed: {e}. Will use inline ZoeDepth.")
             
-    def _run_wsl_command(self, cmd_str: str, check: bool = True, capture_output: bool = False, timeout: int = 7200) -> subprocess.CompletedProcess:
-        """Helper to run commands in WSL.
-        
-        Note: WSL commands run as the default user without password prompts.
-        If permission errors occur, they will be logged and raised as exceptions.
+    def _run_docker_command(self, cmd_str: str, check: bool = True, capture_output: bool = False, timeout: int = 7200) -> subprocess.CompletedProcess:
+        """Helper to run commands natively in Docker.
         
         Args:
             timeout: Maximum time in seconds to wait (default 7200 = 2 hours)
         """
-        if sys.platform != 'win32' and not self.is_docker:
-             raise RuntimeError("WSL command called on non-Windows platform without Docker bypass")
-             
-        if self.is_docker:
-            # Inline Linux execution
-            full_cmd = f"cd {self.acezero_root} && {cmd_str}"
-            logger.info(f"Docker Exec (Native Linux): {cmd_str[:150]}...")
-            return subprocess.run(
-                ["bash", "-c", full_cmd],
-                check=check,
-                stdout=None,
-                stderr=None,
-                timeout=timeout
-            )
-             
-        acezero_wsl_path = self._windows_to_wsl_path(str(self.acezero_root))
-        full_cmd = f"cd {acezero_wsl_path} && {cmd_str}"
+        if not self.is_docker:
+            if getattr(self, 'use_wsl', False):
+                wsl_root = self._windows_to_docker_path(str(self.acezero_root))
+                full_cmd = f"cd {wsl_root} && {cmd_str}"
+                logger.info(f"WSL Exec: {full_cmd[:150]}...")
+                try:
+                    cmd_list = ["wsl", "-d", "FedoraLinux-43", "bash", "-c", full_cmd]
+                    result = subprocess.run(
+                        cmd_list,
+                        check=False,
+                        stdout=subprocess.PIPE if capture_output else None,
+                        stderr=subprocess.PIPE if capture_output else None,
+                        timeout=timeout,
+                        text=True if capture_output else False
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.error(f"WSL Command timed out after {timeout} seconds.")
+                    if check: raise
+                    return subprocess.CompletedProcess(["wsl"], 124, stdout="", stderr="")
+                    
+                if result.returncode != 0 and check:
+                    logger.error(f"WSL Command Failed (Return Code: {result.returncode}).")
+                    if capture_output:
+                        logger.error(f"Output: {result.stderr}")
+                    raise subprocess.CalledProcessError(result.returncode, cmd_str)
+                return subprocess.CompletedProcess(result.args, result.returncode, stdout=result.stdout if capture_output else "", stderr=result.stderr if capture_output else "")
+            else:
+                # We are running on host but invoking the Docker container `acezero`
+                logger.info(f"Docker Exec: {cmd_str[:150]}...")
+                try:
+                    cmd_list = ["docker", "exec", "acezero", "bash", "-c", cmd_str]
+                    result = subprocess.run(
+                        cmd_list,
+                        check=False,
+                        stdout=subprocess.PIPE if capture_output else None,
+                        stderr=subprocess.PIPE if capture_output else None,
+                        timeout=timeout,
+                        text=True if capture_output else False
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.error(f"Docker Command timed out after {timeout} seconds.")
+                    if check: raise
+                    return subprocess.CompletedProcess(["docker"], 124, stdout="", stderr="")
+                    
+                if result.returncode != 0 and check:
+                    logger.error(f"Docker Command Failed (Return Code: {result.returncode}).")
+                    if capture_output:
+                        logger.error(f"Output: {result.stderr}")
+                    raise subprocess.CalledProcessError(result.returncode, cmd_str)
+                return subprocess.CompletedProcess(result.args, result.returncode, stdout=result.stdout if capture_output else "", stderr=result.stderr if capture_output else "")
+
+        # Inline Linux execution if already inside docker
+        full_cmd = f"cd {self.acezero_root} && {cmd_str}"
+        logger.info(f"Docker Exec (Native Linux): {cmd_str[:150]}...")
         
-        logger.info(f"WSL Exec: {cmd_str[:150]}...")
-        
-        # Stream directly to console (bypass pipes) to fix buffering issues
-        # WSL runs as default user - no password required
-        # Add timeout to prevent hanging (especially on GPU initialization issues)
         try:
             result = subprocess.run(
-                ["wsl", "-e", "bash", "-c", full_cmd],
+                ["bash", "-c", full_cmd],
                 check=False,
-                stdout=None, # Inherit calling process stdout
-                stderr=None,  # Inherit calling process stderr
-                timeout=timeout
+                stdout=subprocess.PIPE if capture_output else None,
+                stderr=subprocess.PIPE if capture_output else None,
+                timeout=timeout,
+                text=True if capture_output else False
             )
         except subprocess.TimeoutExpired:
-            logger.error(f"WSL Command timed out after {timeout} seconds. This may indicate:")
-            logger.error("  - GPU initialization hang (check VRAM usage)")
-            logger.error("  - WSL GPU passthrough issues (run: wsl -e bash -c 'nvidia-smi')")
-            logger.error("  - Process deadlock or infinite loop")
-            if check:
-                raise subprocess.TimeoutExpired(cmd_str, timeout)
-            return subprocess.CompletedProcess(["wsl"], 124, stdout="", stderr="")  # 124 = timeout exit code
-        
+            logger.error(f"Command timed out after {timeout} seconds.")
+            if check: raise
+            return subprocess.CompletedProcess(["bash"], 124, stdout="", stderr="")
+            
         if result.returncode != 0 and check:
-             logger.error(f"WSL Command Failed (Return Code: {result.returncode}). See console output above.")
-             logger.error("Note: If you see permission errors, ensure WSL has access to the Windows file system.")
-             logger.error("Note: If you see GPU errors, check VRAM usage and WSL GPU passthrough.")
-             raise subprocess.CalledProcessError(result.returncode, cmd_str)
-        
-        # Mock CompletedProcess
-        return subprocess.CompletedProcess(result.args, result.returncode, stdout="", stderr="")
+            logger.error(f"Command Failed (Return Code: {result.returncode}).")
+            if capture_output:
+                logger.error(f"Output: {result.stderr}")
+            raise subprocess.CalledProcessError(result.returncode, cmd_str)
+            
+        return subprocess.CompletedProcess(result.args, result.returncode, stdout=result.stdout if capture_output else "", stderr=result.stderr if capture_output else "")
 
     def extract_frames(self, video_path: str, fps: float = 2.0) -> int:
         video_path = Path(video_path)
@@ -638,7 +690,6 @@ print('Done! VRAM freed for ACE training.')
         # Scale: Force GPU (False) per user request to maximize GPU usage
         self.training_buffer_cpu = False
 
-    # [OPTIMIZATION] Fast / Streaming Mode Overrides
         # [OPTIMIZATION] Fast / Streaming Mode Overrides
         if self.quality_mode == "fast":
             # Minimize Overhead
@@ -647,267 +698,116 @@ print('Done! VRAM freed for ACE training.')
             self.training_buffer_cpu = True # Move buffer to RAM to free VRAM for 3DGS
             logger.info(f"[Optimization] Fast/Streaming Mode: Reduced overhead (Seeds={self.try_seeds}, CPU Buffer={self.training_buffer_cpu})")
             
-            # Override with explicit max_iterations if provided
-            if max_iterations is not None:
-                self.max_iterations = max_iterations
-                
-            logger.info(f"ACE-Zero params [frames={num_frames}]: seeds={self.try_seeds}, "
-                        f"iters={self.max_iterations}, seed_workers={self.seed_parallel_workers}, "
-                        f"data_workers={self.num_data_workers}, heads={self.num_head_blocks}, "
-                        f"cpu_buffer={self.training_buffer_cpu}, refinement={self.pose_refinement}")
+        # Override with explicit max_iterations if provided
+        if max_iterations is not None:
+            self.max_iterations = max_iterations
+            
+        logger.info(f"ACE-Zero params [frames={num_frames}]: seeds={self.try_seeds}, "
+                    f"iters={self.max_iterations}, seed_workers={self.seed_parallel_workers}, "
+                    f"data_workers={self.num_data_workers}, heads={self.num_head_blocks}, "
+                    f"cpu_buffer={self.training_buffer_cpu}, refinement={self.pose_refinement}")
 
         # [DEBUG] Verify Fast Mode Parameters
         logger.info(f"ACE-Quality Check: Mode={self.quality_mode}, LR_Max={getattr(self, 'learning_rate_max', 'N/A')}, SeedIters={getattr(self, 'seed_iterations', 'N/A')}")
             
         images_glob = str(self.images_dir.resolve() / "*.jpg")
         output_dir = str(self.acezero_output.resolve())
-        acezero_script = str(self.acezero_root.resolve() / "ace_zero.py")
+        
+        # Select script based on hybrid mode
+        if self.use_hybrid:
+            acezero_script = str(self.acezero_root.resolve() / "ace_zero_hybrid.py")
+            logger.info("[HYBRID MODE] Using single-shot pose initialization + single ACE pass")
+        else:
+            acezero_script = str(self.acezero_root.resolve() / "ace_zero.py")
         
         if sys.platform == 'win32':
-            # Verify WSL GPU access before running (helps catch GPU passthrough issues early)
+            # Verify Docker/WSL GPU access before running
             try:
-                logger.info("Verifying WSL GPU access...")
-                gpu_check = self._run_wsl_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", 
+                env_type = "WSL" if getattr(self, "use_wsl", False) else "Docker"
+                logger.info(f"Verifying {env_type} GPU access...")
+                gpu_check = self._run_docker_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", 
                                                   check=False, timeout=10)
-                # #region agent log
-                try:
-                    import json
-                    from pathlib import Path as PathType
-                    import time
-                    debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                    log_entry = {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H5",
-                        "location": "ace_zero_wrapper.py:195",
-                        "message": "WSL GPU check result",
-                        "data": {
-                            "returncode": gpu_check.returncode,
-                            "gpu_accessible": gpu_check.returncode == 0
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }
-                    debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(log_entry) + "\n")
-                except Exception:
-                    pass
-                # #endregion
                 if gpu_check.returncode == 0:
-                    logger.info("WSL GPU access verified.")
+                    logger.info(f"{env_type} GPU access verified.")
                 else:
-                    logger.warning("WSL GPU check failed. ACE-Zero may fail or hang on GPU operations.")
+                    logger.warning(f"{env_type} GPU check failed. ACE-Zero may fail or hang on GPU operations.")
             except Exception as e:
-                # #region agent log
-                try:
-                    import json
-                    from pathlib import Path as PathType
-                    import time
-                    debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                    log_entry = {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H5",
-                        "location": "ace_zero_wrapper.py:210",
-                        "message": "WSL GPU check exception",
-                        "data": {
-                            "exception_type": type(e).__name__,
-                            "exception_message": str(e)
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }
-                    debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(log_entry) + "\n")
-                except Exception:
-                    pass
-                # #endregion
-                logger.warning(f"Could not verify WSL GPU access: {e}. Continuing anyway...")
+                logger.warning(f"Could not verify {env_type} GPU access: {e}. Continuing anyway...")
             
-            return self._run_ace_zero_via_wsl(images_glob, output_dir, acezero_script, max_iterations)
+            return self._run_ace_zero_via_docker(images_glob, output_dir, acezero_script, max_iterations)
         else:
              return self._run_ace_zero_native(images_glob, output_dir, acezero_script, max_iterations)
 
-    def _windows_to_wsl_path(self, windows_path: str) -> str:
+    def _windows_to_docker_path(self, windows_path: str) -> str:
+        p = Path(windows_path).resolve()
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
+        p_str = str(p)
+        root_str = str(project_root)
+        if p_str.lower().startswith(root_str.lower()):
+            rel = p_str[len(root_str):].lstrip('\\/')
+            rel_forward = rel.replace('\\', '/')
+            return f"/workspace/{rel_forward}" if rel_forward else "/workspace"
         if self.is_docker:
-            return str(Path(windows_path).resolve())
-        p = str(Path(windows_path).resolve())
-        suffix = p[2:].replace('\\', '/')
-        if len(p) >= 2 and p[1] == ':':
-            return f"/mnt/{p[0].lower()}{suffix}"
-        return p.replace('\\', '/')
+            return p_str.replace('\\', '/')
+        return p_str.replace('\\', '/')
+
+    def _docker_to_windows_path(self, docker_path: str) -> str:
+        p = str(docker_path).replace('\\', '/')
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
+        if p.startswith("/workspace"):
+            rel = p[len("/workspace"):].lstrip('/')
+            return str(project_root / rel)
+        return str(Path(docker_path).resolve())
     
-    def _run_ace_zero_via_wsl(self, images_glob: str, output_dir: str, acezero_script: str, max_iterations: int) -> bool:
-        # Generate temporary WSL paths
-        run_id = uuid.uuid4().hex[:8]
-        # We assume WSL has write access to c-drive for temp speed, OR we copy to /tmp? 
-        # ace0 example copied to /tmp. Let's stick to /tmp for speed/compat.
-        wsl_temp_images = f"/tmp/acezero_images_{run_id}"
-        wsl_temp_output = f"/tmp/acezero_output_{run_id}"
-        
-        wsl_images_src = self._windows_to_wsl_path(str(self.images_dir.resolve()))
-        # Ensure output_dir is absolute before conversion
+    def _run_ace_zero_via_docker(self, images_glob: str, output_dir: str, acezero_script: str, max_iterations: int) -> bool:
+        docker_images_src = self._windows_to_docker_path(str(self.images_dir.resolve()))
         output_dir_abs = str(Path(output_dir).resolve())
-        wsl_final_output = self._windows_to_wsl_path(output_dir_abs)
-        wsl_script = self._windows_to_wsl_path(acezero_script)
+        docker_final_output = self._windows_to_docker_path(output_dir_abs)
+        docker_script = self._windows_to_docker_path(acezero_script)
         
-        # Debug logging
-        try:
-            import json
-            from pathlib import Path as PathType
-            debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-            log_entry = {
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "H5",
-                "location": "ace_zero_wrapper.py:169",
-                "message": "WSL path conversion",
-                "data": {
-                    "output_dir_input": output_dir,
-                    "output_dir_abs": output_dir_abs,
-                    "wsl_final_output": wsl_final_output,
-                    "acezero_output_path": str(self.acezero_output.resolve())
-                },
-                "timestamp": int(__import__('time').time() * 1000)
-            }
-            debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(debug_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
-        except Exception:
-            pass  # Silently fail if logging fails
+        logger.debug(f"Docker paths: images_src={docker_images_src}, final_output={docker_final_output}")
 
-
-        # Commands
-        # Note: Our modified dataset_io.py (with Depth Anything V2) is already in gsplat/scripts/acezero/
-        # It will be used automatically via WSL path mounting
+        # Ensure output directory exists (in docker)
+        setup_cmd = f"mkdir -p {docker_final_output}"
         
-        # 1. Setup - copy images
-        setup_cmd = f"mkdir -p {wsl_temp_images} {wsl_temp_output} && cp {wsl_images_src}/*.jpg {wsl_temp_images}/"
-        
-        # 2. Run ACE-Zero (will now use Depth Anything V2 via our modified dataset_io.py)
+        # 2. Run ACE-Zero (uses Depth Anything V2 via modified dataset_io.py)
         logger.info(f"ACE-Zero will use Depth Anything V2 for depth estimation (~30ms/frame)")
-        # [FIX] Added missing seed_iterations, refit_iterations, and learning_rate_max
-        ace_cmd = f'{self.wsl_python} -u {wsl_script} "{wsl_temp_images}/*.jpg" {wsl_temp_output} --iterations_max {getattr(self, "max_iterations", 10)} --seed_iterations {self.seed_iterations} --refit_iterations {self.refit_iterations} --learning_rate_max {getattr(self, "learning_rate_max", 0.003)} --try_seeds {self.try_seeds} --seed_parallel_workers {self.seed_parallel_workers} --training_buffer_cpu {self.training_buffer_cpu} --num_data_workers {self.num_data_workers} --num_head_blocks {self.num_head_blocks} --refinement {self.pose_refinement} --refinement_ortho {self.refinement_ortho} --pose_refinement_wait {self.pose_refinement_wait} --pose_refinement_lr {self.pose_refinement_lr}'
+        if self.use_hybrid:
+            # Hybrid mode: single-pass command
+            ace_cmd = (f'{self.docker_python} -u {docker_script} '
+                       f'"{docker_images_src}/*.jpg" {docker_final_output} '
+                       f'--hybrid_train_iterations {getattr(self, "hybrid_train_iterations", 15000)} '
+                       f'--hybrid_pose_wait {getattr(self, "hybrid_pose_wait", 2000)} '
+                       f'--learning_rate_max {getattr(self, "learning_rate_max", 0.003)} '
+                       f'--training_buffer_cpu {self.training_buffer_cpu} '
+                       f'--num_data_workers {self.num_data_workers} '
+                       f'--num_head_blocks {self.num_head_blocks} '
+                       f'--refinement {self.pose_refinement} '
+                       f'--refinement_ortho {self.refinement_ortho} '
+                       f'--pose_refinement_lr {self.pose_refinement_lr} '
+                       f'--cooldown_iterations {self.cooldown_iterations} '
+                       f'--cooldown_threshold {self.cooldown_threshold} '
+                       f'--aug_rotation {self.aug_rotation} '
+                       f'--image_resolution {getattr(self, "image_resolution", 480)} '
+                       f'--registration_confidence {getattr(self, "registration_confidence", 500)}')
+        else:
+            ace_cmd = f'{self.docker_python} -u {docker_script} "{docker_images_src}/*.jpg" {docker_final_output} --iterations_max {getattr(self, "max_iterations", 10)} --seed_iterations {self.seed_iterations} --refit_iterations {self.refit_iterations} --learning_rate_max {getattr(self, "learning_rate_max", 0.003)} --try_seeds {self.try_seeds} --seed_parallel_workers {self.seed_parallel_workers} --training_buffer_cpu {self.training_buffer_cpu} --num_data_workers {self.num_data_workers} --num_head_blocks {self.num_head_blocks} --refinement {self.pose_refinement} --refinement_ortho {self.refinement_ortho} --pose_refinement_wait {self.pose_refinement_wait} --pose_refinement_lr {self.pose_refinement_lr} --cooldown_iterations {self.cooldown_iterations} --cooldown_threshold {self.cooldown_threshold} --aug_rotation {self.aug_rotation} --registration_threshold {self.registration_threshold}'
         
-        cleanup_cmd = f"rm -rf {wsl_temp_images} {wsl_temp_output}"
-        
-        # 3. Copy back
-        copy_back_cmd = f"mkdir -p {wsl_final_output} && cp -r {wsl_temp_output}/* {wsl_final_output}/"
-        
-        # Chain it: setup -> run ACE-Zero -> copy back -> cleanup
-        full_cmd = f"{setup_cmd} && {ace_cmd} && {copy_back_cmd} && {cleanup_cmd}"
+        full_cmd = f"{setup_cmd} && {ace_cmd}"
         
         try:
-            # #region agent log
-            try:
-                import json
-                from pathlib import Path as PathType
-                import time
-                debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "H5",
-                    "location": "ace_zero_wrapper.py:250",
-                    "message": "About to run ACE-Zero WSL command",
-                    "data": {
-                        "full_cmd_preview": full_cmd[:200],
-                        "wsl_temp_images": wsl_temp_images,
-                        "wsl_temp_output": wsl_temp_output,
-                        "wsl_final_output": wsl_final_output
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }
-                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            
-            self._run_wsl_command(full_cmd, check=True, timeout=7200)
-            logger.info("ACE-Zero (WSL) completed.")
-            self.refine_poses_native(via_wsl=True) # Check logic for this
+            self._run_docker_command(full_cmd, check=True, timeout=7200)
+            logger.info("ACE-Zero (Docker) completed.")
+            self.refine_poses_native() 
             return self._parse_acezero_output()
         except subprocess.CalledProcessError as e:
-            # #region agent log
-            try:
-                import json
-                from pathlib import Path as PathType
-                import time
-                debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "H5",
-                    "location": "ace_zero_wrapper.py:255",
-                    "message": "ACE-Zero WSL command failed",
-                    "data": {
-                        "returncode": e.returncode,
-                        "cmd_preview": str(e.cmd)[:200] if hasattr(e, 'cmd') else "unknown"
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }
-                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            logger.error(f"ACE-Zero (WSL) failed: {e}")
+            logger.error(f"ACE-Zero (Docker) failed: {e}")
             return False
         except subprocess.TimeoutExpired as e:
-            # #region agent log
-            try:
-                import json
-                from pathlib import Path as PathType
-                import time
-                debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "H5",
-                    "location": "ace_zero_wrapper.py:275",
-                    "message": "ACE-Zero WSL command timed out",
-                    "data": {
-                        "timeout": e.timeout if hasattr(e, 'timeout') else "unknown"
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }
-                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            logger.error(f"ACE-Zero (WSL) timed out: {e}")
+            logger.error(f"ACE-Zero (Docker) timed out: {e}")
             return False
         except Exception as e:
-            # #region agent log
-            try:
-                import json
-                from pathlib import Path as PathType
-                import time
-                debug_log_path = PathType(__file__).parent.parent.parent / ".cursor" / "debug.log"
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "H5",
-                    "location": "ace_zero_wrapper.py:290",
-                    "message": "ACE-Zero WSL unexpected exception",
-                    "data": {
-                        "exception_type": type(e).__name__,
-                        "exception_message": str(e)
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }
-                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            logger.error(f"ACE-Zero (WSL) failed: {e}")
+            logger.error(f"ACE-Zero (Docker) failed: {e}")
             return False
 
     def _run_ace_zero_native(self, images_glob: str, output_dir: str, acezero_script: str, max_iterations: int) -> bool:
@@ -924,20 +824,44 @@ print('Done! VRAM freed for ACE training.')
         refinement_wait = getattr(self, 'pose_refinement_wait', 5000)
         refinement_lr = getattr(self, 'pose_refinement_lr', 0.001)
         
-        cmd = [
-            sys.executable, "-u", acezero_script,
-            images_glob, output_dir,
-            "--iterations_max", str(iters),
-            "--try_seeds", str(try_seeds),
-            "--seed_parallel_workers", str(seed_workers),
-            "--training_buffer_cpu", str(training_buffer),
-            "--num_data_workers", str(data_workers),
-            "--num_head_blocks", str(head_blocks),
-            "--refinement", str(refinement),
-            "--refinement_ortho", str(refinement_ortho),
-            "--pose_refinement_wait", str(refinement_wait),
-            "--pose_refinement_lr", str(refinement_lr),
-        ]
+        if self.use_hybrid:
+            cmd = [
+                sys.executable, "-u", acezero_script,
+                images_glob, output_dir,
+                "--hybrid_train_iterations", str(getattr(self, 'hybrid_train_iterations', 15000)),
+                "--hybrid_pose_wait", str(getattr(self, 'hybrid_pose_wait', 2000)),
+                "--learning_rate_max", str(getattr(self, 'learning_rate_max', 0.003)),
+                "--training_buffer_cpu", str(training_buffer),
+                "--num_data_workers", str(data_workers),
+                "--num_head_blocks", str(head_blocks),
+                "--refinement", str(refinement),
+                "--refinement_ortho", str(refinement_ortho),
+                "--pose_refinement_lr", str(refinement_lr),
+                "--cooldown_iterations", str(getattr(self, 'cooldown_iterations', 5000)),
+                "--cooldown_threshold", str(getattr(self, 'cooldown_threshold', 0.7)),
+                "--aug_rotation", str(getattr(self, 'aug_rotation', 15)),
+                "--image_resolution", str(getattr(self, 'image_resolution', 480)),
+                "--registration_confidence", str(getattr(self, 'registration_confidence', 500)),
+            ]
+        else:
+            cmd = [
+                sys.executable, "-u", acezero_script,
+                images_glob, output_dir,
+                "--iterations_max", str(iters),
+                "--try_seeds", str(try_seeds),
+                "--seed_parallel_workers", str(seed_workers),
+                "--training_buffer_cpu", str(training_buffer),
+                "--num_data_workers", str(data_workers),
+                "--num_head_blocks", str(head_blocks),
+                "--refinement", str(refinement),
+                "--refinement_ortho", str(refinement_ortho),
+                "--pose_refinement_wait", str(refinement_wait),
+                "--pose_refinement_lr", str(refinement_lr),
+                "--cooldown_iterations", str(getattr(self, 'cooldown_iterations', 5000)),
+                "--cooldown_threshold", str(getattr(self, 'cooldown_threshold', 0.7)),
+                "--aug_rotation", str(getattr(self, 'aug_rotation', 15)),
+                "--registration_threshold", str(getattr(self, 'registration_threshold', 0.99)),
+            ]
         
         logger.info(f"[Native Linux] Running ACE-Zero: iters={iters}, seeds={try_seeds}, refinement={refinement}")
         
@@ -986,22 +910,51 @@ print('Done! VRAM freed for ACE training.')
         return len(self.poses) > 0
 
     def generate_initial_points(self) -> bool:
+        """Generate initial 3D points from depth maps for better 3DGS convergence."""
         if not self.use_depth_init: return False
-        if sys.platform == 'win32': return self._generate_points_via_wsl()
+        if sys.platform == 'win32':
+            return self._generate_points_via_docker()
+        else:
+            # Native Linux / Docker — run point generation directly
+            return self._generate_points_native()
+
+    def _generate_points_via_docker(self) -> bool:
+        script = self._windows_to_docker_path(str(self.acezero_root / "generate_points_wsl.py"))
+        poses = self._windows_to_docker_path(str(self.acezero_output / "poses_final.txt"))
+        imgs = self._windows_to_docker_path(str(self.images_dir))
+        out = self._windows_to_docker_path(str(self.sparse_dir / "points3D.bin"))
+        
+        cmd = f"{self.docker_python} -u {script} '{poses}' '{imgs}' '{out}'"
+        try:
+             res = self._run_docker_command(cmd, check=False, capture_output=True)
+             if (self.sparse_dir / "points3D.bin").stat().st_size > 1000: return True
+             logger.error(f"Docker Point Gen failed. Output: {res.stdout}")
+        except Exception as e: logger.error(f"Docker Point Gen Error: {e}")
         return False
 
-    def _generate_points_via_wsl(self) -> bool:
-        script = self._windows_to_wsl_path(str(self.acezero_root / "generate_points_wsl.py"))
-        poses = self._windows_to_wsl_path(str(self.acezero_output / "poses_final.txt"))
-        imgs = self._windows_to_wsl_path(str(self.images_dir))
-        out = self._windows_to_wsl_path(str(self.sparse_dir / "points3D.bin"))
+    def _generate_points_native(self) -> bool:
+        """Generate initial 3D points on native Linux (Docker or bare metal).
         
-        cmd = f"{self.wsl_python} -u {script} '{poses}' '{imgs}' '{out}'"
+        Same logic as the WSL variant, but calls the script directly — 
+        no path translation needed since we're already on Linux.
+        """
+        script = self.acezero_root / "generate_points_wsl.py"
+        if not script.exists():
+            logger.warning(f"Point generation script not found: {script}")
+            return False
+        
+        poses = str(self.acezero_output / "poses_final.txt")
+        imgs = str(self.images_dir)
+        out = str(self.sparse_dir / "points3D.bin")
+        
+        cmd = [sys.executable, "-u", str(script), poses, imgs, out]
         try:
-             res = self._run_wsl_command(cmd, check=False, capture_output=True)
-             if (self.sparse_dir / "points3D.bin").stat().st_size > 1000: return True
-             logger.error(f"WSL Point Gen failed. Output: {res.stdout}")
-        except Exception as e: logger.error(f"WSL Point Gen Error: {e}")
+            subprocess.run(cmd, check=True, cwd=str(self.acezero_root), timeout=600)
+            if (self.sparse_dir / "points3D.bin").stat().st_size > 1000:
+                return True
+            logger.error("Native Point Gen: output too small")
+        except Exception as e:
+            logger.error(f"Native Point Gen Error: {e}")
         return False
 
     def create_downsampled_images(self, factors: List[int] = [2, 4]) -> bool:
@@ -1039,7 +992,7 @@ print('Done! VRAM freed for ACE training.')
         try: from scipy.spatial.transform import Rotation; return Rotation.from_matrix(R).as_quat()[[3,0,1,2]]
         except: return np.array([1,0,0,0]) 
 
-    def refine_poses_native(self, via_wsl: bool = False) -> bool:
+    def refine_poses_native(self) -> bool:
         return True # Placeholder for now as ace_zero.py does optimization
 
     def dump_config(self, output_path: str):

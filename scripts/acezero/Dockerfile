@@ -1,49 +1,54 @@
+# ============================================================
+# ACE-Zero Docker Image — Lean Build
+# Uses base PyTorch image directly (2.5.1 + CUDA 11.8)
+# No redundant conda env — pip-install missing deps only
+# Code is mounted at /workspace via docker-compose volume
+# ============================================================
 FROM pytorch/pytorch:2.5.1-cuda11.8-cudnn9-devel
 
 WORKDIR /workspace
 
+# System deps (OpenGL for pyrender, ffmpeg for video)
 RUN apt-get update && \
-    apt-get install -y wget \
-    git libnvidia-egl-wayland1 \
-    xvfb mesa-utils libgl1-mesa-glx \
-    libgl1-mesa-dri libglib2.0-0
+    apt-get install -y --no-install-recommends \
+        git wget \
+        libgl1-mesa-glx libglib2.0-0 \
+        libegl1-mesa libgles2-mesa \
+        xvfb mesa-utils \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Miniforge
-RUN wget \
-    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
-    && mkdir /root/.conda \
-    && bash Miniforge3-Linux-x86_64.sh -b \
-    && rm -f Miniforge3-Linux-x86_64.sh
+# Install ACE-Zero Python deps into base env
+# (base image already has: torch 2.5.1, torchvision, numpy, pillow, etc.)
+RUN pip install --no-cache-dir \
+    scipy \
+    scikit-image \
+    opencv-python-headless \
+    matplotlib \
+    trimesh \
+    pyrender \
+    roma \
+    timm>=0.6.7 \
+    pycolmap>=0.4.0 \
+    pyyaml \
+    joblib \
+    tqdm
 
-RUN git clone https://github.com/nianticlabs/acezero --recursive
+# dsacstar C++ CUDA extension requires GPU at compile time.
+# We defer its build to container startup via entrypoint.sh.
+ENV CONDA_PREFIX=/opt/conda
 
-RUN conda install ipykernel
-
-# Create ace0 env
-RUN cd acezero && \
-    conda env create -f environment.yml
-
-RUN echo "source activate ace0" > ~/.bashrc && \
-    conda run -n ace0 pip install ipykernel && \
-    conda install -n ace0 -c conda-forge libstdcxx-ng && \
-    /opt/conda/envs/ace0/bin/python -m ipykernel install --user --name=ace0
-
-RUN cd acezero/dsacstar && \
-    conda run -n ace0 python setup.py install
-
-# Set up Xvfb
+# Xvfb for headless OpenGL (pyrender needs it)
 ENV DISPLAY=:99
-RUN Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-ENV TCNN_CUDA_ARCHITECTURES="50;52;60;61;70;75;80;86"
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Install nerfstudio
-RUN conda create --name nerfstudio -y python=3.8 && \
-    conda run -n nerfstudio pip install --upgrade pip && \
-    conda run -n nerfstudio pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118 && \
-    conda run -n nerfstudio conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit && \
-    conda run -n nerfstudio pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch && \
-    conda run -n nerfstudio pip install nerfstudio && \
-    conda run -n nerfstudio ns-install-cli
+# Default working directory = mounted project scripts
+WORKDIR /workspace/scripts/acezero
 
-WORKDIR /workspace/acezero
+# Entrypoint builds dsacstar on first run, then sleeps
+ENTRYPOINT ["/entrypoint.sh"]

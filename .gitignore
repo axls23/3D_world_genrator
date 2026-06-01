@@ -125,3 +125,16 @@ data
 results
 
 !examples/benchmarks/compression/results/
+
+# AI Assistant & IDE config
+.claude/
+.cursor/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# Run outputs & logs
+demo/output/
+pipeline_log.txt

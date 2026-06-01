@@ -106,8 +106,22 @@ class AceLoss:
             loss_prior = self.prior_loss.compute(pred_cam_coords_b31, pred_scene_coords_b31, reprojection_error_b1,
                                                  iteration, max_iterations, target_crds_b3, self.use_depth)
 
+            # Dynamic prior weight annealing
+            # If depth regularization is active, start at 2.0 * prior_loss_weight for the first 25% of iterations
+            # to anchor the scale, then decay linearly to 0.2 * prior_loss_weight to let reprojection error dominate.
+            if self.use_depth and max_iterations and max_iterations > 0:
+                progress = iteration / max_iterations
+                if progress < 0.25:
+                    current_prior_weight = self.prior_loss_weight * 2.0
+                else:
+                    # Linear decay from 2.0 to 0.2 over the remaining 75% of iterations
+                    factor = 2.0 - ((progress - 0.25) / 0.75) * 1.8
+                    current_prior_weight = self.prior_loss_weight * max(0.2, factor)
+            else:
+                current_prior_weight = self.prior_loss_weight
+
             # combine reprojection loss and prior
-            loss = loss_repro + self.prior_loss_weight * loss_prior
+            loss = loss_repro + current_prior_weight * loss_prior
             return batch_inliers, loss
         else:
             raise ValueError(f"loss_structure {self.loss_structure} is not supported.")

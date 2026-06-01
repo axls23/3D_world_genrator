@@ -33,6 +33,6 @@ setup(
 		include_dirs=[opencv_inc_dir],
 		library_dirs=[opencv_lib_dir],
 		libraries=['opencv_core','opencv_calib3d'],
-		extra_compile_args=['-fopenmp']
+		extra_compile_args=['-fopenmp', '-D_GLIBCXX_USE_CXX11_ABI=0']
 		)],		
 	cmdclass={'build_ext': BuildExtension})

@@ -79,144 +79,247 @@
             <!-- Content Area -->
             <div class="content-wrapper">
 
-                <!-- Status Cards -->
-                <div class="kpi-grid">
-                    <div class="kpi-card" id="status-card">
-                        <div class="card-header">
-                            <span class="label">Status</span>
-                            <i class="fa-solid fa-wave-square icon"></i>
+                <!-- Dashboard Tab -->
+                <div id="tab-dashboard" class="tab-section">
+                    <!-- Status Cards -->
+                    <div class="kpi-grid">
+                        <div class="kpi-card" id="status-card">
+                            <div class="card-header">
+                                <span class="label">Status</span>
+                                <i class="fa-solid fa-wave-square icon"></i>
+                            </div>
+                            <div class="value" id="status-value">Idle</div>
+                            <div class="subtext">Pipeline ready</div>
                         </div>
-                        <div class="value" id="status-value">Idle</div>
-                        <div class="subtext">Pipeline ready</div>
+
+                        <div class="kpi-card">
+                            <div class="card-header">
+                                <span class="label">Progress</span>
+                                <i class="fa-solid fa-spinner icon"></i>
+                            </div>
+                            <div class="value" id="progress-value">0%</div>
+                            <div class="progress-bar-container">
+                                <div class="progress-bar" id="progress-bar-fill"></div>
+                            </div>
+                        </div>
+
+                        <div class="kpi-card">
+                            <div class="card-header">
+                                <span class="label">Mode</span>
+                                <i class="fa-solid fa-microchip icon"></i>
+                            </div>
+                            <div class="value" id="mode-value">ACE-Zero</div>
+                            <div class="subtext">Level 2 Pipeline</div>
+                        </div>
+
+                        <div class="kpi-card action-card">
+                            <button id="train-btn" class="btn btn-primary full-width" disabled>
+                                <i class="fa-solid fa-bolt"></i> Start Training
+                            </button>
+                            <button id="stop-btn" class="btn btn-danger full-width hidden">
+                                <i class="fa-solid fa-stop"></i> Stop
+                            </button>
+                        </div>
                     </div>
 
-                    <div class="kpi-card">
-                        <div class="card-header">
-                            <span class="label">Progress</span>
-                            <i class="fa-solid fa-spinner icon"></i>
+                    <!-- Job Queue Panel -->
+                    <div class="panel queue-panel" style="margin-top: 24px;">
+                        <div class="panel-header">
+                            <div class="title">
+                                <i class="fa-solid fa-list-check"></i> Job Queue
+                            </div>
+                            <div class="controls">
+                                <span class="badge" id="queue-count">0 jobs</span>
+                            </div>
                         </div>
-                        <div class="value" id="progress-value">0%</div>
-                        <div class="progress-bar-container">
-                            <div class="progress-bar" id="progress-bar-fill"></div>
+                        <div class="panel-body">
+                            <div class="queue-list" id="queue-list">
+                                <div class="queue-empty">
+                                    <p>No enqueued jobs. Submit a training config under the Settings tab to get started.</p>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
-                    <div class="kpi-card">
-                        <div class="card-header">
-                            <span class="label">Mode</span>
-                            <i class="fa-solid fa-microchip icon"></i>
+                    <!-- Split View: Visualizer & Terminal -->
+                    <div class="split-view" style="margin-top: 24px;">
+                        <!-- Visualizer -->
+                        <div class="panel visualizer-panel">
+                            <div class="panel-header">
+                                <div class="title">
+                                    <i class="fa-solid fa-eye"></i> 3D Viewport
+                                </div>
+                                <div class="controls">
+                                    <button id="launch-viewer-btn" class="btn btn-sm btn-outline">
+                                        <i class="fa-solid fa-external-link-alt"></i> Launch Viewer
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="panel-body video-container">
+                                <div id="placeholder-view" class="placeholder">
+                                    <i class="fa-solid fa-cube fa-3x"></i>
+                                    <p>No Active Session</p>
+                                    <span class="hint">Upload a video and start training to see results</span>
+                                </div>
+                                <iframe id="viewer-frame" src="" frameborder="0" class="hidden"></iframe>
+                            </div>
                         </div>
-                        <div class="value" id="mode-value">ACE-Zero</div>
-                        <div class="subtext">Level 2 Pipeline</div>
-                    </div>
 
-                    <div class="kpi-card action-card">
-                        <button id="train-btn" class="btn btn-primary full-width" disabled>
-                            <i class="fa-solid fa-bolt"></i> Start Training
-                        </button>
-                        <button id="stop-btn" class="btn btn-danger full-width hidden">
-                            <i class="fa-solid fa-stop"></i> Stop
-                        </button>
+                        <!-- Terminal -->
+                        <div class="panel terminal-panel">
+                            <div class="panel-header">
+                                <div class="title">
+                                    <i class="fa-solid fa-terminal"></i> Pipeline Logs
+                                </div>
+                                <div class="controls">
+                                    <span class="badge" id="log-count">0 lines</span>
+                                    <button id="clear-logs-btn" class="btn-icon" title="Clear Logs">
+                                        <i class="fa-solid fa-trash-can"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="panel-body terminal-body" id="terminal-output">
+                                <div class="log-line system">Waiting for process...</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <!-- Training Configuration Panel -->
-                <div class="panel settings-panel">
-                    <div class="panel-header">
-                        <div class="title">
-                            <i class="fa-solid fa-sliders"></i> Training Configuration
+                <!-- Checkpoints Tab -->
+                <div id="tab-checkpoints" class="tab-section hidden">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div class="title">
+                                <i class="fa-solid fa-layer-group"></i> Saved Checkpoints
+                            </div>
+                            <div class="controls">
+                                <button id="refresh-checkpoints-btn" class="btn btn-sm btn-outline">
+                                    <i class="fa-solid fa-arrows-rotate"></i> Refresh
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                    <div class="panel-body settings-grid">
-                        <div class="form-group">
-                            <label>Mode</label>
-                            <select id="mode-select">
-                                <option value="ace_zero">ACE-Zero (Default)</option>
-                                <option value="simple">Simple</option>
-                                <option value="chunked">Chunked</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Quality</label>
-                            <select id="quality-mode">
-                                <option value="fast">Fast</option>
-                                <option value="balanced" selected>Balanced</option>
-                                <option value="quality">Quality</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Steps</label>
-                            <input type="number" id="max-steps" value="7000">
-                        </div>
-                        <div class="form-group">
-                            <label>SH Degree</label>
-                            <input type="number" id="sh-degree" value="3" min="0" max="4">
-                        </div>
-                        <div class="form-group">
-                            <label>Means LR</label>
-                            <input type="number" id="means-lr" value="0.00016" step="0.00001">
-                        </div>
-                        <div class="form-group">
-                            <label>SSIM Weight</label>
-                            <input type="number" id="ssim-lambda" value="0.2" step="0.1">
-                        </div>
-                        <div class="form-group full-width">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="random-bkgd"> Random Background (Anti-transparency)
-                            </label>
-                        </div>
-                        <div class="form-group full-width">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="pose-opt" checked> Pose Optimization
-                            </label>
-                        </div>
-                        <div class="form-group full-width">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="app-opt"> Appearance Optimization
-                            </label>
+                        <div class="panel-body" style="overflow-y: auto; padding: 16px;">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Size</th>
+                                        <th>Relative Path</th>
+                                        <th style="text-align: right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="checkpoints-list">
+                                    <tr>
+                                        <td colspan="4" class="text-center">Loading checkpoints...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
 
-                <!-- Split View: Visualizer & Terminal -->
-                <div class="split-view">
-                    <!-- Visualizer -->
-                    <div class="panel visualizer-panel">
+                <!-- Renders Tab -->
+                <div id="tab-renders" class="tab-section hidden">
+                    <div class="panel">
                         <div class="panel-header">
                             <div class="title">
-                                <i class="fa-solid fa-eye"></i> 3D Viewport
+                                <i class="fa-solid fa-image"></i> Render Gallery
                             </div>
                             <div class="controls">
-                                <button id="launch-viewer-btn" class="btn btn-sm btn-outline">
-                                    <i class="fa-solid fa-external-link-alt"></i> Launch Viewer
+                                <button id="refresh-renders-btn" class="btn btn-sm btn-outline">
+                                    <i class="fa-solid fa-arrows-rotate"></i> Refresh
                                 </button>
                             </div>
                         </div>
-                        <div class="panel-body video-container">
-                            <div id="placeholder-view" class="placeholder">
-                                <i class="fa-solid fa-cube fa-3x"></i>
-                                <p>No Active Session</p>
-                                <span class="hint">Upload a video and start training to see results</span>
+                        <div class="panel-body" style="overflow-y: auto;">
+                            <div id="renders-grid" class="renders-grid">
+                                <div class="text-center" style="grid-column: 1 / -1; padding: 32px; color: var(--text-secondary);">
+                                    Loading renders...
+                                </div>
                             </div>
-                            <iframe id="viewer-frame" src="" frameborder="0" class="hidden"></iframe>
                         </div>
                     </div>
+                </div>
 
-                    <!-- Terminal -->
-                    <div class="panel terminal-panel">
+                <!-- Settings Tab -->
+                <div id="tab-settings" class="tab-section hidden">
+                    <!-- Training Configuration Panel -->
+                    <div class="panel settings-panel">
                         <div class="panel-header">
                             <div class="title">
-                                <i class="fa-solid fa-terminal"></i> Pipeline Logs
-                            </div>
-                            <div class="controls">
-                                <span class="badge" id="log-count">0 lines</span>
-                                <button id="clear-logs-btn" class="btn-icon" title="Clear Logs">
-                                    <i class="fa-solid fa-trash-can"></i>
-                                </button>
+                                <i class="fa-solid fa-sliders"></i> Training Configuration
                             </div>
                         </div>
-                        <div class="panel-body terminal-body" id="terminal-output">
-                            <div class="log-line system">Waiting for process...</div>
+                        <div class="panel-body settings-grid">
+                            <div class="form-group">
+                                <label>Mode</label>
+                                <select id="mode-select">
+                                    <option value="ace_zero">ACE-Zero (Default)</option>
+                                    <option value="simple">Simple</option>
+                                    <option value="chunked">Chunked</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Quality</label>
+                                <select id="quality-mode">
+                                    <option value="fast">Fast</option>
+                                    <option value="balanced" selected>Balanced</option>
+                                    <option value="quality">Quality</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Steps</label>
+                                <input type="number" id="max-steps" value="7000">
+                            </div>
+                            <div class="form-group row-group">
+                                <div class="col">
+                                    <label>FPS</label>
+                                    <input type="number" id="fps" value="2.0" step="0.5">
+                                </div>
+                                <div class="col">
+                                    <label>Downsample (Data Factor)</label>
+                                    <input type="number" id="data-factor" value="2" min="1" max="8">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Depth Model</label>
+                                <select id="depth-model">
+                                    <option value="depth_anything">Depth Anything (Default)</option>
+                                    <option value="zoedepth">ZoeDepth</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>SH Degree</label>
+                                <input type="number" id="sh-degree" value="3" min="0" max="4">
+                            </div>
+                            <div class="form-group">
+                                <label>Means LR</label>
+                                <input type="number" id="means-lr" value="0.00016" step="0.00001">
+                            </div>
+                            <div class="form-group">
+                                <label>SSIM Weight</label>
+                                <input type="number" id="ssim-lambda" value="0.2" step="0.1">
+                            </div>
+                            <div class="form-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="random-bkgd"> Random Background (Anti-transparency)
+                                </label>
+                            </div>
+                            <div class="form-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="pose-opt" checked> Pose Optimization
+                                </label>
+                            </div>
+                            <div class="form-group full-width">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="app-opt"> Appearance Optimization
+                                </label>
+                            </div>
+                            <div class="form-group full-width" style="border-top: 1px solid var(--border-color); padding-top: 12px; margin-top: 4px;">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="skip-ace"> Skip Step 1 (Use Existing Poses)
+                                </label>
+                            </div>
                         </div>
                     </div>
                 </div>

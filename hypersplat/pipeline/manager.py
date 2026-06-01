@@ -15,33 +15,15 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 import shutil
+import numpy as np
+import cv2
+import torch
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Debug logging helper
-DEBUG_LOG_PATH = Path(__file__).parent.parent.parent.parent / ".cursor" / "debug.log"
-def debug_log(location: str, message: str, data: dict, hypothesis_id: str = None):
-    """Write debug log entry in NDJSON format"""
-    try:
-        import time
-        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        log_entry = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000)
-        }
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception as e:
-        # Log to stderr so we can see if debug logging fails
-        import sys
-        print(f"DEBUG LOG ERROR: {e}", file=sys.stderr)
+
 
 def resolve_path_relative_to_project(path_str: str, must_exist: bool = False, must_be_file: bool = False) -> Path:
     """Resolve a path relative to project root, handling 'gsplat/' prefix"""
@@ -89,9 +71,6 @@ class PipelineConfig:
         self.OUTPUT_BASE = resolve_path_relative_to_project(args.output_dir)
         # Ensure it's an absolute path
         self.OUTPUT_BASE = self.OUTPUT_BASE.resolve()
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:88", "OUTPUT_BASE resolved", {"original": args.output_dir, "resolved": str(self.OUTPUT_BASE), "exists": self.OUTPUT_BASE.exists(), "is_absolute": self.OUTPUT_BASE.is_absolute()}, "H5")
-        # #endregion
         self.FPS = args.fps
         self.DATA_FACTOR = args.data_factor
         
@@ -120,7 +99,8 @@ class PipelineConfig:
         self.SKIP_ACE = getattr(args, 'skip_ace', False)
         self.COLMAP_INPUT = getattr(args, 'colmap_input', None)
         self.QUALITY_MODE = getattr(args, 'quality_mode', 'balanced')
-        self.MIN_CONFIDENCE = getattr(args, 'min_confidence', 0.2) # Default confidence threshold
+        # Pose filtering threshold — passed to ACEZeroPoseEstimator._filter_poses()
+        self.MIN_REGISTRATION_CONFIDENCE = getattr(args, 'min_registration_confidence', 1000) # ACE-Zero threshold (int)
         self.DEPTH_MODEL = getattr(args, 'depth_model', 'depth_anything') # Default depth model
 
         # Cloud Storage
@@ -171,7 +151,8 @@ class PipelineConfig:
 
 
         # Streaming mode: dynamically accept new poses during training
-        self.STREAMING = getattr(args, 'streaming', False)
+        # Removed redundant STREAMING reset that ignored unified_stream
+
         # How often to check for new poses (in training steps)
         self.STREAMING_INTERVAL = getattr(args, 'streaming_check_interval', 1000)
 
@@ -192,15 +173,9 @@ class IntelligentPipeline:
 
     def run(self, video_path: str) -> Dict:
         """Execute the optimized ACE-Zero -> 3DGS pipeline"""
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:56", "run() entry", {"video_path": str(video_path), "output_dir": str(self.config.OUTPUT_BASE), "cwd": str(Path.cwd())}, "H4")
-        # #endregion
         
         # Resolve video path using helper function (must exist and be a file)
         video_path = resolve_path_relative_to_project(video_path, must_exist=True, must_be_file=True)
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:107", "video_path resolved", {"resolved_path": str(video_path), "exists": video_path.exists(), "is_file": video_path.is_file()}, "H4")
-        # #endregion
         
         start_time = time.time()
         
@@ -211,9 +186,6 @@ class IntelligentPipeline:
         logger.info(f"Output: {self.config.OUTPUT_BASE}")
 
         self.config.create_directories()
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:67", "directories created", {"output_base": str(self.config.OUTPUT_BASE), "output_base_exists": self.config.OUTPUT_BASE.exists()}, "H6")
-        # #endregion
 
         try:
             # 1. Pose Estimation (or Load Existing)
@@ -226,12 +198,61 @@ class IntelligentPipeline:
                 if not ace_output.exists():
                     raise FileNotFoundError(f"Cannot skip ACE-Zero: {ace_output} does not exist.")
             else:
-                ace_output = self._run_pose_estimation(video_path)
-                # === NEW: Filter low-confidence poses ===
-                ace_output = self._filter_poses_by_confidence(ace_output)
-            # #region agent log
-            debug_log("automated_intelligent_pipeline.py:72", "pose estimation completed", {"ace_output": str(ace_output), "ace_output_exists": ace_output.exists()}, "H5")
-            # #endregion
+                if self.config.STREAMING:
+                    logger.info("STREAMING MODE: Launching ACE-Zero pose estimation in a background thread...")
+                    import threading
+                    ace_output = self.config.OUTPUT_BASE / "acezero_output"
+                    
+                    # Clear any stale sparse folder to prevent resuming on bad data
+                    sparse_dir = ace_output / "sparse" / "0"
+                    if sparse_dir.exists():
+                        shutil.rmtree(sparse_dir, ignore_errors=True)
+                        
+                    pose_thread = threading.Thread(
+                        target=self._run_pose_estimation, 
+                        args=(video_path,),
+                        daemon=True
+                    )
+                    pose_thread.start()
+                    
+                    # Wait for frame extraction and the first seed poses file
+                    logger.info("Waiting for frame extraction and initial seed pose...")
+                    start_wait = time.time()
+                    acezero_result_dir = ace_output / "acezero_output"
+                    
+                    found_seed = False
+                    while not found_seed:
+                        if acezero_result_dir.exists():
+                            pose_files = list(acezero_result_dir.glob("poses_*.txt"))
+                            if pose_files:
+                                found_seed = True
+                                break
+                        time.sleep(2.0)
+                        if time.time() - start_wait > 900: # 15 minutes timeout
+                            raise RuntimeError("Timeout waiting for ACE-Zero to register the seed frame.")
+                            
+                    logger.info("Seed poses detected! Bootstrapping initial COLMAP binaries...")
+                    # Perform initial conversion using the watcher
+                    import sys
+                    from pathlib import Path
+                    scripts_pipeline = Path(__file__).resolve().parent.parent.parent / "scripts" / "pipeline"
+                    if str(scripts_pipeline) not in sys.path:
+                        sys.path.insert(0, str(scripts_pipeline))
+                    from pose_watcher import PoseWatcher
+                    
+                    watcher = PoseWatcher(ace_output)
+                    watcher.check_for_updates()
+                    
+                    # Create downsampled images since 3DGS trainer needs resized versions if data_factor > 1
+                    from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
+                    temp_estimator = ACEZeroPoseEstimator(output_dir=ace_output)
+                    if hasattr(self, 'use_wsl'):
+                        temp_estimator.use_wsl = self.use_wsl
+                    temp_estimator.create_downsampled_images(factors=[2, 4])
+                    
+                    logger.info("Initial COLMAP structure ready. Proceeding to 3DGS training.")
+                else:
+                    ace_output = self._run_pose_estimation(video_path)
             
             # 1.5. GeNVS Novel View Generation (optional)
             if self.config.GENVS_ENABLED:
@@ -239,9 +260,6 @@ class IntelligentPipeline:
             
             # 2. Training
             result_dir = self._run_training(ace_output)
-            # #region agent log
-            debug_log("automated_intelligent_pipeline.py:75", "training completed", {"result_dir": str(result_dir)}, "H3")
-            # #endregion
             
             # 2.2 Autoregressive Refinement (The "Dream" Loop)
             if self.config.GENVS_AUTOREGRESSIVE:
@@ -267,9 +285,6 @@ class IntelligentPipeline:
             }
 
         except Exception as e:
-            # #region agent log
-            debug_log("automated_intelligent_pipeline.py:85", "pipeline exception", {"exception_type": type(e).__name__, "exception_message": str(e)}, "H3")
-            # #endregion
             logger.error(f"Pipeline Failed: {e}")
             raise
 
@@ -283,55 +298,32 @@ class IntelligentPipeline:
             return True
         return False
 
-    def _filter_poses_by_confidence(self, ace_output: Path) -> Path:
-        """Filter poses by confidence score to remove bad frames."""
-        pose_file = ace_output / "poses_final.txt"
-        if not pose_file.exists():
-            return ace_output
-        
-        min_conf = self.config.MIN_CONFIDENCE
-        logger.info(f"Filtering poses with confidence < {min_conf}...")
-        
-        good_poses = []
-        bad_count = 0
-        
-        with open(pose_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 10:  # Has confidence field
-                    conf = float(parts[-1])
-                    if conf >= min_conf:
-                        good_poses.append(line)
-                    else:
-                        bad_count += 1
-                        logger.debug(f"Filtered low-confidence frame: {parts[0]} (conf={conf})")
-                else:
-                    good_poses.append(line)  # Keep lines without confidence
-        
-        if bad_count > 0:
-            # Write filtered poses
-            filtered_path = ace_output / "poses_final_filtered.txt"
-            with open(filtered_path, 'w') as f:
-                f.writelines(good_poses)
-            logger.info(f"Filtered {bad_count} low-confidence poses. {len(good_poses)} remaining.")
-            logger.info(f"Filtered poses saved to: {filtered_path}")
-        
-        return ace_output
+
+    def _clear_gpu_memory(self):
+        """Aggressively collect garbage and empty PyTorch CUDA cache."""
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            allocated_before = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserved_before = torch.cuda.memory_reserved() / (1024 ** 2)
+            torch.cuda.empty_cache()
+            allocated_after = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserved_after = torch.cuda.memory_reserved() / (1024 ** 2)
+            logger.info(
+                f"[VRAM Telemetry] Freed VRAM: "
+                f"{allocated_before:.2f}MB -> {allocated_after:.2f}MB allocated, "
+                f"{reserved_before:.2f}MB -> {reserved_after:.2f}MB reserved"
+            )
 
     def _run_pose_estimation(self, video_path: Path) -> Path:
         """Step 1: AI-Powered Pose Estimation"""
         logger.info("\nSTEP 1: POSES (ACE-Zero)")
         logger.info(f"Quality Mode: {self.config.QUALITY_MODE}")
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:89", "_run_pose_estimation entry", {"video_path": str(video_path), "__file__": str(__file__), "parent": str(Path(__file__).parent)}, "H1")
-        # #endregion
         
         # Lazy import to keep startup fast
         try:
             from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
-            # #region agent log
-            debug_log("manager.py:318", "import success (package)", {"method": "package_import"}, "H1")
-            # #endregion
         except ImportError as e1:
             logger.error(f"Failed to import from hypersplat: {e1}")
             try:
@@ -341,30 +333,21 @@ class IntelligentPipeline:
                  raise ImportError(f"Could not load ACEZeroPoseEstimator: {e2}")
 
         output_dir = self.config.OUTPUT_BASE / "acezero_output"
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:104", "output_dir set", {"output_dir": str(output_dir), "output_dir_absolute": str(output_dir.resolve()), "output_base": str(self.config.OUTPUT_BASE), "output_base_absolute": str(self.config.OUTPUT_BASE.resolve())}, "H5")
-        # #endregion
         logger.info(f"Depth Model: {self.config.DEPTH_MODEL}")
         estimator = ACEZeroPoseEstimator(
             output_dir=output_dir,
             quality_mode=self.config.QUALITY_MODE,
-            min_confidence=self.config.MIN_CONFIDENCE,
+            min_confidence=self.config.MIN_REGISTRATION_CONFIDENCE,
             depth_model=self.config.DEPTH_MODEL
         )
         
         success = estimator.process_video(str(video_path), fps=self.config.FPS)
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:107", "process_video completed", {"success": success, "fps": self.config.FPS}, "H5")
-        # #endregion
         
         if not success:
             raise RuntimeError("ACE-Zero Pose Estimation failed.")
 
         # Validation
         points_bin = output_dir / "sparse" / "0" / "points3D.bin"
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:113", "points_bin validation", {"points_bin": str(points_bin), "exists": points_bin.exists(), "size": points_bin.stat().st_size if points_bin.exists() else 0}, "H5")
-        # #endregion
         if not points_bin.exists() or points_bin.stat().st_size < 100:
             raise RuntimeError(f"Invalid point cloud generated at {points_bin}")
 
@@ -377,13 +360,14 @@ class IntelligentPipeline:
         logger.info(f"Generating {self.config.GENVS_NUM_VIEWS} synthetic views...")
         
         # Import GeNVS components
-        import sys
-        genvs_path = Path(__file__).parent.parent / "beta" / "genvs"
-        sys.path.insert(0, str(genvs_path))
+        pipeline = None
+        genvs = None
+        ref_tensor = None
+        generated_batch = None
+        novel_views = None
         
         try:
-            from run_completion import GeNVSLite
-            from inject_back_views import inject_back_views
+            from hypersplat.beta.genvs.run_completion import GeNVSLite, inject_back_views
             
             # Step A: Choose implementation based on Quality Mode
             input_images_dir = colmap_dir / "images"
@@ -400,20 +384,45 @@ class IntelligentPipeline:
                 logger.info("  [GeNVS] Using GeNVS-Core (True 3D-Aware Diffusion)")
                 try:
                     # Import our new core pipeline
-                    import sys
-                    sys.path.append(str(Path(__file__).parent.parent / "genvs_core"))
-                    from scripts.genvs_core.pipeline import GeNVSPipeline
+                    from hypersplat.beta.genvs.pipeline import GeNVSPipeline
                     
-                    # Initialize
-                    pipeline = GeNVSPipeline(device='cuda')
+                    # Initialize with model_channels=64 to match trained checkpoints
+                    pipeline = GeNVSPipeline(device='cuda', model_channels=64)
+                    
+                    # === CHECKPOINT LOADING ===
+                    # Priority: explicit CLI path > auto-detect latest
+                    ckpt_path = None
+                    if self.config.GENVS_CKPT and Path(self.config.GENVS_CKPT).exists():
+                        ckpt_path = self.config.GENVS_CKPT
+                    else:
+                        # Auto-detect latest checkpoint
+                        ckpt_dir = Path("results/genvs_train/checkpoints")
+                        if ckpt_dir.exists():
+                            ckpts = sorted(ckpt_dir.glob("step_*.pt"), 
+                                         key=lambda p: int(p.stem.split("_")[1]))
+                            if ckpts:
+                                ckpt_path = str(ckpts[-1])
+                    
+                    if ckpt_path:
+                        step = pipeline.load_checkpoint(ckpt_path)
+                        logger.info(f"  [GeNVS-Core] Loaded trained checkpoint: {ckpt_path} (step {step})")
+                    else:
+                        logger.error("  [GeNVS-Core] NO CHECKPOINT FOUND! Model has random weights.")
+                        logger.error("  [GeNVS-Core] Train first: python hypersplat/beta/genvs/train.py --data_dir <path>")
+                        logger.error("  [GeNVS-Core] Or specify: --genvs_ckpt <path/to/step_XXXX.pt>")
+                        raise FileNotFoundError("GeNVS checkpoint required but not found. Train the model first.")
                     
                     # === REAL POSE INTEGRATION ===
                     from hypersplat.beta.genvs.dataset import GenVSDataset
                     
                     # 1. Load the real dataset from the ACE output
                     # This handles pose loading, focal lengths, and scene normalization
-                    logger.info(f"  [GeNVS] Loading real scene geometry from {colmap_dir}")
-                    dataset = GenVSDataset(root_dir=colmap_dir, pose_file="poses_final.txt", image_dir="images", image_size=self.config.GENVS_IMAGE_SIZE if hasattr(self.config, 'GENVS_IMAGE_SIZE') else 128)
+                    # Determine poses_final.txt location (at root or in acezero_output/)
+                    pose_file = "poses_final.txt"
+                    if not (colmap_dir / pose_file).exists() and (colmap_dir / "acezero_output" / pose_file).exists():
+                        pose_file = "acezero_output/poses_final.txt"
+                    
+                    dataset = GenVSDataset(root_dir=colmap_dir, pose_file=pose_file, image_dir="images", image_size=self.config.GENVS_IMAGE_SIZE if hasattr(self.config, 'GENVS_IMAGE_SIZE') else 128)
                     
                     # 2. Select Reference View
                     ref_idx = len(dataset) // 2
@@ -487,10 +496,6 @@ class IntelligentPipeline:
                 # Initialize GeNVS-Lite (uses ZoeDepth by default)
                 genvs = GeNVSLite(use_zoedepth=True)
                 
-                # Process sample frames for novel view generation
-                import cv2
-                import numpy as np
-                
                 image_files = sorted(input_images_dir.glob("*.jpg")) + sorted(input_images_dir.glob("*.png"))
                 if not image_files:
                     logger.warning("  No images found, skipping GeNVS")
@@ -533,26 +538,25 @@ class IntelligentPipeline:
         except Exception as e:
             logger.warning(f"GeNVS failed: {e}. Falling back to original dataset.")
             return colmap_dir
+        finally:
+            logger.info("Cleaning up GeNVS model resources...")
+            del pipeline
+            del genvs
+            del ref_tensor
+            del generated_batch
+            del novel_views
+            self._clear_gpu_memory()
 
     def _run_training(self, data_dir: Path, resume_ckpt: Optional[Path] = None) -> Path:
         """Step 2: MCMC 3DGS Training"""
         logger.info("\nSTEP 2: TRAINING (3DGS MCMC)")
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:120", "_run_training entry", {"data_dir": str(data_dir), "data_dir_exists": data_dir.exists(), "__file__": str(__file__)}, "H2")
-        # #endregion
         
         result_dir = self.config.OUTPUT_BASE / "results" / "acezero_3dgs"
         trainer_script = Path(__file__).resolve().parent.parent.parent / "examples" / "simple_trainer.py"
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:125", "trainer_script path calculated", {"trainer_script": str(trainer_script), "exists": trainer_script.exists(), "parent_paths": str(Path(__file__).resolve().parent.parent.parent)}, "H2")
-        # #endregion
         
         if not trainer_script.exists():
              # Fallback location check
              trainer_script = Path("examples/simple_trainer.py")
-             # #region agent log
-             debug_log("automated_intelligent_pipeline.py:129", "trainer_script fallback", {"trainer_script": str(trainer_script), "exists": trainer_script.exists(), "is_absolute": trainer_script.is_absolute()}, "H2")
-             # #endregion
 
         cmd = [
             sys.executable, "-u", str(trainer_script), "mcmc",
@@ -603,31 +607,20 @@ class IntelligentPipeline:
             logger.info(f"  [Resume] Continuing from checkpoint: {resume_ckpt.name}")
 
         logger.info(f"Command: {' '.join(cmd)}")
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:150", "command constructed", {"cmd": cmd, "sys_executable": sys.executable, "trainer_script": str(trainer_script)}, "H2,H3")
-        # #endregion
         
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:73", "starting training subprocess", {"cmd": cmd, "resume_ckpt": str(resume_ckpt) if resume_ckpt else None}, "H3")
-        # #endregion
 
         # Stream output
         line_count = 0
         for line in process.stdout:
             print(f"[Train] {line.strip()}")
             line_count += 1
-            if line_count <= 5:  # Log first 5 lines
-                # #region agent log
-                debug_log("automated_intelligent_pipeline.py:157", "subprocess output", {"line": line.strip()[:200]}, "H3")
-                # #endregion
+            if line_count <= 5:  # Log first 5 lines to logger
+                logger.debug(f"[Train] {line.strip()}")
             
         exit_code = process.wait()
-        # #region agent log
-        debug_log("automated_intelligent_pipeline.py:160", "subprocess completed", {"exit_code": exit_code, "line_count": line_count}, "H3")
-        # #endregion
         if exit_code != 0:
             raise RuntimeError(f"Training process exited with error code {exit_code}.")
 
@@ -646,10 +639,7 @@ class IntelligentPipeline:
         import numpy as np
         import yaml
         
-        genvs_path = Path(__file__).parent.parent / "beta" / "genvs"
-        sys.path.insert(0, str(genvs_path))
-        from run_completion import GeNVSLite
-        from inject_back_views import read_model, mirror_camera_pose, compute_scene_center, qvec2rotmat
+        from hypersplat.beta.genvs.run_completion import GeNVSLite, read_model, mirror_camera_pose, compute_scene_center, qvec2rotmat
         
         # [Governor Loop]
         max_loops = 3
@@ -686,15 +676,16 @@ class IntelligentPipeline:
             # 3. Re-Train with Governor's Overrides
             # We need to pass overrides to _run_training. 
             # Currently _run_training reads from self.config.
-            # We should patch self.config temporarily or modify _run_training to accept kwargs.
-            # Let's patch self.config for simplicity in this loop.
-            original_config_state = self._patch_config(overrides)
+            # We temporarily swap self.config with a patched copy
+            import copy
+            original_config = self.config
+            self.config = self._patch_config(original_config, overrides)
             
             try:
                 current_result_dir = self._run_training(augmented_dir)
                 current_data_dir = augmented_dir
             finally:
-                self._restore_config(original_config_state)
+                self.config = original_config
                 
         return current_result_dir
 
@@ -726,22 +717,17 @@ class IntelligentPipeline:
             
         return "STEADY", {}
 
-    def _patch_config(self, overrides: Dict) -> Dict:
-        """Apply overrides to self.config and return original values."""
-        original = {}
+    def _patch_config(self, base_config, overrides: Dict):
+        """Create a patched copy of config without mutating the original."""
+        import copy
+        new_config = copy.copy(base_config)
         for k, v in overrides.items():
             # Map snake_case overrides to UPPER_CASE config keys if needed
-            # For now assume keys match CLI args or Config attr names
             key = k.upper()
-            if hasattr(self.config, key):
-                original[key] = getattr(self.config, key)
-                setattr(self.config, key, v)
-                logger.info(f"  [Config Override] {key}: {original[key]} -> {v}")
-        return original
-
-    def _restore_config(self, original: Dict):
-        for k, v in original.items():
-            setattr(self.config, k, v)
+            if hasattr(new_config, key):
+                logger.info(f"  [Config Override] {key}: {getattr(new_config, key)} -> {v}")
+                setattr(new_config, key, v)
+        return new_config
 
     def _perform_genvs_refinement(self, ace_output, initial_result_dir, iter_dir, overrides) -> Path:
         import torch
@@ -752,15 +738,10 @@ class IntelligentPipeline:
              logger.info("  Skipping GeNVS refinement as requested (Wait/Fine-tune mode).")
              return ace_output
 
-        # Use the beta location as requested
-        beta_path = Path(__file__).parent.parent / "beta"
-        if str(beta_path) not in sys.path:
-             sys.path.insert(0, str(beta_path))
-             
         try:
-             from genvs.run_completion import (
+             from hypersplat.beta.genvs.run_completion import (
                  GeNVSLite, read_model, mirror_camera_pose, 
-                 compute_scene_center, qvec2rotmat, inject_back_views
+                 compute_scene_center, qvec2rotmat, inject_autoregressive_back_views
              )
         except ImportError as e:
              logger.error(f"Failed to import GeNVS utilities from beta/genvs: {e}")
@@ -831,65 +812,79 @@ class IntelligentPipeline:
         
         # 3. GeNVS Refinement
         logger.info("  Refining sample with GeNVS...")
-        # Use the already imported GeNVSLite
-        genvs = GeNVSLite() # No use_zoedepth in our current implementation
         
-        front_img_bgr = cv2.imread(str(ace_output / "images" / ref_image.name))
-        front_img = cv2.cvtColor(front_img_bgr, cv2.COLOR_BGR2RGB)
+        genvs = None
+        src_img_t = None
+        src_pose_t = None
+        novel_view_np = None
         
-        # Use our generate_augmented_view method
-        # We need source_img (tensor), source_pose, source_K, target_pose
-        # For simplicity in this pipeline wrapper, we can just use the provided method
-        # if we wrap it correctly or update run_completion to have the expected API.
-        
-        # Let's adjust run_completion.py to have generate_novel_views for compatibility 
-        # OR just use generate_augmented_view here.
-        
-        # Actually, let's keep manager.py clean and fix run_completion.py to expose what it needs.
-        # But for now, I'll match what I wrote in run_completion.
-        
-        source_item = {
-            "image": torch.from_numpy(front_img).permute(2, 0, 1).float() / 255.0 * 2.0 - 1.0,
-            "pose": torch.from_numpy(ref_image.qvec2rotmat()).float(), # placeholder, needs 4x4
-            "K": torch.tensor(K).float()
-        }
-        # Source Pose (The original frame)
-        R_src_w2c = qvec2rotmat(ref_image.qvec)
-        R_src_c2w = R_src_w2c.T
-        t_src_c2w = -R_src_c2w @ ref_image.tvec
-        src_c2w = np.eye(4)
-        src_c2w[:3, :3] = R_src_c2w
-        src_c2w[:3, 3] = t_src_c2w
-        
-        src_img_t = torch.from_numpy(front_img).permute(2, 0, 1).float() / 255.0 * 2.0 - 1.0
-        src_pose_t = torch.from_numpy(src_c2w).float()
-        
-        novel_view_np = genvs.generate_augmented_view(
-            source_img=src_img_t,
-            source_pose=src_pose_t,
-            source_K=torch.tensor(K).float(),
-            target_pose=torch.from_numpy(c2w).float() # Using the mirrored c2w we computed
-        )
-        
-        refined_path = iter_dir / "refined_back_0000.png"
-        cv2.imwrite(str(refined_path), cv2.cvtColor(novel_view_np, cv2.COLOR_RGB2BGR))
-        
-        # 4. Inject into Dataset
-        logger.info("  Injecting refined view...")
-        augmented_dir = self.config.OUTPUT_BASE / f"acezero_output_autoregressive_{iter_dir.name}"
-        
-        temp_novel_dir = iter_dir / "novel_temp"
-        temp_novel_dir.mkdir(exist_ok=True)
-        shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
-        
-        # Use the already imported inject_back_views
-        inject_back_views(
-            ace_output=ace_output,
-            initial_result_dir=initial_result_dir,
-            iter_dir=iter_dir,
-            overrides=overrides
-        )
-        return augmented_dir
+        try:
+            # Use the already imported GeNVSLite
+            genvs = GeNVSLite() # No use_zoedepth in our current implementation
+            
+            front_img_bgr = cv2.imread(str(ace_output / "images" / ref_image.name))
+            front_img = cv2.cvtColor(front_img_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Use our generate_augmented_view method
+            # We need source_img (tensor), source_pose, source_K, target_pose
+            # For simplicity in this pipeline wrapper, we can just use the provided method
+            # if we wrap it correctly or update run_completion to have the expected API.
+            
+            # Let's adjust run_completion.py to have generate_novel_views for compatibility 
+            # OR just use generate_augmented_view here.
+            
+            # Actually, let's keep manager.py clean and fix run_completion.py to expose what it needs.
+            # But for now, I'll match what I wrote in run_completion.
+            
+            source_item = {
+                "image": torch.from_numpy(front_img).permute(2, 0, 1).float() / 255.0 * 2.0 - 1.0,
+                "pose": torch.from_numpy(ref_image.qvec2rotmat()).float(), # placeholder, needs 4x4
+                "K": torch.tensor(K).float()
+            }
+            # Source Pose (The original frame)
+            R_src_w2c = qvec2rotmat(ref_image.qvec)
+            R_src_c2w = R_src_w2c.T
+            t_src_c2w = -R_src_c2w @ ref_image.tvec
+            src_c2w = np.eye(4)
+            src_c2w[:3, :3] = R_src_c2w
+            src_c2w[:3, 3] = t_src_c2w
+            
+            src_img_t = torch.from_numpy(front_img).permute(2, 0, 1).float() / 255.0 * 2.0 - 1.0
+            src_pose_t = torch.from_numpy(src_c2w).float()
+            
+            novel_view_np = genvs.generate_augmented_view(
+                source_img=src_img_t,
+                source_pose=src_pose_t,
+                source_K=torch.tensor(K).float(),
+                target_pose=torch.from_numpy(c2w).float() # Using the mirrored c2w we computed
+            )
+            
+            refined_path = iter_dir / "refined_back_0000.png"
+            cv2.imwrite(str(refined_path), cv2.cvtColor(novel_view_np, cv2.COLOR_RGB2BGR))
+            
+            # 4. Inject into Dataset
+            logger.info("  Injecting refined view...")
+            augmented_dir = self.config.OUTPUT_BASE / f"acezero_output_autoregressive_{iter_dir.name}"
+            
+            temp_novel_dir = iter_dir / "novel_temp"
+            temp_novel_dir.mkdir(exist_ok=True)
+            shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
+            
+            # Use the already imported inject_autoregressive_back_views
+            inject_autoregressive_back_views(
+                ace_output=ace_output,
+                initial_result_dir=initial_result_dir,
+                iter_dir=iter_dir,
+                overrides=overrides
+            )
+            return augmented_dir
+        finally:
+            logger.info("Cleaning up GeNVS model resources in autoregressive loop...")
+            del genvs
+            del src_img_t
+            del src_pose_t
+            del novel_view_np
+            self._clear_gpu_memory()
 
     def _run_floater_pruning(self, result_dir: Path):
         """Step 2.5: Prune floaters from 3DGS model (optional post-processing)"""
@@ -1062,7 +1057,7 @@ def main():
                         help="ACE-Zero quality mode: fast (speed), balanced (default), quality (max accuracy)")
     
     # === NEW: Pose Confidence Filtering ===
-    parser.add_argument("--min-confidence", dest="min_confidence", type=int, default=1000,
+    parser.add_argument("--min-registration-confidence", dest="min_registration_confidence", type=int, default=1000,
                         help="Minimum pose confidence threshold (poses below this are filtered)")
     
     # === NEW: Early Stopping ===

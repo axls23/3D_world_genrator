@@ -10,6 +10,7 @@ from .encoder import GeometryEncoder
 from .feature_volume import FrustumFeatureVolume
 from .rendering import NeuralVolumeRenderer
 from .unet_2d import DiffusionUNet
+from .dit_2d import DiT_S_2
 
 class GeNVSPipeline(nn.Module):
     """
@@ -20,17 +21,18 @@ class GeNVSPipeline(nn.Module):
     2. Generative Stage: Noisy RGB + Feature -> Denoised RGB (via DDIM)
     """
     
-    def __init__(self, device='cuda', **unet_kwargs):
+    def __init__(self, device='cuda', model_channels=64, **unet_kwargs):
         super().__init__()
         self.device = device
+        self.model_channels = model_channels
         
         # Initialize components
         self.encoder = GeometryEncoder().to(device)
         self.volume_struct = FrustumFeatureVolume().to(device)
         self.renderer = NeuralVolumeRenderer().to(device)
         
-        # 2. Generative Component: UNet
-        self.unet = DiffusionUNet(**unet_kwargs).to(device)
+        # 2. Generative Component: DiT
+        self.unet = DiT_S_2(in_channels=19, out_channels=3, input_size=128).to(device)
 
         # 3. Noise Schedule (Linear Beta) - Consistent with train.py
         self.num_timesteps = 1000
@@ -236,6 +238,58 @@ class GeNVSPipeline(nn.Module):
         loss = (grad_term * x_0).sum()
             
         return loss
+
+    def load_checkpoint(self, path: str) -> int:
+        """
+        Load a checkpoint saved by GeNVSTrainer.
+        
+        The trainer saves each component's state_dict separately:
+        {'encoder': ..., 'volume': ..., 'renderer': ..., 'unet': ..., 'step': ...}
+        
+        Note: The trainer uses 'volume' as the key, but this pipeline stores
+        the FrustumFeatureVolume as 'self.volume_struct'.
+        
+        Returns:
+            step: The training step at which this checkpoint was saved.
+        """
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        # Load each component's state dict
+        if 'encoder' in checkpoint:
+            self.encoder.load_state_dict(checkpoint['encoder'])
+        if 'volume' in checkpoint:
+            # Key mapping: trainer saves as 'volume', pipeline stores as 'volume_struct'
+            self.volume_struct.load_state_dict(checkpoint['volume'])
+        elif 'volume_struct' in checkpoint:
+            self.volume_struct.load_state_dict(checkpoint['volume_struct'])
+        if 'renderer' in checkpoint:
+            self.renderer.load_state_dict(checkpoint['renderer'])
+        if 'unet' in checkpoint:
+            try:
+                self.unet.load_state_dict(checkpoint['unet'])
+            except RuntimeError as e:
+                logging.warning(f"[GeNVS] Failed to load UNet/DiT weights (architecture mismatch?): {e}")
+        
+        step = checkpoint.get('step', 0)
+        logging.info(f"[GeNVS] Loaded checkpoint from step {step} ({path})")
+        return step
+
+    def save_checkpoint(self, path: str, step: int):
+        """
+        Save a checkpoint in the same format as GeNVSTrainer.
+        Enables symmetric load/save from both trainer and pipeline.
+        """
+        torch.save({
+            'step': step,
+            'encoder': self.encoder.state_dict(),
+            'volume': self.volume_struct.state_dict(),
+            'renderer': self.renderer.state_dict(),
+            'unet': self.unet.state_dict(),
+            'config': {
+                'model_channels': self.model_channels,
+            }
+        }, path)
+        logging.info(f"[GeNVS] Saved checkpoint at step {step} to {path}")
 
     def save_config(self, output_path: str):
         """Dump the internal diffusion hyperparameters to a YAML file."""

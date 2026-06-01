@@ -1,4 +1,3 @@
-"""
 System Architecture: 3DGS Reconstruction Pipeline
 
 ## High-Level Design
@@ -11,8 +10,8 @@ System Architecture: 3DGS Reconstruction Pipeline
                               │ HTTP/WebSocket
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY LAYER                                    │
-│                       http://localhost:8080                                  │
+│                         API GATEWAY LAYER                                   │
+│                       http://localhost:8080                                 │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │   /api/v1   │  │  /api/jobs  │  │  /api/ws    │  │  /api/assets        │ │
 │  │   REST API  │  │  Job Queue  │  │  WebSocket  │  │  Static Files       │ │
@@ -108,7 +107,7 @@ System Architecture: 3DGS Reconstruction Pipeline
               ┌────────────┼────────────┐
               ▼            ▼            ▼
        ┌──────────┐  ┌──────────┐  ┌──────────┐
-       │ COMPLETED │  │  FAILED  │  │ CANCELLED│
+       │ COMPLETED│  │  FAILED  │  │ CANCELLED│
        └──────────┘  └──────────┘  └──────────┘
 ```
 
@@ -169,6 +168,3 @@ pipeline:
     render_preview: true
     keep_checkpoints: [1000, 5000, 10000, "final"]
 ```
-"""
-
-# Implementation follows the design above

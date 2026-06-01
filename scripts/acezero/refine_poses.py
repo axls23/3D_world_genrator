@@ -130,7 +130,7 @@ class PoseRefiner:
             self.pose_network = PoseNetwork(0, 128)
             self.pose_network = self.pose_network.to(self.device)
             self.pose_network.train()
-            use_fused = torch.cuda.is_available()
+            use_fused = False
             self.pose_optimizer = optim.AdamW(self.pose_network.parameters(), lr=self.learning_rate, fused=use_fused)
 
     def _orthonormalize_poses(self, poses_b33):

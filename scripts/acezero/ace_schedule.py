@@ -13,13 +13,9 @@ class ScheduleACE:
     def __init__(self, ace_network, options):
 
         # Setup optimization parameters.
-        # [OPTIMIZATION] Use FusedAdamW on CUDA for specific speedup
+        # [OPTIMIZATION] Use FusedAdamW on CUDA for specific speedup (Disabled due to PyTorch AMP dtype mismatch on fused kernels)
         # [OPTIMIZATION] Tuned betas (0.9, 0.95) for faster convergence in reduced iteration regimes
-        use_fused = torch.cuda.is_available()
-        self.optimizer = optim.AdamW(ace_network.parameters(), 
-                                     lr=options.learning_rate_min,
-                                     betas=(0.9, 0.95),
-                                     fused=use_fused)
+        use_fused = False
 
         if options.learning_rate_schedule not in ["circle", "constant", "1cyclepoly"]:
             raise ValueError(f"Unknown learning rate schedule: {options.learning_rate_schedule}")
@@ -30,11 +26,18 @@ class ScheduleACE:
         # Setup learning rate scheduler
         if self.schedule == 'constant':
             # No schedule. Use constant learning rate.
+            self.optimizer = optim.AdamW(ace_network.parameters(), 
+                                         lr=options.learning_rate_min,
+                                         betas=(0.9, 0.95),
+                                         fused=use_fused)
             self.scheduler = None
 
         elif self.schedule == '1cyclepoly':
             # Approximate 1cycle learning rate schedule with linear warmup and cooldown.
-            self.optimizer = optim.AdamW(ace_network.parameters(), lr=options.learning_rate_max)
+            self.optimizer = optim.AdamW(ace_network.parameters(),
+                                         lr=options.learning_rate_max,
+                                         betas=(0.9, 0.95),
+                                         fused=use_fused)
 
             # Warmup phase. Increase from warmup learning rate to max learning rate.
             self.warmup_iterations = options.learning_rate_warmup_iterations
@@ -67,7 +70,10 @@ class ScheduleACE:
 
         else:
             # 1 Cycle learning rate schedule.
-            self.optimizer = optim.AdamW(ace_network.parameters(), lr=options.learning_rate_min)
+            self.optimizer = optim.AdamW(ace_network.parameters(),
+                                         lr=options.learning_rate_min,
+                                         betas=(0.9, 0.95),
+                                         fused=use_fused)
             self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer,
                                                            max_lr=options.learning_rate_max,
                                                            total_steps=self.max_iterations,

@@ -182,7 +182,77 @@ def compute_scene_center(images):
         centers.append(t_c2w)
     return np.mean(centers, axis=0)
 
-def inject_back_views(ace_output: Path, initial_result_dir: Path, iter_dir: Path, overrides: Dict):
+CameraModel = namedtuple("CameraModel", ["model_id", "model_name", "num_params"])
+
+CAMERA_MODELS = {
+    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
+    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
+    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),
+    CameraModel(model_id=3, model_name="RADIAL", num_params=5),
+    CameraModel(model_id=4, model_name="OPENCV", num_params=8),
+    CameraModel(model_id=5, model_name="OPENCV_FISHEYE", num_params=8),
+    CameraModel(model_id=6, model_name="FULL_OPENCV", num_params=12),
+    CameraModel(model_id=7, model_name="FOV", num_params=5),
+    CameraModel(model_id=8, model_name="SIMPLE_RADIAL_FISHEYE", num_params=4),
+    CameraModel(model_id=9, model_name="RADIAL_FISHEYE", num_params=5),
+    CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12)
+}
+CAMERA_MODEL_IDS = dict([(camera_model.model_id, camera_model)
+                         for camera_model in CAMERA_MODELS])
+CAMERA_MODEL_NAMES = dict([(camera_model.model_name, camera_model)
+                           for camera_model in CAMERA_MODELS])
+
+def write_cameras_binary(cameras, path):
+    """Write cameras to binary file."""
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(cameras)))
+        for cam_id, cam in cameras.items():
+            if isinstance(cam.model, int):
+                model_id = cam.model
+            else:
+                model_id = CAMERA_MODEL_NAMES[cam.model].model_id
+            fid.write(struct.pack("<iiQQ", cam.id, model_id, cam.width, cam.height))
+            for param in cam.params:
+                fid.write(struct.pack("<d", param))
+
+def write_images_binary(images, path):
+    """Write images to binary file."""
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(images)))
+        for img_id, img in images.items():
+            fid.write(struct.pack("<i", img.id))
+            for q in img.qvec:
+                fid.write(struct.pack("<d", float(q)))
+            for t in img.tvec:
+                fid.write(struct.pack("<d", float(t)))
+            fid.write(struct.pack("<i", img.camera_id))
+            # Write image name as null-terminated string
+            fid.write(img.name.encode("utf-8"))
+            fid.write(b"\x00")
+            # Write number of 2D points
+            num_points = len(img.xys) if img.xys is not None and len(img.xys) > 0 else 0
+            fid.write(struct.pack("<Q", num_points))
+            # Write 2D points if any
+            if num_points > 0:
+                for i in range(num_points):
+                    fid.write(struct.pack("<ddq", img.xys[i][0], img.xys[i][1], int(img.point3D_ids[i])))
+
+def write_points3D_binary(points3D, path):
+    """Write empty points3D binary file."""
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", 0))  # No points
+
+def write_model(cameras, images, points3D, path, ext=".bin"):
+    """Write COLMAP model. Default to binary format for compatibility."""
+    if ext == ".txt":
+        pass
+    else:
+        # Binary format (preferred by pycolmap)
+        write_cameras_binary(cameras, os.path.join(path, "cameras.bin"))
+        write_images_binary(images, os.path.join(path, "images.bin"))
+        write_points3D_binary(points3D, os.path.join(path, "points3D.bin"))
+
+def inject_autoregressive_back_views(ace_output: Path, initial_result_dir: Path, iter_dir: Path, overrides: Dict):
     """
     Augments the dataset by generating synthetic back-views and integrating them.
     Logic:
@@ -228,13 +298,166 @@ def inject_back_views(ace_output: Path, initial_result_dir: Path, iter_dir: Path
     logger.info(f"  Dataset augmented at {augmented_base}")
     return augmented_base
 
+def inject_back_views(
+    colmap_dir: Path,
+    novel_views_dir: Path,
+    output_dir: Path,
+    camera_offset: float = 0.0
+):
+    """
+    Inject novel back-view images into the COLMAP dataset.
+    """
+    import shutil
+    import json
+    
+    colmap_dir = Path(colmap_dir)
+    novel_views_dir = Path(novel_views_dir)
+    output_dir = Path(output_dir)
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create output structure
+    sparse_out = output_dir / "sparse" / "0"
+    sparse_out.mkdir(parents=True, exist_ok=True)
+    images_out = output_dir / "images"
+    images_out.mkdir(parents=True, exist_ok=True)
+    
+    # Read original COLMAP model
+    sparse_in = colmap_dir / "sparse" / "0"
+    if not sparse_in.exists():
+        sparse_in = colmap_dir / "sparse"
+    
+    cameras, images, points3D = read_model(str(sparse_in))
+    
+    if cameras is None:
+        raise ValueError(f"Could not read COLMAP model from {sparse_in}")
+    
+    logger.info(f"[Inject] Read {len(cameras)} cameras, {len(images)} images")
+    
+    # Copy original images
+    orig_images_dir = colmap_dir / "images"
+    for img_file in orig_images_dir.glob("*"):
+        if img_file.is_file():
+            shutil.copy2(img_file, images_out / img_file.name)
+    logger.info(f"[Inject] Copied original images to {images_out}")
+    
+    # Compute scene center
+    scene_center = compute_scene_center(images)
+    logger.info(f"[Inject] Scene center: {scene_center}")
+    
+    # Get novel view images
+    novel_images = sorted(novel_views_dir.glob("*.png"))
+    if not novel_images:
+        novel_images = sorted(novel_views_dir.glob("*.jpg"))
+    
+    if not novel_images:
+        raise ValueError(f"No novel view images found in {novel_views_dir}")
+    
+    logger.info(f"[Inject] Found {len(novel_images)} novel views to inject")
+    
+    # Get reference camera (use the first one for intrinsics)
+    ref_camera_id = list(cameras.keys())[0]
+    ref_camera = cameras[ref_camera_id]
+    
+    # Get reference image for pose (use the middle one)
+    ref_image_id = list(images.keys())[len(images) // 2]
+    ref_image = images[ref_image_id]
+    
+    # Create new camera and image entries for novel views
+    max_image_id = max(images.keys())
+    max_camera_id = max(cameras.keys())
+    
+    new_images = dict(images)  # Copy existing
+    new_cameras = dict(cameras)  # Copy existing
+    
+    for i, novel_img_path in enumerate(novel_images):
+        # Copy novel view image
+        new_img_name = f"novel_back_{i:04d}.png"
+        shutil.copy2(novel_img_path, images_out / new_img_name)
+        
+        # Create synthetic back-view pose
+        # Distribute novel views evenly around the back hemisphere
+        angle_offset = (i / len(novel_images)) * np.pi * 0.5  # 90 degree spread
+        
+        # Use reference pose as base
+        base_qvec = ref_image.qvec
+        base_tvec = ref_image.tvec
+        
+        # Mirror it
+        new_qvec, new_tvec = mirror_camera_pose(base_qvec, base_tvec, scene_center)
+        
+        # Add slight rotation variation for better coverage
+        # Small perturbation around Y axis
+        perturb_angle = (angle_offset - np.pi * 0.25)  # Center around 0
+        R_perturb = np.array([
+            [np.cos(perturb_angle), 0, np.sin(perturb_angle)],
+            [0, 1, 0],
+            [-np.sin(perturb_angle), 0, np.cos(perturb_angle)]
+        ])
+        R_new = R_perturb @ qvec2rotmat(new_qvec)
+        new_qvec = rotmat2qvec(R_new)
+        
+        # Create new image entry
+        new_image_id = max_image_id + i + 1
+        new_image = Image(
+            id=new_image_id,
+            qvec=new_qvec,
+            tvec=new_tvec,
+            camera_id=ref_camera_id,  # Use same camera intrinsics
+            name=new_img_name,
+            xys=np.zeros((0, 2)),  # No 2D points for synthetic views
+            point3D_ids=np.array([], dtype=np.int64)
+        )
+        new_images[new_image_id] = new_image
+    
+    logger.info(f"[Inject] Created {len(novel_images)} synthetic back-view cameras")
+    
+    # Write augmented model (binary format for pycolmap compatibility)
+    write_model(new_cameras, new_images, points3D, str(sparse_out), ext=".bin")
+    
+    # IMPORTANT: Copy original points3D.bin for SFM initialization (don't overwrite with empty)
+    orig_points_file = sparse_in / "points3D.bin"
+    if orig_points_file.exists():
+        shutil.copy2(orig_points_file, sparse_out / "points3D.bin")
+        logger.info(f"[Inject] Copied original points3D.bin for SFM init")
+    
+    logger.info(f"[Inject] Written binary COLMAP files to {sparse_out}")
+    
+    # Copy downsampled image folders if they exist
+    # Also add novel images to each downsampled folder
+    for factor in ["2", "4", "8"]:
+        src_folder = colmap_dir / f"images_{factor}"
+        if src_folder.exists():
+            dst_folder = output_dir / f"images_{factor}"
+            if not dst_folder.exists():
+                shutil.copytree(src_folder, dst_folder)
+            # Copy novel images to this folder too (same size for now)
+            for novel_img_path in novel_images:
+                new_img_name = f"novel_back_{novel_images.index(novel_img_path):04d}.png"
+                shutil.copy2(images_out / new_img_name, dst_folder / new_img_name)
+    
+    logger.info(f"[Inject] Augmented dataset saved to {output_dir}")
+    logger.info(f"[Inject] Total images: {len(new_images)} ({len(images)} original + {len(novel_images)} novel)")
+    
+    # Save injection metadata
+    metadata = {
+        "original_images": len(images),
+        "novel_views": len(novel_images),
+        "total_images": len(new_images),
+        "scene_center": scene_center.tolist(),
+    }
+    with open(output_dir / "injection_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    return output_dir
+
 class GeNVSLite:
-    def __init__(self, checkpoint_path=None, device="cuda"):
+    def __init__(self, checkpoint_path=None, device="cuda", use_zoedepth=False):
         self.device = device
-        self.pipeline = GeNVSPipeline(device=device)
+        # model_channels=64 matches the trained checkpoint architecture
+        self.pipeline = GeNVSPipeline(device=device, model_channels=64)
         if checkpoint_path and Path(checkpoint_path).exists():
-             state = torch.load(checkpoint_path, map_location=device)
-             self.pipeline.load_state_dict(state.get('pipeline', state))
+             self.pipeline.load_checkpoint(checkpoint_path)
              
     def generate_augmented_view(self, source_img, source_pose, source_K, target_pose):
         with torch.no_grad():
@@ -246,4 +469,61 @@ class GeNVSLite:
                  source_K.to(self.device).unsqueeze(0)
              )
         return (res[0].cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255
+
+    def generate_novel_views(self, ref_image_rgb: np.ndarray, num_views: int = 20, image_size: int = 128) -> List[np.ndarray]:
+        """
+        Generate novel views by orbiting around a dummy central pose using the internal GeNVSPipeline.
+        """
+        import cv2
+        # Resize input image to image_size x image_size
+        ref_resized = cv2.resize(ref_image_rgb, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        
+        # Convert to tensor: shape [3, H, W], normalized to [-1, 1]
+        img_tensor = torch.from_numpy(ref_resized).permute(2, 0, 1).float() / 127.5 - 1.0
+        ref_tensor = img_tensor.unsqueeze(0).to(self.device)
+        
+        # Source pose: Identity 4x4
+        source_pose = torch.eye(4, device=self.device).unsqueeze(0)
+        
+        # Source K: estimated pinhole camera intrinsics
+        f = image_size  # Guestimate focal length as equal to image size
+        source_K = torch.tensor([
+            [f, 0, image_size / 2.0],
+            [0, f, image_size / 2.0],
+            [0, 0, 1.0]
+        ], device=self.device).unsqueeze(0)
+        
+        # Generate target poses (orbit)
+        target_poses = []
+        target_Ks = []
+        for i in range(num_views):
+            angle = (i / num_views) * 2 * np.pi
+            c, s = np.cos(angle), np.sin(angle)
+            R_y = torch.tensor([
+                [c, 0, s, 0],
+                [0, 1, 0, 0],
+                [-s, 0, c, 0],
+                [0, 0, 0, 1]
+            ], device=self.device).float()
+            target_poses.append(source_pose.squeeze(0) @ R_y)
+            target_Ks.append(source_K.squeeze(0))
+            
+        target_poses_stack = torch.stack(target_poses)
+        target_Ks_stack = torch.stack(target_Ks)
+        
+        # Run generation
+        generated_batch = self.pipeline.sample_batch(
+            ref_tensor, source_pose, source_K,
+            target_poses_stack, target_Ks_stack,
+            batch_size=4
+        ) # [N, 3, H, W]
+        
+        # Convert to numpy uint8 RGB images
+        novel_views = []
+        for i in range(num_views):
+            img_t = generated_batch[i]
+            img_np = ((img_t.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).astype(np.uint8)
+            novel_views.append(img_np)
+            
+        return novel_views
 

@@ -7,6 +7,7 @@ _logger = logging.getLogger(__name__)
 
 TRAINING_EXE = [sys.executable, "train_ace.py"]
 REGISTER_EXE = [sys.executable, "register_mapping.py"]
+INIT_POSES_EXE = [sys.executable, "init_all_poses.py"]
 
 def run_cmd(cmd, raise_on_error=True, verbose=True):
     """
@@ -141,6 +142,7 @@ def get_base_mapping_cmd(rgb_files, iteration_id, out_dir, opt):
         "--pose_refinement_wait", opt.pose_refinement_wait,
         "--learning_rate_schedule", opt.learning_rate_schedule,
         "--learning_rate_max", opt.learning_rate_max,
+        "--iterations", str(opt.seed_iterations),
     ]
 
     return mapping_cmd

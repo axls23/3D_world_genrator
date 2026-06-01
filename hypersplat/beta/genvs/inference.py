@@ -121,7 +121,11 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     pipeline.encoder.load_state_dict(ckpt['encoder'])
     pipeline.renderer.load_state_dict(ckpt['renderer'])
-    pipeline.unet.load_state_dict(ckpt['unet'])
+    try:
+        pipeline.unet.load_state_dict(ckpt['unet'])
+    except RuntimeError as e:
+        print(f"[Warning] Failed to load UNet weights: {e}")
+        print("Note: If this checkpoint was trained with DiffusionUNet, it is incompatible with the new DiT architecture.")
     pipeline.volume_struct.load_state_dict(ckpt['volume']) # Frustum often has buffers
     
     # 2. Load Dataset (Training Source)
