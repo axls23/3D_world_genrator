@@ -1,0 +1,4 @@
+# pyproject.toml configuration
+
+[tool.black]
+line-length = 88

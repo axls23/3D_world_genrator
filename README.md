@@ -77,7 +77,7 @@ The easiest way to start is with the provided Windows launcher:
 ```powershell
 ./demo/run_demo.bat
 ```
-This starts the job queue and launches the web interface at `http://localhost:5000`.
+This starts the job queue and launches the web interface at `http://localhost:8080`.
 
 ### 2. Run the Automated Pipeline
 For advanced users who want fine-grained control via the CLI:

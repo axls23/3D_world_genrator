@@ -1426,7 +1426,9 @@ class Runner:
             # PREVENT NaN: Zero out any NaN gradients before clipping
             for param in self.splats.values():
                 if param.grad is not None:
-                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    if param.grad.is_sparse:
+                        continue
+                    param.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             
             # PREVENT NaN: Aggressive gradient clipping (balanced: 0.1)
             torch.nn.utils.clip_grad_norm_(
@@ -1624,7 +1626,7 @@ class Runner:
                 if torch.isnan(param).any() or torch.isinf(param).any():
                     num_bad = (torch.isnan(param) | torch.isinf(param)).sum().item()
                     print(f"[NaN REPAIR] Step {step}: {name} has {num_bad} NaN/Inf values, replacing with 0")
-                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=1e6, neginf=-1e6)
+                    param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
