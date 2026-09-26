@@ -783,7 +783,9 @@ class IntelligentPipeline:
         Renders pseudo views from the current 3DGS, repairs them with nvidia/difix_ref
         (conditioned on the nearest real frame) and returns an augmented dataset of the real
         images plus the pseudo views, weighted by ACE-Zero pose confidence. The orbit angle
-        grows with each loop (Difix3D+ progressive updates).
+        is closed-loop (params/strategies/difix.py): it widens while Difix stays faithful
+        (high render->fixed change PSNR, recorded per round in difix.rounds) and shrinks
+        when Difix starts rewriting the renders.
 
         Governor overrides: `genvs_sample_mode: random` draws new pseudo-camera placements
         each loop; `deterministic` keeps them fixed. Guidance/scheduler/noise-level are
@@ -804,18 +806,36 @@ class IntelligentPipeline:
         seed = loop_idx + 1 if overrides.get("genvs_sample_mode") == "random" else 0
 
         base_dir = getattr(self, "_base_colmap_dir", data_dir)
-        max_angle = self.config.DIFIX_MAX_ANGLE * (loop_idx + 1) / max(self.config.REFINE_LOOPS, 1)
+        user_set = getattr(self.config, "USER_SET", set())
+        if "DIFIX_MAX_ANGLE" in user_set:
+            # Explicit --difix-max-angle: keep the fixed progressive schedule up to that cap
+            max_angle = self.config.DIFIX_MAX_ANGLE * (loop_idx + 1) / max(self.config.REFINE_LOOPS, 1)
+        else:
+            # Closed loop: the DIFIX_MAX_ANGLE strategy already chose this loop's angle
+            max_angle = self.config.DIFIX_MAX_ANGLE
+        # Explicit --min-registration-confidence anchors the confidence ramp; otherwise augment
+        # derives it from the confidence distribution
+        min_conf = (float(self.config.MIN_REGISTRATION_CONFIDENCE)
+                    if "MIN_REGISTRATION_CONFIDENCE" in user_set else None)
         out_dir = iter_dir / "augmented_colmap"
         logger.info(f"  [Difix] Loop {loop_idx + 1}: {self.config.DIFIX_NUM_VIEWS} pseudo views up to "
                     f"{max_angle:.1f} deg from {ckpts[-1].name} (seed {seed})")
+        profile = getattr(self, "profile", None)
+        if profile is not None:
+            profile.save()  # augment appends difix.rounds to the same file
         difix_augment(Namespace(
             data_dir=str(base_dir), ckpt=str(ckpts[-1]), out_dir=str(out_dir),
             num_views=self.config.DIFIX_NUM_VIEWS, max_angle=max_angle,
             pseudo_weight=self.config.DIFIX_PSEUDO_WEIGHT,
-            min_conf=float(self.config.MIN_REGISTRATION_CONFIDENCE), weight_floor=0.2,
+            min_conf=min_conf, weight_floor=None,
             test_every=self.config.TEST_EVERY, model_id="nvidia/difix_ref", no_difix=False, pose_rel_scale=0.1,
-            ckpt_data_dir=str(data_dir), seed=seed,
+            ckpt_data_dir=str(data_dir), seed=seed, loop=loop_idx,
+            profile=str(profile.path) if profile is not None and profile.path else None,
         ))
+        if profile is not None and profile.path:
+            # In-memory keys win on save; reload so the stale difix.rounds can't shadow augment's
+            from hypersplat.pipeline.params import SceneProfile
+            self.profile = SceneProfile.load(profile.path)
         torch.cuda.empty_cache()
         return out_dir
 
@@ -929,15 +949,32 @@ class IntelligentPipeline:
         from hypersplat.beta.genvs.run_completion import GeNVSLite, read_model, mirror_camera_pose, compute_scene_center, qvec2rotmat
         
         # [Governor Loop]
-        max_loops = self.config.REFINE_LOOPS
         current_data_dir = ace_output
         current_result_dir = initial_result_dir
-        
-        for i in range(max_loops):
-            logger.info(f"\n--- Autoregressive Loop {i+1}/{max_loops} ---")
-            
+        visited = [initial_result_dir]
+
+        # Closed-loop signals for this refinement only (the profile may survive a rerun)
+        self.profile.set("difix.rounds", [], "loop-reset")
+        if self.config.GENVS_BACKEND == 'difix':
+            try:
+                from hypersplat.beta.difix.augment import measure_camera_spread
+                spread = measure_camera_spread(ace_output, self.config.TEST_EVERY)
+                self.profile.set("difix.camera_spread_deg", round(spread, 3), "augment.camera_spread_deg")
+            except Exception as e:
+                logger.warning(f"Could not measure camera spread for the Difix angle: {e}")
+
+        # REFINE_LOOPS is re-derived at the start of every loop (early exit on val plateau or
+        # Difix hallucination sets it to the current index), so read it each iteration
+        i = 0
+        while i < self.config.REFINE_LOOPS:
             self._record_training_signals(current_result_dir)
+            self.profile.set("difix.loop_index", i, "loop")
             self._apply_param_stage("loop")
+            if i >= self.config.REFINE_LOOPS:
+                logger.info(f"Stopping refinement after {i} loop(s) "
+                            f"({(self.profile.get('decisions.REFINE_LOOPS') or {}).get('reason')})")
+                break
+            logger.info(f"\n--- Autoregressive Loop {i+1}/{self.config.REFINE_LOOPS} ---")
 
             # 1. Ask Governor for marching orders
             action, overrides = self._run_governor(current_data_dir, current_result_dir)
@@ -976,9 +1013,22 @@ class IntelligentPipeline:
                 # Separate result dir per iteration so earlier rounds stay comparable
                 current_result_dir = self._run_training(augmented_dir, result_name=f"refine_iter{i + 1}")
                 current_data_dir = augmented_dir
+                visited.append(current_result_dir)
             finally:
                 self.config = original_config
-                
+            i += 1
+
+        # A loop can make held-out PSNR worse (e.g. Difix round 1 on the drone: 23.53 -> 23.41);
+        # hand the best reconstruction downstream rather than simply the last one
+        self._record_training_signals(current_result_dir)
+        from hypersplat.pipeline.params.strategies.difix import final_val_psnrs
+        scores = {k: v for k, v in final_val_psnrs(self.profile) if k in {str(d) for d in visited}}
+        if len(scores) == len(visited) and str(current_result_dir) in scores:
+            best = max(visited, key=lambda d: scores[str(d)])
+            if scores[str(best)] > scores[str(current_result_dir)]:
+                logger.info(f"Using {best} (held-out PSNR {scores[str(best)]:.2f}) instead of the last "
+                            f"loop's {current_result_dir} ({scores[str(current_result_dir)]:.2f})")
+                current_result_dir = best
         return current_result_dir
 
     def _run_governor(self, data_dir: Path, result_dir: Path):
