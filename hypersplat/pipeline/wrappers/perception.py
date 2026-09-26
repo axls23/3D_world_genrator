@@ -997,7 +997,7 @@ print('Done! VRAM freed for ACE training.')
         imgs = self._windows_to_docker_path(str(self.images_dir))
         out = self._windows_to_docker_path(str(self.sparse_dir / "points3D.bin"))
         
-        cmd = f"{self.docker_python} -u {script} '{poses}' '{imgs}' '{out}'"
+        cmd = f"{self.docker_python} -u {script} '{poses}' '{imgs}' '{out}' --depth_model {self.depth_model}"
         try:
              res = self._run_docker_command(cmd, check=False, capture_output=True)
              if (self.sparse_dir / "points3D.bin").stat().st_size > 1000: return True
@@ -1021,7 +1021,7 @@ print('Done! VRAM freed for ACE training.')
         out = str(self.sparse_dir / "points3D.bin")
         
         python, env = self._acezero_python()
-        cmd = [python, "-u", str(script), poses, imgs, out]
+        cmd = [python, "-u", str(script), poses, imgs, out, "--depth_model", self.depth_model]
         try:
             subprocess.run(cmd, check=True, cwd=str(self.acezero_root), env=env, timeout=600)
             if (self.sparse_dir / "points3D.bin").stat().st_size > 1000:
