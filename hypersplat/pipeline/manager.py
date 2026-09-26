@@ -862,6 +862,17 @@ class IntelligentPipeline:
 
         if self.config.CAP_MAX:
             cmd.extend(["--strategy.cap-max", str(self.config.CAP_MAX)])
+
+        # Loss-plateau early stopping (trainer still writes final ckpt/ply/val stats).
+        # Patience / min steps at their CLI defaults (500 / 2000, tuned for 7k steps) are
+        # left to the trainer, which derives them from max_steps (~7% / ~30%).
+        if self.config.EARLY_STOPPING:
+            cmd.append("--early_stopping")
+            cmd.extend(["--early_stop_min_delta", str(self.config.EARLY_STOP_MIN_DELTA)])
+            if self.config.EARLY_STOP_PATIENCE not in (None, 500):
+                cmd.extend(["--early_stop_patience", str(self.config.EARLY_STOP_PATIENCE)])
+            if self.config.EARLY_STOP_MIN_STEPS not in (None, 2000):
+                cmd.extend(["--early_stop_min_steps", str(self.config.EARLY_STOP_MIN_STEPS)])
         if self.config.RANDOM_BKGD: cmd.append("--random_bkgd")
         if self.config.USE_APP_OPT: cmd.append("--app_opt")
         if self.config.WITH_UT: cmd.append("--with_ut")
