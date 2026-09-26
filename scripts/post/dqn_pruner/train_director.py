@@ -75,7 +75,6 @@ class DirectorTrainer:
              output_dir = str(self.output_base)
              data_factor = 1
              fps = 2
-             fps = 2
              # Dynamic max_steps: Each Director Step adds +500 steps
              self.base_max_steps = 1000
              max_steps = self.base_max_steps 
@@ -94,7 +93,15 @@ class DirectorTrainer:
              skip_ace = False
              colmap_input = None
              quality_mode = 'fast'
-             min_confidence = 0.2
+             # NOTE: PipelineConfig reads `min_registration_confidence` (an ACE-Zero pose
+             # registration confidence score, int, typically ~500-1500; default 1000 — see
+             # manager.py's --min-registration-confidence flag and perception.py's
+             # `min_confidence` filter, where poses with conf < this are dropped). The old
+             # `min_confidence = 0.2` name/scale here was never read (PipelineConfig's
+             # getattr looked for a different attribute name) and was the wrong magnitude
+             # entirely. 500 reproduces the intended "low threshold, be lenient" behavior
+             # in the correct ~500-1500 int range.
+             min_registration_confidence = 500
              depth_model = 'depth_anything'
              cloud_sync = False
              scene_name = "training_scene"

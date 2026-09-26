@@ -171,6 +171,43 @@ class PipelineConfig:
                 "ACE-Zero + 3DGS pipeline."
             )
 
+        # [Director/Governor RL Overrides]
+        # These attributes exist so that `_patch_config`'s `hasattr(new_config, KEY)` check
+        # (below) actually succeeds when scripts/post/dqn_pruner/governor.py's
+        # `_map_action_director` emits overrides like `genvs_guidance`, `perform_purge`, etc.
+        # Defaults below reproduce today's always-off/no-effect behavior.
+        #
+        # GeNVS sampling knobs: accepted-but-NOT-YET-CONSUMED. There is currently no GeNVS
+        # sampling call in this codebase that reads a guidance scale / scheduler / sample
+        # mode / noise level — `hypersplat/beta/genvs/run_completion.py`'s
+        # `GeNVSLite.generate_augmented_view()` takes only (source_img, source_pose,
+        # source_K, target_pose). Wiring these through would mean extending GeNVSLite's
+        # sampling API, which is out of scope for this unit. Flagged as "needs decision".
+        self.GENVS_GUIDANCE = getattr(args, 'genvs_guidance', None)
+        self.GENVS_SCHEDULER = getattr(args, 'genvs_scheduler', None)
+        self.GENVS_SAMPLE_MODE = getattr(args, 'genvs_sample_mode', None)
+        self.GENVS_NOISE_LEVEL = getattr(args, 'genvs_noise_level', None)
+
+        # Purge/prune knobs from the Governor's PURGE_WORST_VIEW action.
+        # Also accepted-but-NOT-YET-CONSUMED: the existing pruning entrypoint
+        # (`_run_floater_pruning` -> `scripts/post/dqn_pruner/prune.py::prune_ply`) is only
+        # invoked from the top-level `run()` gate on `self.config.PRUNE`, and it does not
+        # accept a threshold argument at all — `prune.py`/`agent.py` hardcode their own
+        # thresholds (e.g. `HeuristicAgent`'s 0.4 cut, `PrunerConfig.PRUNE_OPACITY_THR`).
+        # Making the Governor's per-iteration override actually trigger a purge (and pass a
+        # threshold through) would require changes to `_run_autoregressive_refinement` and
+        # `scripts/post/dqn_pruner/prune.py`, both outside this unit's scope
+        # (PipelineConfig/_patch_config only). Flagged as "needs decision".
+        self.PERFORM_PURGE = getattr(args, 'perform_purge', False)
+        self.PRUNE_THRESHOLD = getattr(args, 'prune_threshold', 0.5)
+
+        # Extra training steps requested by the Governor's WAIT_FINE_TUNE action.
+        # UNLIKE the other overrides above, this one IS wired up: `_patch_config` treats
+        # `training_steps_add` specially and adds it on top of `TRAINING_MAX_STEPS` (the
+        # already-existing consumer read at `_run_training`'s `--max_steps` arg), rather than
+        # blindly overwriting it. See `_patch_config` below.
+        self.TRAINING_STEPS_ADD = getattr(args, 'training_steps_add', 0)
+
     def create_directories(self):
         """Ensure output directories exist"""
         dirs = [self.OUTPUT_BASE, self.OUTPUT_BASE / "results"]
@@ -734,6 +771,20 @@ class IntelligentPipeline:
         import copy
         new_config = copy.copy(base_config)
         for k, v in overrides.items():
+            # Special-case: `training_steps_add` is ADDITIVE (extra steps for just this
+            # autoregressive iteration), not a direct replacement of TRAINING_MAX_STEPS, so
+            # it can't go through the generic setattr path below.
+            if k == "training_steps_add":
+                if v:
+                    old_max = getattr(new_config, "TRAINING_MAX_STEPS", 0)
+                    new_max = old_max + v
+                    logger.info(
+                        f"  [Config Override] TRAINING_MAX_STEPS: {old_max} -> {new_max} "
+                        f"(+{v} from training_steps_add)"
+                    )
+                    new_config.TRAINING_MAX_STEPS = new_max
+                new_config.TRAINING_STEPS_ADD = v
+                continue
             # Map snake_case overrides to UPPER_CASE config keys if needed
             key = k.upper()
             if hasattr(new_config, key):
