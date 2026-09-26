@@ -39,7 +39,7 @@ def test_short_schedule_scales_proportionally():
     s = resolve_trainer_schedule(7000)
     assert s.sh_degree_interval == schedule_relative(7000, 1000) == 233
     assert 3 * s.sh_degree_interval < 7000 * 0.15  # full SH well before the end
-    assert s.floater_start < 7000 and s.floater_every >= 50
+    assert s.floater_start < 7000 and s.floater_every == 400
     assert schedule_relative(10, 400, min_value=50) == 50
 
 

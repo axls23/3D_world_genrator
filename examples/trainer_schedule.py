@@ -50,9 +50,9 @@ def resolve_trainer_schedule(max_steps: int) -> TrainerSchedule:
         depth_warmup_steps=schedule_relative(max_steps, 100, min_value=0),
         depth_ramp_steps=schedule_relative(max_steps, 500),
         floater_start=schedule_relative(max_steps, 2_000),
-        # Same number of pruning passes regardless of schedule length; floor keeps
-        # the (CPU kNN) pass from running too often on very short schedules.
-        floater_every=schedule_relative(max_steps, 400, min_value=50),
+        # Interval stays 400: each pass is a CPU kNN over all Gaussians and kills up
+        # to floater_max_frac, so short schedules get fewer passes, not denser ones.
+        floater_every=400,
     )
 
 

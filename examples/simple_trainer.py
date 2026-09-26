@@ -359,9 +359,9 @@ def create_splats_with_optimizers(
         pcd = o3d.io.read_point_cloud(init_ply_path)
         points = torch.tensor(np.asarray(pcd.points)).float()
         rgbs = torch.tensor(np.asarray(pcd.colors)).float()
-        # Ensure we don't have too many points if memory is tight. With MCMC the
-        # strategy cap (max_init_pts, below) applies instead of the fixed 500k.
-        ext_cap = max_init_pts if max_init_pts is not None else 500_000
+        # Ensure we don't have too many points if memory is tight; with MCMC the
+        # (smaller) strategy cap applies so the cloud never starts above cap_max.
+        ext_cap = min(500_000, max_init_pts) if max_init_pts is not None else 500_000
         if points.shape[0] > ext_cap:
              # Random subsample
              indices = torch.randperm(points.shape[0])[:ext_cap]
@@ -1779,8 +1779,8 @@ class Runner:
                 )
                 trainloader_iter = iter(trainloader)
 
-            # eval the full set (also on early stop: the scheduled final eval is skipped)
-            is_eval_step = step in [i - 1 for i in cfg.eval_steps] or stop_now
+            # eval the full set; always on the final step (early stop, or eval_steps past max_steps)
+            is_eval_step = step in [i - 1 for i in cfg.eval_steps] or is_final_step
             if is_eval_step:
                 self.eval(step)
                 self.render_traj(step)
