@@ -848,6 +848,8 @@ print('Done! VRAM freed for ACE training.')
                 sys.executable, "-u", acezero_script,
                 images_glob, output_dir,
                 "--iterations_max", str(iters),
+                "--seed_iterations", str(self.seed_iterations),
+                "--refit_iterations", str(self.refit_iterations),
                 "--try_seeds", str(try_seeds),
                 "--seed_parallel_workers", str(seed_workers),
                 "--training_buffer_cpu", str(training_buffer),
