@@ -21,7 +21,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from hypersplat.beta.genvs.dataset import GenVSDataset
-from hypersplat.beta.genvs import GeometryEncoder, FrustumFeatureVolume, NeuralVolumeRenderer, DiffusionUNet, DiT_S_2
+from hypersplat.beta.genvs import GeometryEncoder, FrustumFeatureVolume, NeuralVolumeRenderer, DiT_S_2
 
 
 # --------------------------------------------------------------

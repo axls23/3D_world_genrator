@@ -19,7 +19,6 @@ import os
 import time
 import argparse
 from pathlib import Path
-from distutils.util import strtobool
 
 import numpy as np
 import ace_zero_util as zutil
@@ -28,8 +27,14 @@ import dataset_io
 _logger = logging.getLogger(__name__)
 
 
-def _strtobool(x):
-    return bool(strtobool(x))
+def _strtobool(val: str) -> bool:
+    """Minimal replacement for the removed distutils.util.strtobool."""
+    val = val.lower()
+    if val in ("y", "yes", "t", "true", "on", "1"):
+        return True
+    if val in ("n", "no", "f", "false", "off", "0"):
+        return False
+    raise ValueError(f"invalid truth value {val!r}")
 
 
 if __name__ == '__main__':
