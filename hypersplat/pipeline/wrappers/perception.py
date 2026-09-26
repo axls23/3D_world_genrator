@@ -615,7 +615,7 @@ print('Done! VRAM freed for ACE training.')
                 import cv2
                 sample = cv2.imread(str(existing_frames[0]))
                 self.image_height, self.image_width = sample.shape[:2]
-                self.focal_length = self.image_width / (2 * np.tan(np.radians(35)))
+                self.focal_length = self._initial_focal(video_path)
                 
                 return len(existing_frames)
             
@@ -647,10 +647,25 @@ print('Done! VRAM freed for ACE training.')
             import cv2
             sample = cv2.imread(str(frame_files[0]))
             self.image_height, self.image_width = sample.shape[:2]
-            self.focal_length = self.image_width / (2 * np.tan(np.radians(35))) # ~70 deg HFOV
+            self.focal_length = self._initial_focal(video_path)
             
         logger.info(f"Extracted {len(frame_files)} frames ({self.image_width}x{self.image_height})")
         return len(frame_files)
+
+    def _initial_focal(self, video_path: Path) -> float:
+        """Initial focal (frame px): video 35mm-equiv metadata, else the shared 70-deg HFOV rule.
+
+        Only a starting point: it is handed to ACE-Zero, which refines it during mapping.
+        """
+        from hypersplat.pipeline.params import SceneProfile, record
+        from hypersplat.pipeline.params.strategies import intrinsics
+        f35 = intrinsics.probe_focal_35mm(video_path)
+        decision = intrinsics.initial_focal(self.image_width, self.image_height, f35)
+        profile = SceneProfile.from_env()
+        record("FOCAL_INIT_PX", decision, profile)
+        if profile is not None:
+            profile.save()
+        return float(decision.value)
     
     def run_ace_zero(self, max_iterations: int = None) -> bool:
         """Run ACE-Zero with parameters calculated from frame count."""
@@ -744,6 +759,9 @@ print('Done! VRAM freed for ACE training.')
                             f'"{docker_images_src}/*.jpg"', docker_final_output]
                            + self._ace_cli_args())
         
+        if self.focal_length > 0:
+            # Initial focal hint (metadata or 70-deg HFOV); ACE-Zero still refines it
+            ace_cmd += f' --use_external_focal_length {self.focal_length:.4f}'
         full_cmd = f"{setup_cmd} && {ace_cmd}"
         
         try:
@@ -834,6 +852,10 @@ print('Done! VRAM freed for ACE training.')
         """Run ACE-Zero natively on Linux (Docker or bare metal)."""
         cmd = [sys.executable, "-u", acezero_script, images_glob, output_dir] + self._ace_cli_args()
         
+        if self.focal_length > 0:
+            # Initial focal hint (metadata or 70-deg HFOV); ACE-Zero still refines it
+            cmd += ["--use_external_focal_length", f"{self.focal_length:.4f}"]
+
         if not self._check_native_dependencies():
             return False
 
@@ -872,10 +894,15 @@ print('Done! VRAM freed for ACE training.')
                             self.poses[Path(tokens[0]).name] = np.linalg.inv(w2c)
                 if focals:
                     # ACE-Zero refines the focal length (in original-image pixels); the value
-                    # set at frame extraction is only a 70-degree-HFOV initial guess
-                    ace_focal = float(np.median(focals))
-                    logger.info(f"Using ACE-Zero focal length {ace_focal:.1f}px (initial guess was {self.focal_length:.1f}px)")
-                    self.focal_length = ace_focal
+                    # set at frame extraction is only the initial guess (metadata / 70-deg HFOV)
+                    from hypersplat.pipeline.params import SceneProfile, resolve
+                    from hypersplat.pipeline.params.strategies import intrinsics
+                    profile = SceneProfile.from_env()
+                    self.focal_length = float(resolve(
+                        "FOCAL_PX", None, lambda: intrinsics.refined_focal(focals, self.focal_length),
+                        self.focal_length, profile))
+                    if profile is not None:
+                        profile.save()
                 return len(self.poses) > 0
             except Exception as e: logger.error(f"Parse error: {e}")
 
@@ -959,7 +986,10 @@ print('Done! VRAM freed for ACE training.')
         return True
 
     def write_colmap_format(self) -> bool:
-        logger.info("Writing COLMAP output...")
+        # Focal: ACE-Zero refined median (see _parse_acezero_output). Principal point: image
+        # centre, since ACE-Zero does not estimate it and video metadata does not carry it.
+        logger.info(f"Writing COLMAP output (PINHOLE f={self.focal_length:.2f}px, "
+                    f"{self.image_width}x{self.image_height})...")
         with open(self.sparse_dir / "cameras.bin", "wb") as f:
             f.write(struct.pack("<QIiQQdddd", 1, 1, 1, self.image_width, self.image_height, self.focal_length, self.focal_length, self.image_width/2, self.image_height/2))
         with open(self.sparse_dir / "images.bin", "wb") as f:

@@ -453,6 +453,25 @@ class IntelligentPipeline:
         n_points = signals.count_points3d(ace_output / "sparse" / "0" / "points3D.bin")
         if n_points is not None:
             self.profile.set("points.count", n_points, "points3D.bin")
+
+        # Intrinsics: keep the focal decisions perception.py recorded in the on-disk profile,
+        # and repair a reused cameras.bin whose focal disagrees with ACE-Zero's refined one
+        from hypersplat.pipeline.params import SceneProfile, record
+        from hypersplat.pipeline.params.strategies import intrinsics
+        on_disk = SceneProfile.load(self.profile.path)
+        for name in ("FOCAL_INIT_PX", "FOCAL_PX"):
+            key = f"decisions.{name}"
+            if on_disk.get(key) is not None and self.profile.get(key) is None:
+                self.profile.set(key, on_disk.get(key))
+        if ace:
+            try:
+                fixed = intrinsics.fix_stale_cameras(ace_output / "sparse" / "0" / "cameras.bin",
+                                                     ace["focal_median"], self.profile.get("frames.width"))
+            except Exception as e:  # a malformed cameras.bin must not stop the run
+                logger.warning(f"[param] could not check cameras.bin focal: {e}")
+                fixed = None
+            if fixed is not None:
+                record("FOCAL_PX", fixed, self.profile)
         self.profile.save()
 
     def _record_training_signals(self, result_dir: Path):
