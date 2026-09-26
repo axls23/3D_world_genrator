@@ -694,7 +694,12 @@ class GeNVSTrainer:
         print(f"{'='*60}")
 
 
-if __name__ == "__main__":
+def build_parser():
+    """Build the canonical GeNVS trainer argument parser.
+
+    Shared by this module's own CLI entrypoint and by the thin shim at
+    scripts/genvs_core/train.py, so both stay in sync automatically.
+    """
     parser = argparse.ArgumentParser(description="GeNVS 3-Phase Trainer")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to ACE output directory")
     parser.add_argument("--output_dir", type=str, default="results/genvs_train")
@@ -704,18 +709,23 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="Checkpoint + validation interval")
     parser.add_argument("--image_size", type=int, default=128, help="Training resolution (128 for speed, 256 for quality)")
     parser.add_argument("--device", type=str, default="cuda")
-    
+
     # Smart Optimizations
     parser.add_argument("--amp", action="store_true", default=True, help="Enable Automatic Mixed Precision")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable AMP")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (Graph Optimization)")
     parser.add_argument("--eco_mode", action="store_true", help="Enable Eco Mode (Sleep between steps)")
     parser.add_argument("--eco_sleep", type=float, default=0.1, help="Sleep duration in seconds for Eco Mode")
-    
+
     # Resume
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
-    
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
     args = parser.parse_args()
-    
+
     trainer = GeNVSTrainer(args)
     trainer.train()
