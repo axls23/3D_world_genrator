@@ -159,6 +159,18 @@ class PipelineConfig:
         # GeNVS Online Integration
         self.GENVS_INTERVAL = getattr(args, 'genvs_interval', 1000)
 
+        # [Level 3 / Chunked pipeline] Accepted from wrapper.py's chunked mode. There is no
+        # distinct chunked-video-splitting implementation wired up yet; these are stored so the
+        # flags parse successfully, but the pipeline currently runs as a standard single-pass run.
+        self.USE_COLMAP = getattr(args, 'use_colmap', False)
+        self.MIN_CHUNK_DURATION = getattr(args, 'min_chunk_duration', 5)
+        if self.USE_COLMAP:
+            logger.info(
+                "[Chunked Mode] --use_colmap/--min_chunk_duration accepted, but chunked "
+                "video-splitting is not yet implemented; running the standard single-pass "
+                "ACE-Zero + 3DGS pipeline."
+            )
+
     def create_directories(self):
         """Ensure output directories exist"""
         dirs = [self.OUTPUT_BASE, self.OUTPUT_BASE / "results"]
@@ -1050,6 +1062,15 @@ def main():
     # Debug/Overrides
     parser.add_argument("--colmap-input", dest="colmap_input", type=str, default=None,
                         help="Override input COLMAP directory (e.g. for testing existing datasets)")
+
+    # [Level 3 / Chunked pipeline] Accepted by wrapper.py's TrainingManager (_run_chunked_pipeline).
+    # NOTE: there is currently no distinct video-chunking implementation in this codebase; these
+    # flags are parsed and stored on PipelineConfig, but the pipeline still runs as a standard
+    # single-pass ACE-Zero + 3DGS run (see PipelineConfig.__init__ log message).
+    parser.add_argument("--use_colmap", action="store_true",
+                        help="(Chunked/Level-3 mode) Force COLMAP-based pose estimation; currently accepted but does not change pipeline behavior beyond standard COLMAP usage")
+    parser.add_argument("--min_chunk_duration", type=float, default=5,
+                        help="(Chunked/Level-3 mode) Minimum chunk duration in seconds; currently accepted but not yet wired to any chunking implementation")
     
     # === NEW: ACE-Zero Quality Mode ===
     parser.add_argument("--quality-mode", dest="quality_mode", type=str, default="balanced",
