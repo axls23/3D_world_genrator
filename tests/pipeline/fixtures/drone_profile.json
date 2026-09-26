@@ -1,0 +1,105 @@
+{
+ "video": {
+  "fps": 23.976023976023978,
+  "frame_count": 485,
+  "width": 1920,
+  "height": 1080,
+  "duration": 20.228541666666665,
+  "avg_motion": 19.21559502283732
+ },
+ "frames": {
+  "count": 40,
+  "width": 640,
+  "height": 360
+ },
+ "ace": {
+  "focal_median": 317.0840148925781,
+  "conf": {
+   "frame_00005.jpg": 6393.0,
+   "frame_00006.jpg": 6402.0,
+   "frame_00016.jpg": 6394.0,
+   "frame_00007.jpg": 6411.0,
+   "frame_00009.jpg": 6408.0,
+   "frame_00008.jpg": 6410.0,
+   "frame_00021.jpg": 6358.0,
+   "frame_00025.jpg": 6299.0,
+   "frame_00026.jpg": 6313.0,
+   "frame_00032.jpg": 6387.0,
+   "frame_00019.jpg": 6389.0,
+   "frame_00037.jpg": 6394.0,
+   "frame_00011.jpg": 6405.0,
+   "frame_00035.jpg": 6372.0,
+   "frame_00036.jpg": 6395.0,
+   "frame_00003.jpg": 6364.0,
+   "frame_00027.jpg": 6343.0,
+   "frame_00033.jpg": 6391.0,
+   "frame_00004.jpg": 6398.0,
+   "frame_00034.jpg": 6387.0,
+   "frame_00031.jpg": 6380.0,
+   "frame_00015.jpg": 6394.0,
+   "frame_00029.jpg": 6400.0,
+   "frame_00038.jpg": 6383.0,
+   "frame_00010.jpg": 6401.0,
+   "frame_00022.jpg": 6336.0,
+   "frame_00012.jpg": 6396.0,
+   "frame_00039.jpg": 6360.0,
+   "frame_00013.jpg": 6407.0,
+   "frame_00024.jpg": 6282.0,
+   "frame_00028.jpg": 6364.0,
+   "frame_00023.jpg": 6290.0,
+   "frame_00018.jpg": 6380.0,
+   "frame_00030.jpg": 6385.0,
+   "frame_00017.jpg": 6390.0,
+   "frame_00040.jpg": 6305.0,
+   "frame_00001.jpg": 6336.0,
+   "frame_00020.jpg": 6350.0,
+   "frame_00002.jpg": 6367.0,
+   "frame_00014.jpg": 6404.0
+  },
+  "n_registered": 40
+ },
+ "points": {
+  "count": 184610
+ },
+ "gpu": {
+  "free_mb": 5670,
+  "total_mb": 5800
+ },
+ "_observed": {
+  "note": "2026-09-26 runs on RTX 4050 Laptop 6GB",
+  "base_v2": {
+   "cap_max": 300000,
+   "data_factor": 1,
+   "max_steps": 7000,
+   "val_psnr": 23.53,
+   "peak_train_mem_gb": 0.47
+  },
+  "difix_r1": {
+   "val_psnr": 23.41,
+   "difix_change_psnr": [
+    22.1,
+    20.6,
+    19.7
+   ],
+   "difix_change_angles": [
+    3,
+    6,
+    12
+   ]
+  },
+  "heuristic_focal_px": 457.0,
+  "pruning_context_aware_delta_psnr": -2.19
+ },
+ "train": {
+  "val": [
+   {
+    "step": 6999,
+    "psnr": 23.532,
+    "ssim": 0.6154,
+    "lpips": 0.2918,
+    "num_GS": 300000,
+    "result_dir": "results/acezero_3dgs"
+   }
+  ]
+ }
+}

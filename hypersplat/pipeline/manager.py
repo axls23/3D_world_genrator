@@ -6,6 +6,7 @@ Condensed & Optimized Version
 Flow: Video -> ACE-Zero (AI Poses) -> 3DGS Training (MCMC)
 """
 
+import os
 import sys
 import subprocess
 import time
@@ -225,6 +226,41 @@ class PipelineConfig:
         # blindly overwriting it. See `_patch_config` below.
         self.TRAINING_STEPS_ADD = getattr(args, 'training_steps_add', 0)
 
+        # Held-out split used by the trainer and the Difix augmenter (must match)
+        self.TEST_EVERY = getattr(args, 'test_every', None) or 8
+
+        self._resolve_auto_params(args)
+
+    # [Dynamic Parameters] config attribute -> (argparse dest, previous hard-coded default).
+    # A None arg means "auto": the fallback applies until a strategy in
+    # hypersplat/pipeline/params/strategies derives a value from measured signals.
+    # Explicitly passed values are recorded in USER_SET and never overridden.
+    AUTO_PARAMS = {
+        "FPS": ("fps", 10.0),
+        "DATA_FACTOR": ("data_factor", 2),
+        "TRAINING_MAX_STEPS": ("max_steps", 7000),
+        "TRAINING_EVAL_STEPS": ("eval_steps", [3000, 7000]),
+        "TRAINING_SAVE_STEPS": ("save_steps", [3000, 7000]),
+        "INIT_SCALE": ("init_scale", 2.5),
+        "CAP_MAX": ("cap_max", None),
+        "MIN_REGISTRATION_CONFIDENCE": ("min_registration_confidence", 1000),
+        "POSE_OPT_WARMUP": ("pose_opt_warmup", 1000),
+        "REFINE_LOOPS": ("refine_loops", 3),
+        "DIFIX_NUM_VIEWS": ("difix_views", 24),
+        "DIFIX_MAX_ANGLE": ("difix_max_angle", 20.0),
+        "DIFIX_PSEUDO_WEIGHT": ("difix_pseudo_weight", 0.5),
+    }
+
+    def _resolve_auto_params(self, args):
+        self.USER_SET = set()
+        for attr, (dest, fallback) in self.AUTO_PARAMS.items():
+            value = getattr(args, dest, None)
+            if value is None:
+                setattr(self, attr, fallback)
+            else:
+                setattr(self, attr, value)
+                self.USER_SET.add(attr)
+
     def create_directories(self):
         """Ensure output directories exist"""
         dirs = [self.OUTPUT_BASE, self.OUTPUT_BASE / "results"]
@@ -252,6 +288,13 @@ class IntelligentPipeline:
         logger.info(f"Output: {self.config.OUTPUT_BASE}")
 
         self.config.create_directories()
+
+        # Measured signals shared by all stages; strategies derive parameters from them
+        from hypersplat.pipeline.params import PROFILE_ENV, PROFILE_FILENAME, SceneProfile
+        self.profile = SceneProfile.load(self.config.OUTPUT_BASE / PROFILE_FILENAME)
+        os.environ[PROFILE_ENV] = str(self.profile.path)  # for stage subprocesses
+        self._record_video_signals(video_path)
+        self._apply_param_stage("pre_ace")
 
         try:
             # 1. Pose Estimation (or Load Existing)
@@ -320,6 +363,9 @@ class IntelligentPipeline:
                 else:
                     ace_output = self._run_pose_estimation(video_path)
             
+            self._record_ace_signals(ace_output)
+            self._apply_param_stage("post_ace")
+
             # Real-image dataset; feedback-loop pseudo views are always regenerated from it
             self._base_colmap_dir = ace_output
 
@@ -333,6 +379,8 @@ class IntelligentPipeline:
                     ace_output = self._run_novel_view_generation(ace_output)
             
             # 2. Training
+            self._record_gpu_signals()
+            self._apply_param_stage("pre_train")
             result_dir = self._run_training(ace_output)
             
             # 2.2 Autoregressive Refinement (The "Dream" Loop)
@@ -361,6 +409,58 @@ class IntelligentPipeline:
         except Exception as e:
             logger.error(f"Pipeline Failed: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Dynamic parameters: record measured signals, then run strategies
+    # ------------------------------------------------------------------
+    def _apply_param_stage(self, stage: str):
+        from hypersplat.pipeline.params.strategies import apply_stage
+        apply_stage(stage, self.profile, self.config)
+
+    def _record_video_signals(self, video_path: Path):
+        from hypersplat.pipeline.params import signals
+        info = signals.probe_video(video_path)
+        if info:
+            for k, v in info.items():
+                self.profile.set(f"video.{k}", v, "probe_video")
+        self._record_gpu_signals()
+
+    def _record_gpu_signals(self):
+        from hypersplat.pipeline.params import signals
+        mem = signals.gpu_memory()
+        if mem:
+            self.profile.set("gpu.free_mb", round(mem[0]), "gpu_memory")
+            self.profile.set("gpu.total_mb", round(mem[1]), "gpu_memory")
+        self.profile.save()
+
+    def _record_ace_signals(self, ace_output: Path):
+        from hypersplat.pipeline.params import signals
+        ace = signals.read_ace_poses(ace_output)
+        if ace:
+            self.profile.set("ace.focal_median", ace["focal_median"], ace["path"])
+            self.profile.set("ace.conf", ace["conf"], ace["path"])
+            self.profile.set("ace.n_registered", len(ace["conf"]), ace["path"])
+        frames = signals.image_folder_stats(ace_output / "images")
+        if frames:
+            for k, v in zip(("count", "width", "height"), frames):
+                self.profile.set(f"frames.{k}", v, "images/")
+        n_points = signals.count_points3d(ace_output / "sparse" / "0" / "points3D.bin")
+        if n_points is not None:
+            self.profile.set("points.count", n_points, "points3D.bin")
+        self.profile.save()
+
+    def _record_training_signals(self, result_dir: Path):
+        from hypersplat.pipeline.params import signals
+        rows = signals.read_val_stats(result_dir)
+        if rows:
+            val = self.profile.get("train.val") or []
+            seen = {(r.get("result_dir"), r.get("step")) for r in val}
+            for r in rows:
+                r["result_dir"] = str(result_dir)
+                if (r["result_dir"], r["step"]) not in seen:
+                    val.append(r)
+            self.profile.set("train.val", val, "val_step*.json")
+        self.profile.save()
 
     def _detect_existing_ace_output(self) -> bool:
         """Check if valid ACE-Zero output already exists (consistent with pipeline_wrapper.py)."""
@@ -686,7 +786,7 @@ class IntelligentPipeline:
             num_views=self.config.DIFIX_NUM_VIEWS, max_angle=max_angle,
             pseudo_weight=self.config.DIFIX_PSEUDO_WEIGHT,
             min_conf=float(self.config.MIN_REGISTRATION_CONFIDENCE), weight_floor=0.2,
-            test_every=8, model_id="nvidia/difix_ref", no_difix=False, pose_rel_scale=0.1,
+            test_every=self.config.TEST_EVERY, model_id="nvidia/difix_ref", no_difix=False, pose_rel_scale=0.1,
             ckpt_data_dir=str(data_dir), seed=seed,
         ))
         torch.cuda.empty_cache()
@@ -722,6 +822,7 @@ class IntelligentPipeline:
             "--sh_degree", str(self.config.SH_DEGREE),
             "--means_lr", str(self.config.MEANS_LR),
             "--ssim_lambda", str(self.config.SSIM_LAMBDA),
+            "--test_every", str(self.config.TEST_EVERY),
         ]
 
         if self.config.TRAINING_SAVE_STEPS:
@@ -797,6 +898,9 @@ class IntelligentPipeline:
         for i in range(max_loops):
             logger.info(f"\n--- Autoregressive Loop {i+1}/{max_loops} ---")
             
+            self._record_training_signals(current_result_dir)
+            self._apply_param_stage("loop")
+
             # 1. Ask Governor for marching orders
             action, overrides = self._run_governor(current_data_dir, current_result_dir)
             
@@ -1211,16 +1315,16 @@ def main():
     # Core
     parser.add_argument("video_path", help="Input video file")
     parser.add_argument("--output_dir", default="data/output_3dgs", help="Output root")
-    parser.add_argument("--fps", type=float, default=10.0, help="Extraction FPS")
-    parser.add_argument("--data_factor", type=int, default=2, help="Downsample factor")
+    parser.add_argument("--fps", type=float, default=None, help="Extraction FPS (default: auto, fallback 10)")
+    parser.add_argument("--data_factor", type=int, default=None, help="Downsample factor (default: auto, fallback 2)")
     
     # Training
-    parser.add_argument("--max_steps", type=int, default=7000, help="Training steps")
+    parser.add_argument("--max_steps", type=int, default=None, help="Training steps (default: auto, fallback 7000)")
     parser.add_argument("--with_ut", action="store_true", help="Uncertainty Training")
     parser.add_argument("--with_eval3d", action="store_true", help="3D Evaluation")
     
     # Tuning
-    parser.add_argument("--init_scale", type=float, default=2.5)
+    parser.add_argument("--init_scale", type=float, default=None, help="Default: auto, fallback 2.5")
     parser.add_argument("--cap-max", dest="cap_max", type=int, default=None,
                         help="Max Gaussians for MCMC (trainer default 1M; ~300k suits short captures)")
     parser.add_argument("--opacity_reg", type=float, default=0.05)
@@ -1266,11 +1370,11 @@ def main():
                         help="Generative model for the GeNVS slots: pretrained Difix (default) or in-repo GeNVS core")
     parser.add_argument("--difix", action="store_true",
                         help="Shorthand for --genvs-autoregressive --genvs-backend difix")
-    parser.add_argument("--refine-loops", "--difix-rounds", dest="refine_loops", type=int, default=3,
+    parser.add_argument("--refine-loops", "--difix-rounds", dest="refine_loops", type=int, default=None,
                         help="Iterations of the 3DGS <-> GeNVS feedback loop")
-    parser.add_argument("--difix-views", dest="difix_views", type=int, default=24)
-    parser.add_argument("--difix-max-angle", dest="difix_max_angle", type=float, default=20.0)
-    parser.add_argument("--difix-pseudo-weight", dest="difix_pseudo_weight", type=float, default=0.5)
+    parser.add_argument("--difix-views", dest="difix_views", type=int, default=None)
+    parser.add_argument("--difix-max-angle", dest="difix_max_angle", type=float, default=None)
+    parser.add_argument("--difix-pseudo-weight", dest="difix_pseudo_weight", type=float, default=None)
     parser.add_argument("--genvs_ckpt", type=str, default=None, help="Path to GeNVS checkpoint for Autoregressive Injection")
     parser.add_argument("--genvs_interval", type=int, default=1000, help="Interval for GeNVS injection (default: 1000)")
     parser.add_argument("--skip-ace", action="store_true", help="Skip ACE-Zero pose estimation (use existing)")
@@ -1283,7 +1387,7 @@ def main():
                         help="Enable JOGS-style joint pose-3DGS optimization (default: True)")
     parser.add_argument("--no-pose-opt", dest="pose_opt", action="store_false",
                         help="Disable pose optimization (use fixed ACE-Zero poses)")
-    parser.add_argument("--pose-opt-warmup", dest="pose_opt_warmup", type=int, default=1000,
+    parser.add_argument("--pose-opt-warmup", dest="pose_opt_warmup", type=int, default=None,
                         help="Steps before pose optimization starts (default: 1000)")
 
     # Autoregressive GeNVS
@@ -1309,7 +1413,7 @@ def main():
                         help="ACE-Zero quality mode: fast (speed), balanced (default), quality (max accuracy)")
     
     # === NEW: Pose Confidence Filtering ===
-    parser.add_argument("--min-registration-confidence", dest="min_registration_confidence", type=int, default=1000,
+    parser.add_argument("--min-registration-confidence", dest="min_registration_confidence", type=int, default=None,
                         help="Minimum pose confidence threshold (poses below this are filtered)")
     
     # === NEW: Early Stopping ===
