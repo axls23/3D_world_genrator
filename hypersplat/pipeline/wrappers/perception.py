@@ -64,8 +64,8 @@ class ACEZeroPoseEstimator:
         # Adaptive ACE-Zero settings
         self.quality_mode = quality_mode  # 'fast', 'balanced', 'quality'
         self.min_confidence = min_confidence  # Filter poses below this confidence
-        # None = infer: a value other than the auto fallback (1000) came from the user and is
-        # applied as-is; otherwise _filter_poses may lower it to the scene's outlier boundary.
+        # None = infer: a value other than the auto fallback (1000), or the CLI flag, means the
+        # user set it (applied as-is); otherwise _filter_poses may lower it to the outlier boundary.
         self.min_confidence_user_set = None
         self.video_info = {}  # Populated by _analyze_video()
         
@@ -263,7 +263,8 @@ class ACEZeroPoseEstimator:
 
         user_set = self.min_confidence_user_set
         if user_set is None:
-            user_set = self.min_confidence != ace_schedule.DEFAULT_MIN_CONFIDENCE
+            user_set = (self.min_confidence != ace_schedule.DEFAULT_MIN_CONFIDENCE
+                        or any(a.startswith("--min_registration_confidence") for a in sys.argv))
         profile = SceneProfile.from_env()
         threshold = resolve(
             "MIN_REGISTRATION_CONFIDENCE", self.min_confidence if user_set else None,

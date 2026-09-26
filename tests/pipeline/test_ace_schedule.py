@@ -22,6 +22,8 @@ def _schedule(profile, mode="balanced", cpu=24, **kw):
 def test_real_profiles_stay_in_old_envelope(request, fixture, mode):
     v = _schedule(request.getfixturevalue(fixture), mode)
     for key, (lo, hi) in S.ENVELOPE.items():
+        if key == "registration_confidence":  # scaled by (resolution/480)^2
+            lo *= (v["image_resolution"] / 480.0) ** 2
         if key == "try_seeds" and mode == "fast":
             assert v[key] == 1
             continue
@@ -40,6 +42,7 @@ def test_real_profile_values(drone_profile, whatsapp_profile):
     # Shakier handheld clip -> tighter clamp, stricter registration, more seeds
     assert wa["repro_loss_soft_clamp"] < drone["repro_loss_soft_clamp"]
     assert wa["registration_confidence"] > drone["registration_confidence"]
+    assert S.registration_confidence(19.2, 480).value > drone["registration_confidence"]
     assert wa["try_seeds"] >= drone["try_seeds"]
     # 139 vs 40 frames -> longer mapping
     assert wa["hybrid_train_iterations"] > drone["hybrid_train_iterations"]
@@ -117,7 +120,8 @@ def test_arg_builder_passes_soft_clamp_and_resolution(whatsapp_profile):
         opts = dict(zip(args[::2], args[1::2]))
         assert opts["--repro_loss_soft_clamp"] == str(values["repro_loss_soft_clamp"])
         assert opts["--image_resolution"] == str(values["image_resolution"])
-        assert opts["--registration_confidence"] == str(values["registration_confidence"])
+        if hybrid:
+            assert opts["--registration_confidence"] == str(values["registration_confidence"])
         assert opts["--training_buffer_cpu"] == "False"
         if not hybrid:
             assert opts["--try_seeds"] == str(values["try_seeds"])

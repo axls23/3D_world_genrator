@@ -119,11 +119,18 @@ def soft_clamp(avg_motion) -> Decision:
     return Decision(value, "motion-ramp", f"avg_motion={_fmt(avg_motion)} -> level {m:.2f}")
 
 
-def registration_confidence(avg_motion) -> Decision:
-    """ACE-internal inlier-count threshold for registering a frame; stricter under motion."""
+def registration_confidence(avg_motion, resolution=DEFAULT_IMAGE_RESOLUTION) -> Decision:
+    """ACE-internal inlier-count threshold for registering a frame; stricter under motion.
+
+    Confidence is an inlier *count*, so it scales with the pixel count ACE sees: at a
+    360px short side it is ~(360/480)^2 of the 480px value (the drone run's median fell
+    from ~6390 to ~2950). The motion ramp is scaled by the same factor.
+    """
     m = motion_level(avg_motion)
-    value = _round_to(_env("registration_confidence", 500 + 1000 * m), 10)
-    return Decision(value, "motion-ramp", f"avg_motion={_fmt(avg_motion)} -> level {m:.2f}")
+    px = (float(resolution) / DEFAULT_IMAGE_RESOLUTION) ** 2
+    value = _round_to(_env("registration_confidence", 500 + 1000 * m) * px, 10)
+    return Decision(value, "motion-ramp x pixels",
+                    f"avg_motion={_fmt(avg_motion)} -> level {m:.2f}, {resolution}px short side")
 
 
 def try_seeds(avg_motion, num_frames, quality_mode) -> Decision:
@@ -234,13 +241,13 @@ def compute_schedule(avg_motion, num_frames, frame_width=None, frame_height=None
     num_frames = max(1, int(num_frames or 1))
     out = {
         "repro_loss_soft_clamp": soft_clamp(avg_motion),
-        "registration_confidence": registration_confidence(avg_motion),
         "try_seeds": try_seeds(avg_motion, num_frames, quality_mode),
         "iterations_max": iterations_max(num_frames),
         "aug_rotation": aug_rotation(avg_motion, quality_mode),
         "image_resolution": image_resolution(frame_width, frame_height),
         "num_data_workers": num_data_workers(num_frames, cpu_count),
     }
+    out["registration_confidence"] = registration_confidence(avg_motion, out["image_resolution"].value)
     out.update(mapping_iterations(num_frames, quality_mode))
     p = preset(quality_mode)
     out["cooldown_threshold"] = Decision(p["cooldown_threshold"], "preset", quality_mode)
@@ -264,7 +271,7 @@ ITERATIVE_ARGS = ("iterations_max", "seed_iterations", "refit_iterations", "lear
                   "num_head_blocks", "refinement", "refinement_ortho", "pose_refinement_wait",
                   "pose_refinement_lr", "cooldown_iterations", "cooldown_threshold",
                   "aug_rotation", "registration_threshold", "image_resolution",
-                  "registration_confidence", "repro_loss_soft_clamp")
+                  "repro_loss_soft_clamp")  # registration_confidence: ace_zero.py keeps its 500
 
 
 def build_ace_args(values: dict, hybrid: bool) -> List[str]:
