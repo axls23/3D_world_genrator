@@ -1,7 +1,10 @@
-"""# utils/depth_estimator.py
+"""hypersplat/pipeline/wrappers/depth.py
 
 Small utility to run a depth-estimation pipeline over a folder of images
 and produce a simple Open3D PLY point cloud for debugging/initialization.
+Also exposes `DepthEstimator`, the unified depth model wrapper used by
+`hypersplat/pipeline/steps/depth.py` for VRAM-efficient batch depth
+pre-computation.
 
 This file was reformatted and made a few robustness improvements:
 - consistent device handling for transformers.pipeline (int device index or -1)
@@ -192,6 +195,39 @@ class DepthEstimator:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def benchmark(self, image_rgb: np.ndarray, n_runs: int = 5) -> dict:
+        """Time depth estimation on a single image for this model.
+
+        Runs one untimed warmup call (to absorb model/CUDA init cost) followed
+        by `n_runs` timed calls, and prints/returns basic latency stats.
+        """
+        import time
+
+        # Warmup (not timed): first call often pays for lazy CUDA init, etc.
+        self(image_rgb)
+
+        durations = []
+        for _ in range(n_runs):
+            start = time.perf_counter()
+            self(image_rgb)
+            durations.append(time.perf_counter() - start)
+
+        stats = {
+            "model": self.model_type,
+            "n_runs": n_runs,
+            "mean_s": float(np.mean(durations)),
+            "min_s": float(np.min(durations)),
+            "max_s": float(np.max(durations)),
+        }
+        print(
+            f"[DepthEstimator.benchmark] model={stats['model']} "
+            f"mean={stats['mean_s']*1000:.1f}ms "
+            f"min={stats['min_s']*1000:.1f}ms "
+            f"max={stats['max_s']*1000:.1f}ms "
+            f"(n={n_runs})"
+        )
+        return stats
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
