@@ -9,15 +9,168 @@ Pipeline Modes:
 """
 
 import os
+import re
 import subprocess
 import threading
 import time
 import sys
 import collections
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from hypersplat.pipeline import log_parsing
+
+
+# =============================================================================
+# Pipeline command building -- single source of truth for wrapper.py and
+# services/api/server.py.
+#
+# The manager (hypersplat.pipeline.manager) treats any param that is NOT passed
+# on the command line as "auto": a dynamic strategy derives it from measured
+# signals (video, poses, GPU memory), with today's constants only as fallback.
+# An explicitly passed flag is "user-set" and is never overridden. So entry
+# points must only emit a flag when the caller actually provided a value;
+# hard-coding and always passing a default silently disables the strategy.
+# =============================================================================
+
+# config key -> manager CLI flag, emitted only when the value is not None.
+_VALUE_FLAGS = (
+    ("fps", "--fps"),
+    ("max_steps", "--max_steps"),
+    ("data_factor", "--data_factor"),
+    ("init_scale", "--init_scale"),
+    ("cap_max", "--cap-max"),
+    ("opacity_reg", "--opacity_reg"),
+    ("scale_reg", "--scale_reg"),
+    ("sh_degree", "--sh_degree"),
+    ("means_lr", "--means_lr"),
+    ("ssim_lambda", "--ssim_lambda"),
+    ("quality_mode", "--quality-mode"),
+    ("min_registration_confidence", "--min-registration-confidence"),
+    ("depth_model", "--depth-model"),
+    ("pose_opt_warmup", "--pose-opt-warmup"),
+    ("refine_loops", "--refine-loops"),
+    ("difix_views", "--difix-views"),
+    ("difix_max_angle", "--difix-max-angle"),
+    ("difix_pseudo_weight", "--difix-pseudo-weight"),
+    ("colmap_input", "--colmap-input"),
+    ("seed", "--seed"),
+)
+
+# config key -> store_true flag, emitted only when the value is truthy.
+_BOOL_FLAGS = (
+    ("with_ut", "--with_ut"),
+    ("with_eval3d", "--with_eval3d"),
+    ("random_bkgd", "--random_bkgd"),
+    ("app_opt", "--app_opt"),
+    ("difix", "--difix"),
+)
+
+# Early-stop values: (accepted config keys, flag). wrapper.py historically used
+# loss_patience/loss_threshold/min_steps, server.py early_stop_*; both work.
+_EARLY_STOP_FLAGS = (
+    (("early_stop_patience", "loss_patience"), "--early-stop-patience"),
+    (("early_stop_min_delta", "loss_threshold"), "--early-stop-min-delta"),
+    (("early_stop_min_steps", "min_steps"), "--early-stop-min-steps"),
+)
+
+# Sanity bounds for caller-provided values (validated, never injected).
+_POSITIVE_KEYS = ("fps", "max_steps", "data_factor", "genvs_views", "cap_max", "init_scale")
+
+
+def _first_set(config: Dict[str, Any], keys) -> Any:
+    for key in keys:
+        if config.get(key) is not None:
+            return config[key]
+    return None
+
+
+def validate_pipeline_config(config: Dict[str, Any]) -> None:
+    """Raise ValueError for caller-provided values that are out of range.
+
+    Unset (None) values are fine: the manager resolves them automatically.
+    """
+    for key in _POSITIVE_KEYS:
+        value = config.get(key)
+        if value is None:
+            continue
+        try:
+            ok = float(value) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise ValueError(f"{key} must be a positive number, got {value!r}")
+
+
+def build_pipeline_args(config: Dict[str, Any]) -> List[str]:
+    """Build the manager CLI flags for ``config``.
+
+    Only values the caller set (not None) are emitted, so every unset param
+    reaches the manager as "auto".
+    """
+    args: List[str] = []
+    for key, flag in _VALUE_FLAGS:
+        value = config.get(key)
+        if value is not None:
+            args.extend([flag, str(value)])
+
+    for key, flag in _BOOL_FLAGS:
+        if config.get(key):
+            args.append(flag)
+
+    # GeNVS novel view synthesis
+    if config.get("use_zero123") or config.get("genvs"):
+        args.append("--genvs")
+        if config.get("genvs_views") is not None:
+            args.extend(["--genvs-views", str(config["genvs_views"])])
+
+    # Pruning control (manager default: prune off unless asked)
+    if config.get("prune") is not None:
+        args.append("--prune" if config["prune"] else "--no-prune")
+
+    if config.get("unified_stream") or config.get("streaming"):
+        args.append("--streaming")
+
+    pose_opt = config.get("pose_opt")
+    if pose_opt is not None:
+        args.append("--pose-opt" if pose_opt else "--no-pose-opt")
+
+    early_stopping = config.get("early_stopping")
+    if early_stopping is not None and not early_stopping:
+        args.append("--no-early-stopping")
+    else:
+        if early_stopping:
+            args.append("--early-stopping")
+        for keys, flag in _EARLY_STOP_FLAGS:
+            value = _first_set(config, keys)
+            if value is not None:
+                args.extend([flag, str(value)])
+
+    return args
+
+
+# tqdm progress: "loss=0.123| sh degree=3| :  12%|#   | 850/7000 [00:30<03:40, 27.9it/s]"
+_TQDM_STEP_RE = re.compile(r"(\d+)/(\d+)\s*\[")
+# Explicit step logs: "Step 850", "step: 850", "Train Step 850/7000", "Iteration 850"
+_STEP_RE = re.compile(r"\b(?:[Ss]tep|[Ii]teration)[\s:=]+(\d+)")
+_LOSS_RE = re.compile(r"[Ll]oss[=:]\s*([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)")
+
+
+def parse_training_step(line: str) -> Optional[int]:
+    """Extract the training step number from a tqdm/log line, or None."""
+    match = _TQDM_STEP_RE.search(line) or _STEP_RE.search(line)
+    return int(match.group(1)) if match else None
+
+
+def parse_training_loss(line: str) -> Optional[float]:
+    """Extract a loss value ("loss=0.0123" / "Loss: 0.0123") from a log line, or None."""
+    match = _LOSS_RE.search(line)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 class PipelineMode:
@@ -52,29 +205,30 @@ class TrainingManager:
         self.log_file_path = self.root_dir / "pipeline_log.txt"
         self.current_mode = PipelineMode.LEVEL_2_ACE_ZERO
         
-        # Training config
-        self.training_config = {
-            "max_steps": 7000,
-            "data_factor": 2,
-            "fps": 2,  # Frames per second for video extraction
+        # Training config. Numeric params (fps, max_steps, data_factor,
+        # eval/save steps, early-stop thresholds, regs, ...) are deliberately
+        # absent: unset means "auto" and the manager derives them per scene.
+        # Set them via config_override to pin a value.
+        self.default_training_config = {
             "with_ut": False,
             "with_eval3d": False,
             "save_ply": True,
             "disable_viewer": False,
-            "eval_steps": [3000, 7000],
-            # Early stopping config
-            "early_stopping": True,
-            "loss_patience": 500,  # Steps to wait for improvement
-            "loss_threshold": 0.001,  # Min improvement to reset patience
-            "min_steps": 2000,  # Minimum steps before early stopping
+            # Early stopping: None = manager default; True/False = explicit
+            "early_stopping": None,
             # Zero123 mode for GeNVS
             "use_zero123": False,
         }
-        
-        # Loss tracking for early stopping
+        self.training_config = dict(self.default_training_config)
+
+        # Loss tracking for the log-regex early-stopping fallback (simple mode
+        # only, when the trainer has no native early stopping)
         self.loss_history = []
         self.best_loss = float('inf')
         self.steps_without_improvement = 0
+        self.best_loss_step = 0
+        self.regex_early_stop = False
+        self.early_stopped = False
         
     def start_training(
         self, 
@@ -100,14 +254,24 @@ class TrainingManager:
         self.progress = 0
         self.training_viewer_url = None
         
-        # Apply config overrides
+        # Apply config overrides on top of fresh defaults, so values from a
+        # previous run (or a previous fps cap) don't leak in as "user-set"
+        self.training_config = dict(self.default_training_config)
         if config_override:
             self.training_config.update(config_override)
-        
+        try:
+            validate_pipeline_config(self.training_config)
+        except ValueError:
+            self.status = "idle"
+            raise
+
         # Reset early stopping state
         self.loss_history = []
         self.best_loss = float('inf')
         self.steps_without_improvement = 0
+        self.best_loss_step = 0
+        self.regex_early_stop = False
+        self.early_stopped = False
         
         # Validate and log fps
         self.validate_fps_config(video_path)
@@ -146,82 +310,10 @@ class TrainingManager:
         acezero_output.mkdir(parents=True, exist_ok=True)
         result_dir.mkdir(parents=True, exist_ok=True)
         
-        # Build the combined pipeline command
-        pipeline_script = self.scripts_dir / "automated_intelligent_pipeline.py"
-        
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         
-        cmd = [
-            sys.executable, "-u", str(pipeline_script),
-            video_path,
-            "--output_dir", str(self.output_dir),
-            "--fps", str(self.training_config["fps"]),
-            "--max_steps", str(self.training_config["max_steps"]),
-            "--data_factor", str(self.training_config["data_factor"]),
-        ]
-        
-        # 3DGUT options
-        if self.training_config.get("with_ut"):
-            cmd.append("--with_ut")
-        if self.training_config.get("with_eval3d"):
-            cmd.append("--with_eval3d")
-        
-        # GeNVS novel view synthesis
-        if self.training_config.get("use_zero123") or self.training_config.get("genvs"):
-            cmd.append("--genvs")
-            num_views = self.training_config.get("genvs_views", 20)
-            cmd.extend(["--genvs-views", str(num_views)])
-        
-        # Pruning control
-        if not self.training_config.get("prune", True):
-            cmd.append("--no-prune")
-        
-        # Streaming mode
-        if self.training_config.get("streaming"):
-            cmd.append("--streaming")
-        
-        # === NEW: Pass quality mode, confidence filter, early stopping ===
-        quality_mode = self.training_config.get("quality_mode", "balanced")
-        cmd.extend(["--quality-mode", quality_mode])
-        
-        min_conf = self.training_config.get("min_registration_confidence", 1000)
-        cmd.extend(["--min-registration-confidence", str(min_conf)])
-        
-        depth_model = self.training_config.get("depth_model", "depth_anything")
-        cmd.extend(["--depth-model", depth_model])
-
-        # Advanced config
-        if "sh_degree" in self.training_config:
-            cmd.extend(["--sh_degree", str(self.training_config["sh_degree"])])
-        if "means_lr" in self.training_config:
-            cmd.extend(["--means_lr", str(self.training_config["means_lr"])])
-        if "opacity_reg" in self.training_config:
-            cmd.extend(["--opacity_reg", str(self.training_config["opacity_reg"])])
-        if "scale_reg" in self.training_config:
-            cmd.extend(["--scale_reg", str(self.training_config["scale_reg"])])
-        if "ssim_lambda" in self.training_config:
-            cmd.extend(["--ssim_lambda", str(self.training_config["ssim_lambda"])])
-        if self.training_config.get("random_bkgd"):
-            cmd.append("--random_bkgd")
-        if self.training_config.get("pose_opt", True):
-            cmd.append("--pose-opt")
-        else:
-            cmd.append("--no-pose-opt")
-        if self.training_config.get("app_opt"):
-            cmd.append("--app_opt")
-        
-        # Depth model selection: depth_anything (default), zoedepth, midas
-        depth_model = self.training_config.get("depth_model", "depth_anything")
-        cmd.extend(["--depth-model", depth_model])
-        
-        if self.training_config.get("early_stopping", True):
-            cmd.append("--early-stopping")
-            cmd.extend(["--early-stop-patience", str(self.training_config.get("loss_patience", 500))])
-            cmd.extend(["--early-stop-min-delta", str(self.training_config.get("loss_threshold", 0.001))])
-            cmd.extend(["--early-stop-min-steps", str(self.training_config.get("min_steps", 2000))])
-        else:
-            cmd.append("--no-early-stopping")
+        cmd = self.build_ace_zero_command(video_path)
 
         # Smart Resume: Check if ACE-Zero output exists
         # ACE-Zero creates 'acezero_output' inside the output_dir
@@ -240,6 +332,66 @@ class TrainingManager:
         
         return self._start_subprocess(cmd, env)
     
+    def build_ace_zero_command(self, video_path: str) -> List[str]:
+        """Pure: the Level 2 manager command for the current training_config."""
+        pipeline_script = self.scripts_dir / "automated_intelligent_pipeline.py"
+        return [
+            sys.executable, "-u", str(pipeline_script),
+            video_path,
+            "--output_dir", str(self.output_dir),
+            *build_pipeline_args(self.training_config),
+        ]
+
+    def _trainer_has_native_early_stop(self, trainer_script: Path) -> bool:
+        """Whether simple_trainer.py implements early stopping itself."""
+        try:
+            return "early_stop" in trainer_script.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+    # Level 1 calls simple_trainer.py directly, which has no dynamic
+    # strategies (its own defaults are 30k steps at data_factor 4), so unset
+    # values fall back to these instead of being left "auto".
+    SIMPLE_MODE_FALLBACK = {"max_steps": 7000, "data_factor": 2}
+
+    def build_simple_command(self, data_dir: str) -> List[str]:
+        """Pure: the Level 1 simple_trainer command for the current training_config.
+
+        Unset max_steps/data_factor use SIMPLE_MODE_FALLBACK; unset
+        eval_steps/save_steps are derived from the effective max_steps.
+        """
+        trainer_script = self.root_dir / "examples" / "simple_trainer.py"
+        result_dir = self.output_dir / "results"
+        config = {**self.SIMPLE_MODE_FALLBACK,
+                  **{k: v for k, v in self.training_config.items() if v is not None}}
+        cmd = [
+            sys.executable, "-u", str(trainer_script),
+            "mcmc",
+            "--data_dir", str(data_dir),
+            "--result_dir", str(result_dir),
+        ]
+        for key in ("max_steps", "data_factor"):
+            if config.get(key) is not None:
+                cmd.extend([f"--{key}", str(config[key])])
+        # The trainer's default eval/save steps (7k/30k) never fire for a
+        # shorter custom run, so derive them from max_steps when unset.
+        for key in ("eval_steps", "save_steps"):
+            steps = config.get(key)
+            if steps is None and config.get("max_steps") is not None:
+                steps = [config["max_steps"]]
+            if steps is not None:
+                cmd.extend([f"--{key}", *[str(s) for s in steps]])
+
+        if config.get("save_ply"):
+            cmd.append("--save_ply")
+        if config.get("disable_viewer"):
+            cmd.append("--disable_viewer")
+        if config.get("with_ut"):
+            cmd.append("--with_ut")
+        if config.get("with_eval3d"):
+            cmd.append("--with_eval3d")
+        return cmd
+
     def _run_simple_training(self, video_path: str):
         """
         Level 1: Simple direct training (assumes data is pre-processed)
@@ -256,24 +408,16 @@ class TrainingManager:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         
-        cmd = [
-            sys.executable, "-u", str(trainer_script),
-            "mcmc",
-            "--data_dir", str(data_dir),
-            "--result_dir", str(result_dir),
-            "--max_steps", str(self.training_config["max_steps"]),
-            "--data_factor", str(self.training_config["data_factor"]),
-            "--eval_steps", *[str(s) for s in self.training_config["eval_steps"]],
-        ]
-        
-        if self.training_config.get("save_ply"):
-            cmd.append("--save_ply")
-        if self.training_config.get("disable_viewer"):
-            cmd.append("--disable_viewer")
-        if self.training_config.get("with_ut"):
-            cmd.append("--with_ut")
-        if self.training_config.get("with_eval3d"):
-            cmd.append("--with_eval3d")
+        cmd = self.build_simple_command(str(data_dir))
+
+        # Log-regex early stopping is only a fallback for trainers without
+        # native early stopping, and only when the user asked for it.
+        self.regex_early_stop = (
+            self.training_config.get("early_stopping") is True
+            and not self._trainer_has_native_early_stop(trainer_script)
+        )
+        if self.regex_early_stop:
+            self.logs.append("[EARLY STOP] Trainer has no native early stopping; using log-based fallback.")
         
         self.logs.append(f"Command: {' '.join(cmd)}")
         print(f"Starting simple training: {' '.join(cmd)}")
@@ -296,10 +440,10 @@ class TrainingManager:
             video_path,
             "--output_dir", str(self.output_dir),
             "--use_colmap",  # Force COLMAP/chunked mode
-            "--fps", str(self.training_config["fps"]),
-            "--max_steps", str(self.training_config["max_steps"]),
-            "--min_chunk_duration", "5",
+            *build_pipeline_args(self.training_config),
         ]
+        if self.training_config.get("min_chunk_duration") is not None:
+            cmd.extend(["--min_chunk_duration", str(self.training_config["min_chunk_duration"])])
         
         self.logs.append(f"Command: {' '.join(cmd)}")
         print(f"Starting chunked pipeline: {' '.join(cmd)}")
@@ -372,6 +516,8 @@ class TrainingManager:
                         pass
                         
                     self._parse_log_line(decoded_line)
+                    if self.regex_early_stop:
+                        self._check_early_stopping(decoded_line)
                     
         except Exception as e:
             self.logs.append(f"Error reading logs: {e}")
@@ -379,13 +525,22 @@ class TrainingManager:
             self.process.stdout.close()
             return_code = self.process.wait()
             
-            if return_code == 0:
+            if self.early_stopped and return_code != 0 and not self._has_saved_output():
+                self.status = "error"
+                self.logs.append("[EARLY STOP] Trainer was stopped before saving any checkpoint/PLY.")
+            elif return_code == 0 or self.early_stopped:
                 self.status = "training_complete"
                 self.progress = 100
                 self.logs.append("Training completed successfully.")
             else:
                 self.status = "error"
                 self.logs.append(f"Process failed with return code {return_code}")
+
+    def _has_saved_output(self) -> bool:
+        """Whether simple_trainer wrote any checkpoint or PLY into results/."""
+        result_dir = self.output_dir / "results"
+        return any(any((result_dir / sub).glob("*")) for sub in ("ckpts", "ply")
+                   if (result_dir / sub).is_dir())
 
     def _is_repetitive_match(self, last_line: str, new_line: str) -> bool:
         """Check if new line is a progress update of the same type as last line"""
@@ -416,67 +571,85 @@ class TrainingManager:
         if result.is_complete:
             self.status = "training_complete"
 
+    # Fallback thresholds for the log-regex early stop, used only inside the
+    # wrapper (never passed on the CLI) when the user didn't set them.
+    _FALLBACK_EARLY_STOP = {"patience": 500, "min_delta": 0.001, "min_steps": 2000}
+
     def _check_early_stopping(self, line: str):
-        """Check if training should stop early based on loss convergence."""
-        if not self.training_config.get("early_stopping", False):
+        """Log-regex early stopping fallback (see _run_simple_training).
+
+        Steps are the trainer's actual step numbers parsed from the tqdm/log
+        line, not a count of log lines.
+        """
+        if not self.regex_early_stop or self.early_stopped:
             return
-        
-        try:
-            # Parse loss value from line (formats: "loss: 0.0123" or "Loss=0.0123")
-            import re
-            match = re.search(r'[Ll]oss[=:]\s*([0-9.]+)', line)
-            if not match:
-                return
-            
-            loss = float(match.group(1))
-            self.loss_history.append(loss)
-            
-            # Check for improvement
-            if loss < self.best_loss - self.training_config["loss_threshold"]:
-                self.best_loss = loss
-                self.steps_without_improvement = 0
-            else:
-                self.steps_without_improvement += 1
-            
-            # Check early stopping condition
-            current_step = len(self.loss_history)
-            min_steps = self.training_config.get("min_steps", 2000)
-            patience = self.training_config.get("loss_patience", 500)
-            
-            if (current_step >= min_steps and 
-                self.steps_without_improvement >= patience):
-                self.logs.append(f"[EARLY STOP] Loss converged at {loss:.6f} after {current_step} steps")
-                self.logs.append(f"[EARLY STOP] No improvement for {patience} steps, stopping...")
-                # Signal to stop the process
-                if self.process and self.process.poll() is None:
-                    self.process.terminate()
-                    self.status = "training_complete"
-                    self.progress = 100
-        except Exception as e:
-            pass  # Ignore parsing errors
-    
-    def get_video_fps(self, video_path: str) -> float:
-        """Get actual FPS from video file."""
+
+        loss = parse_training_loss(line)
+        step = parse_training_step(line)
+        if loss is None or step is None:
+            return
+        self.loss_history.append((step, loss))
+
+        config = self.training_config
+        fallback = self._FALLBACK_EARLY_STOP
+        patience = _first_set(config, ("early_stop_patience", "loss_patience"))
+        min_delta = _first_set(config, ("early_stop_min_delta", "loss_threshold"))
+        min_steps = _first_set(config, ("early_stop_min_steps", "min_steps"))
+        patience = fallback["patience"] if patience is None else patience
+        min_delta = fallback["min_delta"] if min_delta is None else min_delta
+        if min_steps is None:
+            min_steps = fallback["min_steps"]
+            if config.get("max_steps") is not None:
+                # Short runs: don't wait longer than a third of the budget
+                min_steps = min(min_steps, int(config["max_steps"]) // 3)
+
+        if loss < self.best_loss - min_delta:
+            self.best_loss = loss
+            self.best_loss_step = step
+        self.steps_without_improvement = step - self.best_loss_step
+
+        # Never kill the trainer before it has written a checkpoint/PLY
+        # (simple_trainer only saves at save_steps), or the run is lost.
+        if (step >= min_steps and self.steps_without_improvement >= patience
+                and self._has_saved_output()):
+            self.logs.append(f"[EARLY STOP] Loss converged at {loss:.6f} after {step} steps")
+            self.logs.append(f"[EARLY STOP] No improvement for {self.steps_without_improvement} steps, stopping...")
+            if self.process and self.process.poll() is None:
+                self.early_stopped = True
+                self.process.terminate()
+                self.status = "training_complete"
+                self.progress = 100
+
+    def get_video_fps(self, video_path: str) -> Optional[float]:
+        """Get actual FPS from video file, or None if it can't be read."""
         try:
             import cv2
             cap = cv2.VideoCapture(video_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
             cap.release()
-            return fps if fps > 0 else 30.0
-        except:
-            return 30.0  # Default fallback
-    
-    def validate_fps_config(self, video_path: str):
-        """Validate and adjust fps config based on video."""
+            return fps if fps > 0 else None
+        except Exception:
+            return None
+
+    def validate_fps_config(self, video_path: str) -> Optional[float]:
+        """Sanity-check a user-set extraction fps against the video.
+
+        Unset fps stays unset (the manager picks it per scene); a user-set fps
+        above the video's own rate is capped to it.
+        """
+        config_fps = self.training_config.get("fps")
         video_fps = self.get_video_fps(video_path)
-        config_fps = self.training_config.get("fps", 1.5)
-        
+        if video_fps is None:
+            return config_fps
+        if config_fps is None:
+            self.logs.append(f"[FPS] Video: {video_fps:.2f} fps, extraction fps: auto")
+            return None
+
         # Ensure extraction fps doesn't exceed video fps
         if config_fps > video_fps:
             self.logs.append(f"[FPS] Capping extraction fps from {config_fps} to {video_fps}")
             self.training_config["fps"] = video_fps
-        
-        # Log effective frame extraction rate
-        estimated_frames = video_fps / self.training_config["fps"]
-        self.logs.append(f"[FPS] Video: {video_fps:.2f} fps, Extracting: 1 frame per {1/self.training_config['fps']:.2f}s")
-        return self.training_config["fps"]
+
+        fps = self.training_config["fps"]
+        self.logs.append(f"[FPS] Video: {video_fps:.2f} fps, Extracting: 1 frame per {1/fps:.2f}s")
+        return fps
