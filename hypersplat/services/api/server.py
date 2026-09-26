@@ -25,6 +25,7 @@ API Endpoints:
 """
 
 import os
+import sys
 import shutil
 import subprocess
 import asyncio
@@ -34,6 +35,7 @@ import datetime
 import time
 import glob
 import collections
+import threading
 from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
@@ -67,6 +69,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Server ports (env-overridable, single source of truth for this module)
+SERVER_PORT = int(os.environ.get("HYPERSPLAT_SERVER_PORT", 8080))
+VIEWER_PORT = int(os.environ.get("HYPERSPLAT_VIEWER_PORT", 8092))
+
 # Directories - All outputs consolidated in demo/output/
 CURRENT_DIR = Path(__file__).parent.resolve()
 STATIC_DIR = CURRENT_DIR / "static"
@@ -89,10 +95,28 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 
 
 def get_python_executable() -> str:
-    # Prefer the 3dgrut environment python if available on Windows
-    conda_env_python = "C:\\Users\\sxhil_25660\\anaconda3\\envs\\3dgrut\\python.exe"
-    if os.path.exists(conda_env_python):
-        return conda_env_python
+    # Prefer the currently-active "3dgrut" conda environment's python if one
+    # is active (checked via standard environment variables rather than a
+    # hardcoded per-developer path), otherwise fall back to the interpreter
+    # currently running this process.
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix and os.path.basename(os.path.normpath(conda_prefix)) == "3dgrut":
+        candidate = os.path.join(
+            conda_prefix, "Scripts" if os.name == "nt" else "bin",
+            "python.exe" if os.name == "nt" else "python",
+        )
+        if os.path.exists(candidate):
+            return candidate
+
+    user_profile = os.environ.get("USERPROFILE") or os.environ.get("HOME")
+    if user_profile:
+        candidate = os.path.join(
+            user_profile, "anaconda3", "envs", "3dgrut",
+            "python.exe" if os.name == "nt" else "python",
+        )
+        if os.path.exists(candidate):
+            return candidate
+
     return sys.executable or "python"
 
 
@@ -500,7 +524,6 @@ class AppState:
             subscribers.discard(ws)
 
 
-import sys
 state = AppState()
 
 
@@ -830,7 +853,7 @@ async def start_viewer(req: ViewRequest = None):
         raise HTTPException(status_code=404, detail=f"No checkpoints found in {OUTPUT_DIR}")
 
     viewer_script = GSPLAT_ROOT / "examples" / "simple_viewer_3dgut.py"
-    port = 8092
+    port = VIEWER_PORT
     
     cmd = [
         get_python_executable(), str(viewer_script),
@@ -902,7 +925,7 @@ async def get_info():
         "output_dir": str(OUTPUT_DIR),
         "gsplat_root": str(GSPLAT_ROOT),
         "uploads_dir": str(UPLOADS_DIR),
-        "websocket_url": "ws://localhost:8081/api/ws",
+        "websocket_url": f"ws://localhost:{SERVER_PORT}/api/ws",
         "has_existing_poses": has_existing_poses
     }
 
@@ -1037,8 +1060,8 @@ if __name__ == "__main__":
     print(f"Uploads directory: {UPLOADS_DIR}")
     print(f"GSplat root: {GSPLAT_ROOT}")
     print("=" * 60)
-    print("Starting server on http://0.0.0.0:8080")
-    print("API docs available at http://localhost:8080/docs")
+    print(f"Starting server on http://0.0.0.0:{SERVER_PORT}")
+    print(f"API docs available at http://localhost:{SERVER_PORT}/docs")
     print("=" * 60)
-    
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
