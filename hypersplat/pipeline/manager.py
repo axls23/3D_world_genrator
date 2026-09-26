@@ -292,7 +292,13 @@ class IntelligentPipeline:
         # Measured signals shared by all stages; strategies derive parameters from them
         from hypersplat.pipeline.params import PROFILE_ENV, PROFILE_FILENAME, SceneProfile
         self.profile = SceneProfile.load(self.config.OUTPUT_BASE / PROFILE_FILENAME)
+        # A rerun into the same output dir keeps measured scene signals (video/ace/points)
+        # but must not decide from the previous run's results or decisions
+        self.profile.discard("train", "difix", "decisions")
         os.environ[PROFILE_ENV] = str(self.profile.path)  # for stage subprocesses
+        from hypersplat.pipeline.params import Decision, record
+        for name in sorted(self.config.USER_SET):
+            record(name, Decision(getattr(self.config, name), "user", "set explicitly"), self.profile)
         self._record_video_signals(video_path)
         self._apply_param_stage("pre_ace")
 

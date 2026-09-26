@@ -40,6 +40,23 @@ def test_profile_save_merges_concurrent_writers(tmp_path):
     assert manager_view.get("points.count") == 309050    # in-memory copy refreshed
 
 
+def test_profile_discard_drops_previous_run(tmp_path):
+    f = tmp_path / "scene_profile.json"
+    old = SceneProfile.load(f)
+    old.set("ace.focal_median", 593.0)
+    old.set("train.val", [{"step": 6999, "psnr": 12.7}])
+    old.set("decisions.CAP_MAX", {"value": 1})
+    old.save()
+    rerun = SceneProfile.load(f)
+    rerun.discard("train", "difix", "decisions")
+    rerun.set("gpu.free_mb", 5000)
+    rerun.save()
+    fresh = SceneProfile.load(f)
+    assert fresh.get("ace.focal_median") == 593.0      # scene signal kept
+    assert fresh.get("train.val") is None               # previous run's results gone
+    assert fresh.get("decisions") is None
+
+
 def test_profile_load_corrupt_file(tmp_path):
     f = tmp_path / "scene_profile.json"
     f.write_text("{not json")
