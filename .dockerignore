@@ -30,7 +30,6 @@ environment_windows.yml
 demo/output/
 debug_output/
 assets/
-examples/
 tests/
 
 # Temporary files
