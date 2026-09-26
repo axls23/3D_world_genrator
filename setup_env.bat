@@ -5,7 +5,7 @@ echo ========================================================
 echo.
 
 :: 1. Setup Windows Environment
-echo [1/2] Creating Windows Environment (hypersplat)...
+echo [1/2] Creating Windows Environment (3dgrut)...
 if exist "environment_windows.yml" (
     call conda env create -f environment_windows.yml
     call conda activate 3dgrut
