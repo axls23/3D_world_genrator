@@ -22,6 +22,24 @@ def test_profile_roundtrip(tmp_path):
     assert q.get("_sources")["gpu.free_mb"] == "test"
 
 
+def test_profile_save_merges_concurrent_writers(tmp_path):
+    f = tmp_path / "scene_profile.json"
+    manager_view = SceneProfile.load(f)
+    manager_view.set("gpu.free_mb", 5000)
+    manager_view.save()
+    subprocess_view = SceneProfile.load(f)               # e.g. generate_points_wsl.py
+    subprocess_view.set("decisions.INIT_POINT_SUBSAMPLE", {"value": 0.03})
+    subprocess_view.set("points.count", 309050)
+    subprocess_view.save()
+    manager_view.set("decisions.CAP_MAX", {"value": 300000})  # stale in-memory copy
+    manager_view.save()
+    merged = SceneProfile.load(f)
+    assert merged.get("decisions.INIT_POINT_SUBSAMPLE") == {"value": 0.03}
+    assert merged.get("decisions.CAP_MAX") == {"value": 300000}
+    assert merged.get("points.count") == 309050
+    assert manager_view.get("points.count") == 309050    # in-memory copy refreshed
+
+
 def test_profile_load_corrupt_file(tmp_path):
     f = tmp_path / "scene_profile.json"
     f.write_text("{not json")

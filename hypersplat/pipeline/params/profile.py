@@ -78,9 +78,29 @@ class SceneProfile:
         self.set(key, items, source)
 
     def save(self) -> None:
+        """Write to disk, merging with what is already there.
+
+        Stage subprocesses (e.g. the ACE-Zero point generator) and in-process helpers may
+        hold their own SceneProfile of the same file; a plain overwrite from a stale copy
+        would drop their keys. Keys in memory win on conflict, keys only on disk are kept,
+        and this object is refreshed with the merged result.
+        """
         if self.path is None:
             return
+        on_disk = SceneProfile.load(self.path).data
+        self.data = _merge(on_disk, self.data)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self.data, indent=2, default=str))
         os.replace(str(tmp), str(self.path))
+
+
+def _merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge; `override` wins on conflicting non-dict values."""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
