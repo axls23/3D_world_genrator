@@ -19,13 +19,17 @@ def _write_pinhole(path, w, h, f, model=1):
 # ----------------------------------------------------------------------------
 # Initial focal
 # ----------------------------------------------------------------------------
-def test_heuristic_matches_old_70deg_hfov(drone_profile, whatsapp_profile):
-    # The old hard-coded guesses these datasets were exported with
+def test_heuristic_70deg_long_side(drone_profile, whatsapp_profile):
+    # Landscape: same as the old 70-deg HFOV guess
     d = intrinsics.initial_focal(drone_profile.get("frames.width"), drone_profile.get("frames.height"))
     assert d.strategy == "hfov-70"
     assert d.value == pytest.approx(drone_profile.get("_observed.heuristic_focal_px"), abs=0.5)
+    # Portrait: the old width-based guess (342.76) was 42% below ACE's 593.37; the long
+    # side gives ~617 (+4%), a much better starting point for ACE-Zero
     w = intrinsics.initial_focal(whatsapp_profile.get("frames.width"), whatsapp_profile.get("frames.height"))
-    assert w.value == pytest.approx(whatsapp_profile.get("_observed.heuristic_focal_px"), abs=0.01)
+    ace = whatsapp_profile.get("ace.focal_median")
+    assert w.value == pytest.approx(616.96, abs=0.01)
+    assert abs(w.value - ace) / ace < 0.05
 
 
 def test_parse_ffprobe_apple_35mm_tag():

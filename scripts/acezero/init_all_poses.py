@@ -203,7 +203,7 @@ def init_all_poses(images_glob: str, output_path: str, focal_length: float = -1,
     Args:
         images_glob: Glob pattern matching input images.
         output_path: Path for the output ACE pose file.
-        focal_length: Focal length in pixels. -1 = 70 degree horizontal FOV heuristic.
+        focal_length: Focal length in pixels. -1 = 70 degree FOV (long side) heuristic.
         confidence: Confidence value assigned to all initialized poses.
         max_features: Maximum SIFT features per image.
 
@@ -232,8 +232,8 @@ def init_all_poses(images_glob: str, output_path: str, focal_length: float = -1,
     if focal_length < 0:
         # No hint from the pipeline: use the same 70-degree-HFOV rule as its frame extraction
         # (hypersplat/pipeline/params/strategies/intrinsics.py), not ACE-Zero's 70%-of-diagonal
-        focal_length = w / (2.0 * np.tan(np.radians(35.0)))
-        _logger.info(f"Using heuristic focal length: {focal_length:.1f}px (70 deg HFOV of {w}px)")
+        focal_length = max(w, h) / (2.0 * np.tan(np.radians(35.0)))
+        _logger.info(f"Using heuristic focal length: {focal_length:.1f}px (70 deg FOV of {max(w, h)}px long side)")
     else:
         _logger.info(f"Using focal length hint: {focal_length:.1f}px")
 
@@ -305,7 +305,7 @@ if __name__ == '__main__':
     parser.add_argument('output_pose_file', type=str,
                         help='Output ACE pose file path')
     parser.add_argument('--focal_length', type=float, default=-1,
-                        help='Focal length in pixels. -1 = 70 degree horizontal FOV heuristic')
+                        help='Focal length in pixels. -1 = 70 degree FOV (long side) heuristic')
     parser.add_argument('--confidence', type=float, default=10000,
                         help='Confidence value assigned to all initialized poses')
     parser.add_argument('--max_features', type=int, default=2000,

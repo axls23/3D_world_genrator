@@ -454,11 +454,18 @@ class IntelligentPipeline:
         if n_points is not None:
             self.profile.set("points.count", n_points, "points3D.bin")
 
-        # Intrinsics: repair a reused cameras.bin (--colmap-input / skip-ACE) whose focal
-        # disagrees with ACE-Zero's refined one
-        from hypersplat.pipeline.params import record
+        # Intrinsics: perception.py recorded this run's focal decisions on disk; they replace
+        # any left in memory from an earlier run into the same output folder
+        from hypersplat.pipeline.params import SceneProfile, record
         from hypersplat.pipeline.params.strategies import intrinsics
-        if ace:
+        on_disk = SceneProfile.load(self.profile.path)
+        for key in ("decisions.FOCAL_INIT_PX", "decisions.FOCAL_PX"):
+            if on_disk.get(key) is not None:
+                self.profile.set(key, on_disk.get(key))
+        # Repair a reused cameras.bin (--colmap-input / skip-ACE) whose focal disagrees with
+        # ACE-Zero's refined one. Not in streaming mode: ACE and the pose watcher are still
+        # writing sparse/0 then.
+        if ace and not self.config.STREAMING:
             try:
                 fixed = intrinsics.fix_stale_cameras(ace_output / "sparse" / "0" / "cameras.bin",
                                                      ace["focal_median"], self.profile.get("frames.width"))

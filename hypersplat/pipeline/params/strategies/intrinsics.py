@@ -5,8 +5,9 @@
      `com.apple.quicktime.camera.focal_length.35mmEquivalent`, EXIF-style
      `FocalLengthIn35mmFormat`) -> f_px = f35 / 36mm * long_side_px
      (36 mm is the long side of a 35mm frame, so this holds for portrait and landscape).
-   - "hfov-70": otherwise ONE shared heuristic, 70 degree horizontal FOV:
-     f_px = W / (2 tan 35deg). ACE-Zero's own hybrid init receives this value as a hint
+   - "hfov-70": otherwise ONE shared heuristic, 70 degree FOV across the long side:
+     f_px = max(W, H) / (2 tan 35deg) (the long side, so portrait phone clips are not
+     given a focal ~40% too short). ACE-Zero's own hybrid init receives this value as a hint
      instead of applying its separate 70%-of-diagonal rule.
 2. Refined focal (FOCAL_PX): ACE-Zero optimises the focal during mapping
    (refine_calibration); the median of its per-frame focals is what the COLMAP export uses.
@@ -65,9 +66,9 @@ COLMAP_MODELS = {
 # ----------------------------------------------------------------------------
 # Initial focal: metadata, else the shared 70-degree-HFOV heuristic
 # ----------------------------------------------------------------------------
-def heuristic_focal_px(width: float) -> float:
-    """Focal (px) for a 70 degree horizontal FOV."""
-    return width / (2.0 * math.tan(math.radians(HFOV_DEG / 2.0)))
+def heuristic_focal_px(width: float, height: float = 0) -> float:
+    """Focal (px) for a 70 degree FOV across the long image side."""
+    return max(width, height) / (2.0 * math.tan(math.radians(HFOV_DEG / 2.0)))
 
 
 def _parse_mm(value) -> Optional[float]:
@@ -115,8 +116,8 @@ def initial_focal(width: int, height: int, f35_mm: Optional[float] = None) -> De
     if f35_mm:
         return Decision(round(focal_35mm_to_px(f35_mm, width, height), 2), "metadata-35mm",
                         f"video tag {f35_mm:g}mm 35mm-equiv -> {f35_mm:g}/36*{max(width, height)}px")
-    return Decision(round(heuristic_focal_px(width), 2), "hfov-70",
-                    f"no focal metadata; 70deg HFOV of {width}px-wide frames")
+    return Decision(round(heuristic_focal_px(width, height), 2), "hfov-70",
+                    f"no focal metadata; 70deg FOV across the {max(width, height)}px long side")
 
 
 def refined_focal(focals: List[float], initial_px: float) -> Optional[Decision]:
