@@ -810,6 +810,66 @@ print('Done! VRAM freed for ACE training.')
             logger.error(f"ACE-Zero (Docker) failed: {e}")
             return False
 
+    # Modules the ACE-Zero subprocesses hard-import (train_ace -> refine_poses/dataset,
+    # register_mapping -> dsacstar). Missing ones otherwise only surface after frame
+    # extraction and pose init, buried in a subprocess traceback.
+    NATIVE_REQUIRED_MODULES = ["torch", "roma", "skimage", "cv2", "dsacstar"]
+
+    # ACE-Zero lives in its own conda env (python 3.8, torch 2.0, compiled dsacstar);
+    # the 3DGS side (.venv_3dgrut) does not have those deps.
+    DEFAULT_ACEZERO_ENV = Path(__file__).resolve().parents[4] / ".conda_envs" / "ace0"
+
+    def _acezero_python(self) -> Tuple[str, Dict[str, str]]:
+        """Interpreter + environment for native ACE-Zero subprocesses.
+
+        Resolution: $HYPERSPLAT_ACEZERO_PYTHON, then the sibling `.conda_envs/ace0`
+        env, then the current interpreter.
+        """
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(self.acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+        python = os.environ.get("HYPERSPLAT_ACEZERO_PYTHON")
+        if not python:
+            candidate = self.DEFAULT_ACEZERO_ENV / "bin" / "python"
+            python = str(candidate) if candidate.exists() else sys.executable
+
+        if python != sys.executable:
+            # Point PATH at the env so ace_zero_hybrid's own child calls (sys.executable)
+            # and any tools stay inside it.
+            env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+            # dsacstar in ace0 was compiled with the system GCC and needs symbols
+            # (__cxa_call_terminate) missing from conda's older libstdc++.
+            system_libstdcxx = "/usr/lib64/libstdc++.so.6"
+            if os.path.exists(system_libstdcxx) and "LD_PRELOAD" not in env:
+                env["LD_PRELOAD"] = system_libstdcxx
+        return python, env
+
+    def _check_native_dependencies(self) -> bool:
+        """Fail fast if the ACE-Zero interpreter can't import a required module."""
+        python, env = self._acezero_python()
+        probe = (
+            "import importlib, sys\n"
+            "for m in sys.argv[1:]:\n"
+            "    try: importlib.import_module(m)\n"
+            "    except Exception as e: print(f'{m}: {e}')\n"
+        )
+        result = subprocess.run(
+            [python, "-c", probe, *self.NATIVE_REQUIRED_MODULES],
+            cwd=str(self.acezero_root), env=env, capture_output=True, text=True,
+        )
+        failures = [l for l in result.stdout.splitlines() if l.strip()]
+        if result.returncode == 0 and not failures:
+            logger.info(f"ACE-Zero interpreter: {python}")
+            return True
+        logger.error(f"ACE-Zero cannot run with interpreter {python}:")
+        for line in failures or [result.stderr.strip()]:
+            logger.error(f"  {line}")
+        logger.error(
+            f"  Set HYPERSPLAT_ACEZERO_PYTHON to an env with ACE-Zero deps "
+            f"(default: {self.DEFAULT_ACEZERO_ENV}/bin/python)."
+        )
+        return False
+
     def _run_ace_zero_native(self, images_glob: str, output_dir: str, acezero_script: str, max_iterations: int) -> bool:
         """Run ACE-Zero natively on Linux (Docker or bare metal)."""
         # Ensure all parameters have valid defaults
@@ -865,11 +925,14 @@ print('Done! VRAM freed for ACE training.')
                 "--registration_threshold", str(getattr(self, 'registration_threshold', 0.99)),
             ]
         
+        if not self._check_native_dependencies():
+            return False
+
         logger.info(f"[Native Linux] Running ACE-Zero: iters={iters}, seeds={try_seeds}, refinement={refinement}")
-        
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(self.acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
-        
+
+        python, env = self._acezero_python()
+        cmd[0] = python
+
         try:
             subprocess.run(cmd, cwd=str(self.acezero_root), env=env, check=True)
             self.refine_poses_native()
@@ -887,15 +950,23 @@ print('Done! VRAM freed for ACE training.')
         fpath = self.acezero_output / "poses_final.txt"
         if fpath.exists():
             try:
+                focals = []
                 with open(fpath, 'r') as f:
                     for line in f:
                         tokens = line.split()
                         if len(tokens) == 10:
+                            focals.append(float(tokens[8]))
                             q = [float(tokens[2]), float(tokens[3]), float(tokens[4]), float(tokens[1])] # x,y,z,w
                             t = np.array([float(tokens[5]), float(tokens[6]), float(tokens[7])])
                             R = Rotation.from_quat(q).as_matrix()
                             w2c = np.eye(4); w2c[:3,:3] = R; w2c[:3,3] = t
                             self.poses[Path(tokens[0]).name] = np.linalg.inv(w2c)
+                if focals:
+                    # ACE-Zero refines the focal length (in original-image pixels); the value
+                    # set at frame extraction is only a 70-degree-HFOV initial guess
+                    ace_focal = float(np.median(focals))
+                    logger.info(f"Using ACE-Zero focal length {ace_focal:.1f}px (initial guess was {self.focal_length:.1f}px)")
+                    self.focal_length = ace_focal
                 return len(self.poses) > 0
             except Exception as e: logger.error(f"Parse error: {e}")
 
@@ -949,9 +1020,10 @@ print('Done! VRAM freed for ACE training.')
         imgs = str(self.images_dir)
         out = str(self.sparse_dir / "points3D.bin")
         
-        cmd = [sys.executable, "-u", str(script), poses, imgs, out]
+        python, env = self._acezero_python()
+        cmd = [python, "-u", str(script), poses, imgs, out]
         try:
-            subprocess.run(cmd, check=True, cwd=str(self.acezero_root), timeout=600)
+            subprocess.run(cmd, check=True, cwd=str(self.acezero_root), env=env, timeout=600)
             if (self.sparse_dir / "points3D.bin").stat().st_size > 1000:
                 return True
             logger.error("Native Point Gen: output too small")

@@ -24,7 +24,8 @@ class PipelineGovernor:
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.ace_dir = state_dir.parent / "acezero_output"
-        self.results_dir = state_dir.parent / "results" / "acezero_3dgs"
+        # state_dir is the 3DGS result dir of the last training run (it holds stats/)
+        self.results_dir = state_dir if (state_dir / "stats").exists() else state_dir.parent / "results" / "acezero_3dgs"
         
         # Hyperparameter defaults
         self.current_action = "STEADY"

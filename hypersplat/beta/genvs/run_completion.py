@@ -4,7 +4,7 @@ import sys
 import torch
 import numpy as np
 from pathlib import Path
-from PIL import Image
+from PIL import Image as PILImage
 from typing import Dict, List, Optional
 
 import logging
@@ -280,7 +280,7 @@ def inject_autoregressive_back_views(ace_output: Path, initial_result_dir: Path,
     refined_src = iter_dir / "refined_back_0000.png"
     if refined_src.exists():
         # Save as JPG for consistency
-        img = Image.open(refined_src)
+        img = PILImage.open(refined_src)
         img.save(images_out / "aug_back_0000.jpg", quality=95)
         
     # 4. Update Model (Simplified: we generate a new poses_final.txt for ACE-Zero compat)
@@ -456,8 +456,14 @@ class GeNVSLite:
         self.device = device
         # model_channels=64 matches the trained checkpoint architecture
         self.pipeline = GeNVSPipeline(device=device, model_channels=64)
-        if checkpoint_path and Path(checkpoint_path).exists():
-             self.pipeline.load_checkpoint(checkpoint_path)
+        if not (checkpoint_path and Path(checkpoint_path).exists()):
+            # Without weights the diffusion model samples pure noise, which then gets
+            # injected as "novel views" and corrupts training
+            raise FileNotFoundError(
+                f"GeNVS-Lite needs a trained checkpoint (got {checkpoint_path!r}). "
+                "Use --difix for pretrained pseudo-view refinement instead."
+            )
+        self.pipeline.load_checkpoint(checkpoint_path)
              
     def generate_augmented_view(self, source_img, source_pose, source_K, target_pose):
         with torch.no_grad():

@@ -289,6 +289,7 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
     init_ply_path: Optional[str] = None,
+    max_init_pts: Optional[int] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -312,13 +313,22 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or external")
 
+    # MCMC never removes Gaussians, so an initial cloud above cap_max would stay above it
+    # (dense depth-unprojected clouds easily exceed 1M points and OOM small GPUs)
+    if max_init_pts is not None and points.shape[0] > max_init_pts:
+        print(f"Subsampling initial points {points.shape[0]} -> {max_init_pts} (strategy cap)")
+        indices = torch.randperm(points.shape[0])[:max_init_pts]
+        points = points[indices]
+        rgbs = rgbs[indices]
+
     # Initialize the GS size to be the average dist of the nearest neighbors
     # Use min(4, num_points-1) to handle small datasets
     k_neighbors = min(4, points.shape[0] - 1)
     if k_neighbors < 1:
         k_neighbors = 1
     dist2_avg = (knn(points, k_neighbors)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
+    # Duplicate points (common in ACE-Zero clouds) give zero distance -> log(0) = -inf
+    dist_avg = torch.sqrt(dist2_avg).clamp_min(1e-7)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
@@ -488,6 +498,7 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
             init_ply_path=cfg.init_ply_path,
+            max_init_pts=cfg.strategy.cap_max if isinstance(cfg.strategy, MCMCStrategy) else None,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -1263,7 +1274,8 @@ class Runner:
             ssimloss = torch.nan_to_num(ssimloss, nan=0.0, posinf=0.0, neginf=0.0)
             
             # RGB branch always exists in the graph, but weight can be 0.0
-            loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda) * rgb_weight
+            # Auxiliary terms (depth, tv, bg) accumulate here; the RGB term is added below
+            loss = torch.zeros((), device=device)
                 
             # Depth branch
             if (cfg.depth_loss or is_depth_only) and points is not None:
@@ -1381,7 +1393,9 @@ class Runner:
                  self.eliminate_floaters(verbose=True)
 
 
-            loss = (1.0 - cfg.ssim_lambda) * l1loss + cfg.ssim_lambda * ssimloss
+            # Per-image weight (ACE-Zero pose confidence / pseudo-view trust), default 1.0
+            view_weight = data["loss_weight"].float().mean().to(device) if "loss_weight" in data else 1.0
+            loss = loss + ((1.0 - cfg.ssim_lambda) * l1loss + cfg.ssim_lambda * ssimloss) * rgb_weight * view_weight
             
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -1622,8 +1636,13 @@ class Runner:
             for name, param in self.splats.items():
                 if torch.isnan(param).any() or torch.isinf(param).any():
                     num_bad = (torch.isnan(param) | torch.isinf(param)).sum().item()
-                    print(f"[NaN REPAIR] Step {step}: {name} has {num_bad} NaN/Inf values, replacing with 0")
-                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=1e6, neginf=-1e6)
+                    print(f"[NaN REPAIR] Step {step}: {name} has {num_bad} NaN/Inf values, repairing")
+                    if name in ("scales", "opacities"):
+                        # Neutralize bad Gaussians (tiny + transparent) instead of turning
+                        # them into large unit-scale blobs that show up as floaters
+                        param.data = torch.nan_to_num(param.data, nan=-10.0, posinf=-10.0, neginf=-10.0)
+                    else:
+                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=1e6, neginf=-1e6)
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):

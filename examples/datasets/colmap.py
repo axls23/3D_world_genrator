@@ -431,26 +431,36 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        # Optional per-image loss weights (e.g. from ACE-Zero pose confidence), written by
+        # hypersplat/beta/difix/augment.py as {image_name: weight}
+        weights_path = Path(self.parser.data_dir) / "image_weights.json"
+        self.image_weights = json.loads(weights_path.read_text()) if weights_path.exists() else {}
+        self.indices = self._split_indices()
+
+    def _split_indices(self) -> np.ndarray:
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
-        else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+        # Diffusion pseudo-views are supervision only: never evaluate on them
+        is_pseudo = np.array([Path(n).name.startswith("pseudo_") for n in self.parser.image_names], dtype=bool)
+        if self.split == "train":
+            return indices[(indices % self.parser.test_every != 0) | is_pseudo]
+        return indices[(indices % self.parser.test_every == 0) & ~is_pseudo]
 
     def rebuild_indices(self) -> int:
         """Rebuild indices after parser refresh. Returns number of new training images."""
         old_count = len(self.indices)
-        indices = np.arange(len(self.parser.image_names))
-        if self.split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
-        else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+        self.indices = self._split_indices()
         return len(self.indices) - old_count
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
+        data = self._get_item(item)
+        name = Path(self.parser.image_names[self.indices[item]]).name
+        data["loss_weight"] = float(self.image_weights.get(name, 1.0))
+        return data
+
+    def _get_item(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         
         # [GeNVS] Check for In-Memory Data first

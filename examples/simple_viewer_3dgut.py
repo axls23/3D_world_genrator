@@ -137,14 +137,13 @@ def main(local_rank: int, world_rank, world_size: int, args):
         viewmat = c2w.inverse()
 
         if args.backend == "gsplat":
-            try:
-                rasterization_fn = rasterization
-                # Check if backend is actually loaded
-                from gsplat import csrc
-            except ImportError:
-                print("[Viewer Error] 'gsplat' C++ extension is missing!")
-                print("[Viewer Error] Please install Visual Studio Build Tools (C++) and reinstall gsplat.")
-                print("[Viewer Error] Command: pip install -e .")
+            rasterization_fn = rasterization
+            # Check if the CUDA backend (prebuilt or JIT-compiled) is actually loaded
+            from gsplat.cuda._backend import _C
+
+            if _C is None:
+                print("[Viewer Error] 'gsplat' CUDA extension failed to load/compile!")
+                print("[Viewer Error] Check CUDA toolkit / compiler, then: pip install -e .")
                 print("Returning empty image to prevent crash.")
                 return np.zeros((height, width, 3), dtype=np.uint8)
 

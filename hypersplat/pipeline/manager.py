@@ -18,6 +18,7 @@ import shutil
 import numpy as np
 import cv2
 import torch
+import yaml
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -81,6 +82,7 @@ class PipelineConfig:
         
         # Quality/Tuning
         self.INIT_SCALE = args.init_scale
+        self.CAP_MAX = getattr(args, 'cap_max', None)  # MCMC Gaussian cap (None = trainer default 1M)
         self.OPACITY_REG = args.opacity_reg
         self.SCALE_REG = args.scale_reg
         self.USE_APP_OPT = args.app_opt
@@ -135,12 +137,27 @@ class PipelineConfig:
         self.GENVS_NUM_VIEWS = getattr(args, 'genvs_views', 20)  # Number of novel views
         self.GENVS_CKPT = getattr(args, 'genvs_ckpt', None)
 
+        # Generative backend for the GeNVS slots:
+        #   "difix" - pretrained nvidia/difix_ref (Difix3D+) repairs 3DGS renders at pseudo
+        #             poses (non-commercial license). Needs a trained 3DGS, so it only runs
+        #             in the feedback loop, not in the pre-training step 1.5 slot.
+        #   "core"  - the in-repo GeNVS diffusion model; requires a trained --genvs_ckpt.
+        self.GENVS_BACKEND = getattr(args, 'genvs_backend', 'difix')
+        self.DIFIX_NUM_VIEWS = getattr(args, 'difix_views', 24)
+        self.DIFIX_MAX_ANGLE = getattr(args, 'difix_max_angle', 20.0)
+        self.DIFIX_PSEUDO_WEIGHT = getattr(args, 'difix_pseudo_weight', 0.5)
+
         # JOGS-style Joint Pose-3DGS Optimization (default ON)
         self.POSE_OPT = getattr(args, 'pose_opt', True)
         self.POSE_OPT_WARMUP = getattr(args, 'pose_opt_warmup', 1000)  # Steps before pose opt starts
 
-        # [Autoregressive GeNVS] The "Dream" Loop
+        # [Autoregressive GeNVS] The "Dream" Loop (3DGS <-> generative feedback loop)
         self.GENVS_AUTOREGRESSIVE = getattr(args, 'genvs_autoregressive', False)
+        self.REFINE_LOOPS = getattr(args, 'refine_loops', 3)
+        if getattr(args, 'difix', False):
+            # --difix is shorthand for the feedback loop with the Difix backend
+            self.GENVS_AUTOREGRESSIVE = True
+            self.GENVS_BACKEND = 'difix'
 
         # [ROBUSTNESS] Flag Validation
         if self.WITH_UT and self.POSE_OPT:
@@ -303,9 +320,17 @@ class IntelligentPipeline:
                 else:
                     ace_output = self._run_pose_estimation(video_path)
             
+            # Real-image dataset; feedback-loop pseudo views are always regenerated from it
+            self._base_colmap_dir = ace_output
+
             # 1.5. GeNVS Novel View Generation (optional)
             if self.config.GENVS_ENABLED:
-                ace_output = self._run_novel_view_generation(ace_output)
+                if self.config.GENVS_BACKEND == 'difix':
+                    logger.info("Step 1.5 skipped: the Difix backend needs a trained 3DGS to render "
+                                "from, so it runs in the feedback loop instead (enabling it).")
+                    self.config.GENVS_AUTOREGRESSIVE = True
+                else:
+                    ace_output = self._run_novel_view_generation(ace_output)
             
             # 2. Training
             result_dir = self._run_training(ace_output)
@@ -542,9 +567,37 @@ class IntelligentPipeline:
                     use_core_genvs = False
 
             if not use_core_genvs:
-                # Initialize GeNVS-Lite (uses ZoeDepth by default)
-                genvs = GeNVSLite(use_zoedepth=True)
-                
+                # NOTE: despite its name and the `use_zoedepth` flag, GeNVSLite does not
+                # implement any depth-based warping fallback - it runs the same untrained
+                # GeNVSPipeline diffusion model as the "Core" path above. Without a real
+                # trained checkpoint, sampling from randomly-initialized weights produces
+                # pure noise, which would silently corrupt the training set if injected.
+                # Guard against that explicitly, mirroring the Core path's own checkpoint
+                # check above, instead of generating garbage views.
+                ckpt_path = None
+                if self.config.GENVS_CKPT and Path(self.config.GENVS_CKPT).exists():
+                    ckpt_path = self.config.GENVS_CKPT
+                else:
+                    ckpt_dir = Path("results/genvs_train/checkpoints")
+                    if ckpt_dir.exists():
+                        ckpts = sorted(ckpt_dir.glob("step_*.pt"),
+                                      key=lambda p: int(p.stem.split("_")[1]))
+                        if ckpts:
+                            ckpt_path = str(ckpts[-1])
+
+                if not ckpt_path:
+                    logger.warning(
+                        "  [GeNVS-Lite] No trained GeNVS checkpoint found (checked "
+                        "--genvs_ckpt and results/genvs_train/checkpoints/). GeNVS-Lite has "
+                        "no depth-based fallback implemented - it would sample from an "
+                        "untrained diffusion model, producing noise. Skipping novel-view "
+                        "augmentation rather than injecting garbage views. Train a checkpoint "
+                        "first via hypersplat/beta/genvs/train.py, or pass --genvs_ckpt <path>."
+                    )
+                    return colmap_dir
+
+                genvs = GeNVSLite(checkpoint_path=ckpt_path, use_zoedepth=True)
+
                 image_files = sorted(input_images_dir.glob("*.jpg")) + sorted(input_images_dir.glob("*.png"))
                 if not image_files:
                     logger.warning("  No images found, skipping GeNVS")
@@ -596,11 +649,55 @@ class IntelligentPipeline:
             del novel_views
             self._clear_gpu_memory()
 
-    def _run_training(self, data_dir: Path, resume_ckpt: Optional[Path] = None) -> Path:
+    def _perform_difix_refinement(self, data_dir: Path, result_dir: Path, iter_dir: Path,
+                                  overrides: Dict, loop_idx: int) -> Path:
+        """Difix backend for the feedback-loop GeNVS slot.
+
+        Renders pseudo views from the current 3DGS, repairs them with nvidia/difix_ref
+        (conditioned on the nearest real frame) and returns an augmented dataset of the real
+        images plus the pseudo views, weighted by ACE-Zero pose confidence. The orbit angle
+        grows with each loop (Difix3D+ progressive updates).
+
+        Governor overrides: `genvs_sample_mode: random` draws new pseudo-camera placements
+        each loop; `deterministic` keeps them fixed. Guidance/scheduler/noise-level are
+        multi-step sampler knobs with no meaning for single-step Difix and are ignored.
+        """
+        from argparse import Namespace
+        from hypersplat.beta.difix.augment import run as difix_augment
+
+        ckpts = sorted((result_dir / "ckpts").glob("ckpt_*_rank0.pt"),
+                       key=lambda p: int(p.stem.split("_")[1]))
+        if not ckpts:
+            logger.warning(f"  [Difix] No checkpoint in {result_dir}/ckpts; skipping this loop")
+            return data_dir
+
+        ignored = [k for k in ("genvs_guidance", "genvs_scheduler", "genvs_noise_level") if k in overrides]
+        if ignored:
+            logger.info(f"  [Difix] Ignoring multi-step sampler overrides {ignored} (single-step model)")
+        seed = loop_idx + 1 if overrides.get("genvs_sample_mode") == "random" else 0
+
+        base_dir = getattr(self, "_base_colmap_dir", data_dir)
+        max_angle = self.config.DIFIX_MAX_ANGLE * (loop_idx + 1) / max(self.config.REFINE_LOOPS, 1)
+        out_dir = iter_dir / "augmented_colmap"
+        logger.info(f"  [Difix] Loop {loop_idx + 1}: {self.config.DIFIX_NUM_VIEWS} pseudo views up to "
+                    f"{max_angle:.1f} deg from {ckpts[-1].name} (seed {seed})")
+        difix_augment(Namespace(
+            data_dir=str(base_dir), ckpt=str(ckpts[-1]), out_dir=str(out_dir),
+            num_views=self.config.DIFIX_NUM_VIEWS, max_angle=max_angle,
+            pseudo_weight=self.config.DIFIX_PSEUDO_WEIGHT,
+            min_conf=float(self.config.MIN_REGISTRATION_CONFIDENCE), weight_floor=0.2,
+            test_every=8, model_id="nvidia/difix_ref", no_difix=False, pose_rel_scale=0.1,
+            ckpt_data_dir=str(data_dir), seed=seed,
+        ))
+        torch.cuda.empty_cache()
+        return out_dir
+
+    def _run_training(self, data_dir: Path, resume_ckpt: Optional[Path] = None,
+                      result_name: str = "acezero_3dgs") -> Path:
         """Step 2: MCMC 3DGS Training"""
         logger.info("\nSTEP 2: TRAINING (3DGS MCMC)")
         
-        result_dir = self.config.OUTPUT_BASE / "results" / "acezero_3dgs"
+        result_dir = self.config.OUTPUT_BASE / "results" / result_name
         trainer_script = Path(__file__).resolve().parent.parent.parent / "examples" / "simple_trainer.py"
         
         if not trainer_script.exists():
@@ -635,6 +732,8 @@ class IntelligentPipeline:
             cmd.append("--eval_steps")
             cmd.extend([str(s) for s in self.config.TRAINING_EVAL_STEPS])
 
+        if self.config.CAP_MAX:
+            cmd.extend(["--strategy.cap-max", str(self.config.CAP_MAX)])
         if self.config.RANDOM_BKGD: cmd.append("--random_bkgd")
         if self.config.USE_APP_OPT: cmd.append("--app_opt")
         if self.config.WITH_UT: cmd.append("--with_ut")
@@ -691,7 +790,7 @@ class IntelligentPipeline:
         from hypersplat.beta.genvs.run_completion import GeNVSLite, read_model, mirror_camera_pose, compute_scene_center, qvec2rotmat
         
         # [Governor Loop]
-        max_loops = 3
+        max_loops = self.config.REFINE_LOOPS
         current_data_dir = ace_output
         current_result_dir = initial_result_dir
         
@@ -719,7 +818,8 @@ class IntelligentPipeline:
                 current_data_dir, 
                 current_result_dir, 
                 iter_dir,
-                overrides # Pass governor config to GeNVS?
+                overrides, # Pass governor config to GeNVS?
+                loop_idx=i,
             )
             
             # 3. Re-Train with Governor's Overrides
@@ -731,7 +831,8 @@ class IntelligentPipeline:
             self.config = self._patch_config(original_config, overrides)
             
             try:
-                current_result_dir = self._run_training(augmented_dir)
+                # Separate result dir per iteration so earlier rounds stay comparable
+                current_result_dir = self._run_training(augmented_dir, result_name=f"refine_iter{i + 1}")
                 current_data_dir = augmented_dir
             finally:
                 self.config = original_config
@@ -792,7 +893,8 @@ class IntelligentPipeline:
                 setattr(new_config, key, v)
         return new_config
 
-    def _perform_genvs_refinement(self, ace_output, initial_result_dir, iter_dir, overrides) -> Path:
+    def _perform_genvs_refinement(self, ace_output, initial_result_dir, iter_dir, overrides,
+                                  loop_idx: int = 0) -> Path:
         import torch
         import cv2
         import numpy as np
@@ -800,6 +902,10 @@ class IntelligentPipeline:
         if overrides.get("skip_genvs", False):
              logger.info("  Skipping GeNVS refinement as requested (Wait/Fine-tune mode).")
              return ace_output
+
+        if self.config.GENVS_BACKEND == 'difix':
+            return self._perform_difix_refinement(ace_output, initial_result_dir, iter_dir,
+                                                  overrides, loop_idx)
 
         try:
              from hypersplat.beta.genvs.run_completion import (
@@ -874,17 +980,62 @@ class IntelligentPipeline:
         rendered_img_path = initial_result_dir / "renders" / "custom_render.png"
         
         # 3. GeNVS Refinement
+        # NOTE: GeNVSLite has no depth-based warping fallback - it runs the same untrained
+        # GeNVSPipeline diffusion model as the "Core" path, and without a real trained
+        # checkpoint this produces pure noise (see the analogous guard in
+        # _run_novel_view_generation). Rather than let that noise overwrite the perfectly
+        # valid `rendered_img_path` draft we just rendered directly from the trained 3DGS
+        # model above, skip the "refinement" step and inject that real draft render as-is
+        # when no checkpoint is available.
+        ckpt_path = None
+        if self.config.GENVS_CKPT and Path(self.config.GENVS_CKPT).exists():
+            ckpt_path = self.config.GENVS_CKPT
+        else:
+            ckpt_dir = Path("results/genvs_train/checkpoints")
+            if ckpt_dir.exists():
+                ckpts_found = sorted(ckpt_dir.glob("step_*.pt"),
+                                     key=lambda p: int(p.stem.split("_")[1]))
+                if ckpts_found:
+                    ckpt_path = str(ckpts_found[-1])
+
+        if not ckpt_path:
+            logger.warning(
+                "  [GeNVS-Lite] No trained GeNVS checkpoint found - skipping diffusion "
+                "refinement (it would only produce noise) and injecting the rendered 3DGS "
+                "draft view as-is instead."
+            )
+            refined_path = iter_dir / "refined_back_0000.png"
+            shutil.copy2(rendered_img_path, refined_path)
+
+            logger.info("  Injecting refined view...")
+            temp_novel_dir = iter_dir / "novel_temp"
+            temp_novel_dir.mkdir(exist_ok=True)
+            shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
+
+            augmented_dir = inject_autoregressive_back_views(
+                ace_output=ace_output,
+                initial_result_dir=initial_result_dir,
+                iter_dir=iter_dir,
+                overrides=overrides
+            )
+            if self.config.DATA_FACTOR > 1:
+                from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
+                ACEZeroPoseEstimator(output_dir=augmented_dir).create_downsampled_images(
+                    factors=[self.config.DATA_FACTOR]
+                )
+            return augmented_dir
+
         logger.info("  Refining sample with GeNVS...")
-        
+
         genvs = None
         src_img_t = None
         src_pose_t = None
         novel_view_np = None
-        
+
         try:
             # Use the already imported GeNVSLite
-            genvs = GeNVSLite() # No use_zoedepth in our current implementation
-            
+            genvs = GeNVSLite(checkpoint_path=ckpt_path)
+
             front_img_bgr = cv2.imread(str(ace_output / "images" / ref_image.name))
             front_img = cv2.cvtColor(front_img_bgr, cv2.COLOR_BGR2RGB)
             
@@ -927,19 +1078,34 @@ class IntelligentPipeline:
             
             # 4. Inject into Dataset
             logger.info("  Injecting refined view...")
-            augmented_dir = self.config.OUTPUT_BASE / f"acezero_output_autoregressive_{iter_dir.name}"
-            
+
             temp_novel_dir = iter_dir / "novel_temp"
             temp_novel_dir.mkdir(exist_ok=True)
             shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
-            
-            # Use the already imported inject_autoregressive_back_views
-            inject_autoregressive_back_views(
+
+            # Use the already imported inject_autoregressive_back_views.
+            # Its return value is the actual augmented dataset directory it created
+            # (named `acezero_output_aug_{iter_dir.name}`) - use it directly rather than
+            # independently recomputing a path, which previously drifted out of sync
+            # (guessed `acezero_output_autoregressive_{iter_dir.name}`, which was never created).
+            augmented_dir = inject_autoregressive_back_views(
                 ace_output=ace_output,
                 initial_result_dir=initial_result_dir,
                 iter_dir=iter_dir,
                 overrides=overrides
             )
+
+            # inject_autoregressive_back_views only writes full-resolution images/, but
+            # _run_training's --data_factor (when >1) requires a pre-existing images_{factor}
+            # dir to exist (examples/datasets/colmap.py's Parser checks for it before it will
+            # generate the resized variant) - without this, retraining on the augmented
+            # dataset fails with "Image folder .../images_2 does not exist."
+            if self.config.DATA_FACTOR > 1:
+                from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
+                ACEZeroPoseEstimator(output_dir=augmented_dir).create_downsampled_images(
+                    factors=[self.config.DATA_FACTOR]
+                )
+
             return augmented_dir
         finally:
             logger.info("Cleaning up GeNVS model resources in autoregressive loop...")
@@ -1055,6 +1221,8 @@ def main():
     
     # Tuning
     parser.add_argument("--init_scale", type=float, default=2.5)
+    parser.add_argument("--cap-max", dest="cap_max", type=int, default=None,
+                        help="Max Gaussians for MCMC (trainer default 1M; ~300k suits short captures)")
     parser.add_argument("--opacity_reg", type=float, default=0.05)
     parser.add_argument("--scale_reg", type=float, default=0.05)
     parser.add_argument("--app_opt", action="store_true")
@@ -1079,8 +1247,11 @@ def main():
                         help="Interval to check for new poses in streaming mode (default: 1000)")
 
     # Floater Pruning
-    parser.add_argument("--prune", action="store_true", default=True,
-                        help="Run floater pruning post-processing (default: True)")
+    # Off by default: the context-aware heuristic costs ~2 dB held-out PSNR on the drone
+    # scene (removes visible and saturated-colour Gaussians) and strips the periphery that
+    # Difix pseudo views fill in. It was also silently skipped before plyfile was installed.
+    parser.add_argument("--prune", action="store_true", default=False,
+                        help="Run heuristic floater pruning on the exported PLY (default: off)")
     parser.add_argument("--no-prune", dest="prune", action="store_false",
                         help="Disable floater pruning")
     parser.add_argument("--prune-model", dest="prune_model", type=str, default=None,
@@ -1091,6 +1262,15 @@ def main():
                         help="Enable GeNVS-Lite to generate synthetic novel views for data augmentation")
     parser.add_argument("--genvs-views", dest="genvs_views", type=int, default=20,
                         help="Number of novel views to generate (default: 20)")
+    parser.add_argument("--genvs-backend", dest="genvs_backend", choices=["difix", "core"], default="difix",
+                        help="Generative model for the GeNVS slots: pretrained Difix (default) or in-repo GeNVS core")
+    parser.add_argument("--difix", action="store_true",
+                        help="Shorthand for --genvs-autoregressive --genvs-backend difix")
+    parser.add_argument("--refine-loops", "--difix-rounds", dest="refine_loops", type=int, default=3,
+                        help="Iterations of the 3DGS <-> GeNVS feedback loop")
+    parser.add_argument("--difix-views", dest="difix_views", type=int, default=24)
+    parser.add_argument("--difix-max-angle", dest="difix_max_angle", type=float, default=20.0)
+    parser.add_argument("--difix-pseudo-weight", dest="difix_pseudo_weight", type=float, default=0.5)
     parser.add_argument("--genvs_ckpt", type=str, default=None, help="Path to GeNVS checkpoint for Autoregressive Injection")
     parser.add_argument("--genvs_interval", type=int, default=1000, help="Interval for GeNVS injection (default: 1000)")
     parser.add_argument("--skip-ace", action="store_true", help="Skip ACE-Zero pose estimation (use existing)")
