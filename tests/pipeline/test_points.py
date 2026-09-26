@@ -47,6 +47,9 @@ def test_target_clamped():
     assert points.target_points(tiny).value == points.MIN_POINTS
     assert points.target_points(huge).value == points.MAX_POINTS
     assert points.target_points(total_only).value == 300000
+    # a zero free-memory reading must not fall back to total memory (the OOM case)
+    full = SceneProfile(data={"gpu": {"free_mb": 0, "total_mb": 24000}})
+    assert points.target_points(full).value == points.MIN_POINTS
 
 
 def test_density_cap_for_few_small_frames(drone_profile):

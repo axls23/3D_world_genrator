@@ -32,8 +32,9 @@ def target_points(profile) -> Optional[Decision]:
         return None
     free_mb = profile.get("gpu.free_mb")
     total_mb = profile.get("gpu.total_mb")
-    mem_mb, which = (free_mb, "free") if free_mb else (total_mb, "total")
-    if not mem_mb or mem_mb <= 0:
+    # 0 MB free is a real (bad) reading -> MIN_POINTS, not "unknown" -> total memory
+    mem_mb, which = (free_mb, "free") if free_mb is not None else (total_mb, "total")
+    if mem_mb is None:
         return None
     target = int(min(MAX_POINTS, max(MIN_POINTS, mem_mb * POINTS_PER_FREE_MB)))
     return Decision(target, "point-budget", f"{mem_mb:.0f} MB GPU {which}")
