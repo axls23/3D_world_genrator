@@ -110,9 +110,13 @@ def test_wrapper_ace_zero_explicit(manager):
 
 
 def test_wrapper_simple_minimal_and_explicit(manager):
+    # simple_trainer has no auto strategy: unset values use the wrapper fallback,
+    # not the trainer's own 30k-step / data_factor-4 defaults.
     cmd = manager.build_simple_command("/data")
-    for flag in ("--max_steps", "--data_factor", "--eval_steps", "--save_steps"):
-        assert flag not in cmd
+    assert _flag_value(cmd, "--max_steps") == "7000"
+    assert _flag_value(cmd, "--data_factor") == "2"
+    assert _flag_value(cmd, "--eval_steps") == "7000"
+    assert _flag_value(cmd, "--save_steps") == "7000"
     manager.training_config["max_steps"] = 300
     cmd = manager.build_simple_command("/data")
     assert _flag_value(cmd, "--max_steps") == "300"
@@ -173,12 +177,28 @@ def test_regex_early_stop_counts_trainer_steps_not_lines(manager):
     manager.regex_early_stop = True
     manager.training_config.update({"loss_patience": 100, "min_steps": 0})
     manager.process = _FakeProc()
+    (manager.output_dir / "results" / "ckpts").mkdir(parents=True)
+    (manager.output_dir / "results" / "ckpts" / "ckpt_99.pt").write_text("x")
     # Many tqdm refreshes of the same few steps must not trip patience.
     for _ in range(500):
         manager._check_early_stopping("loss=0.500| : 1%| | 10/7000 [00:01<1:00, 9it/s]")
     assert not manager.process.terminated
     manager._check_early_stopping("loss=0.500| : 2%| | 111/7000 [00:02<1:00, 9it/s]")
     assert manager.process.terminated and manager.early_stopped
+
+
+def test_regex_early_stop_waits_for_saved_output(manager):
+    manager.regex_early_stop = True
+    manager.training_config.update({"loss_patience": 100, "min_steps": 0})
+    manager.process = _FakeProc()
+    for step in range(0, 5000, 100):
+        manager._check_early_stopping(f"loss=0.500| : | {step}/7000 [00:01<1:00, 9it/s]")
+    assert not manager.process.terminated
+
+
+def test_prune_flag_both_ways():
+    assert build_pipeline_args({"prune": True}) == ["--prune"]
+    assert build_pipeline_args({"prune": False}) == ["--no-prune"]
 
 
 def test_regex_early_stop_inactive_by_default(manager):

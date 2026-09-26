@@ -125,8 +125,8 @@ def build_pipeline_args(config: Dict[str, Any]) -> List[str]:
             args.extend(["--genvs-views", str(config["genvs_views"])])
 
     # Pruning control (manager default: prune off unless asked)
-    if config.get("prune") is not None and not config["prune"]:
-        args.append("--no-prune")
+    if config.get("prune") is not None:
+        args.append("--prune" if config["prune"] else "--no-prune")
 
     if config.get("unified_stream") or config.get("streaming"):
         args.append("--streaming")
@@ -349,15 +349,21 @@ class TrainingManager:
         except OSError:
             return False
 
+    # Level 1 calls simple_trainer.py directly, which has no dynamic
+    # strategies (its own defaults are 30k steps at data_factor 4), so unset
+    # values fall back to these instead of being left "auto".
+    SIMPLE_MODE_FALLBACK = {"max_steps": 7000, "data_factor": 2}
+
     def build_simple_command(self, data_dir: str) -> List[str]:
         """Pure: the Level 1 simple_trainer command for the current training_config.
 
-        Unset max_steps/data_factor/eval_steps/save_steps are left to the
-        trainer's own defaults.
+        Unset max_steps/data_factor use SIMPLE_MODE_FALLBACK; unset
+        eval_steps/save_steps are derived from the effective max_steps.
         """
         trainer_script = self.root_dir / "examples" / "simple_trainer.py"
         result_dir = self.output_dir / "results"
-        config = self.training_config
+        config = {**self.SIMPLE_MODE_FALLBACK,
+                  **{k: v for k, v in self.training_config.items() if v is not None}}
         cmd = [
             sys.executable, "-u", str(trainer_script),
             "mcmc",
@@ -519,13 +525,22 @@ class TrainingManager:
             self.process.stdout.close()
             return_code = self.process.wait()
             
-            if return_code == 0 or self.early_stopped:
+            if self.early_stopped and return_code != 0 and not self._has_saved_output():
+                self.status = "error"
+                self.logs.append("[EARLY STOP] Trainer was stopped before saving any checkpoint/PLY.")
+            elif return_code == 0 or self.early_stopped:
                 self.status = "training_complete"
                 self.progress = 100
                 self.logs.append("Training completed successfully.")
             else:
                 self.status = "error"
                 self.logs.append(f"Process failed with return code {return_code}")
+
+    def _has_saved_output(self) -> bool:
+        """Whether simple_trainer wrote any checkpoint or PLY into results/."""
+        result_dir = self.output_dir / "results"
+        return any(any((result_dir / sub).glob("*")) for sub in ("ckpts", "ply")
+                   if (result_dir / sub).is_dir())
 
     def _is_repetitive_match(self, last_line: str, new_line: str) -> bool:
         """Check if new line is a progress update of the same type as last line"""
@@ -593,7 +608,10 @@ class TrainingManager:
             self.best_loss_step = step
         self.steps_without_improvement = step - self.best_loss_step
 
-        if step >= min_steps and self.steps_without_improvement >= patience:
+        # Never kill the trainer before it has written a checkpoint/PLY
+        # (simple_trainer only saves at save_steps), or the run is lost.
+        if (step >= min_steps and self.steps_without_improvement >= patience
+                and self._has_saved_output()):
             self.logs.append(f"[EARLY STOP] Loss converged at {loss:.6f} after {step} steps")
             self.logs.append(f"[EARLY STOP] No improvement for {self.steps_without_improvement} steps, stopping...")
             if self.process and self.process.poll() is None:
