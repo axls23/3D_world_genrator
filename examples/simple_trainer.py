@@ -813,7 +813,6 @@ class Runner:
                     "is_depth_only": True  # Flag for training loop
                 }
                 print(f"[GeNVS-Depth] Generated depth for novel pose (shape: {gen_depth.shape})")
-                print(f"[GeNVS-Depth] Generated depth for novel pose (shape: {gen_depth.shape})")
             else:
                 # RGB INJECTION MODE with SDS (Master Tuner)
                 # We need to perform optimization here or just save the view for next iteration

@@ -145,6 +145,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         base_dir = Path(sys.argv[1])
     else:
-        base_dir = Path(r"C:\Users\sxhil_25660\3D_world_genrator\demo\test_run_genvs_gpu_max_seed2089\acezero_output")
-    
+        print("[ERROR] Usage: python recover_colmap_sparse.py <acezero_output_dir>")
+        sys.exit(1)
+
     recover_colmap_sparse(base_dir)
