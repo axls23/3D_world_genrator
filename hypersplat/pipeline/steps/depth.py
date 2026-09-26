@@ -113,15 +113,15 @@ def main():
         choices=["zoedepth", "depth_anything", "midas"],
         help="Depth model: zoedepth (quality), depth_anything (fast), midas (light)"
     )
-    parser.add_argument("--benchmark", action="store_true", help="Benchmark all models")
+    parser.add_argument("--benchmark", action="store_true", help="Benchmark depth estimation latency for --model")
     args = parser.parse_args()
-    
+
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    
+
     if args.benchmark:
-        from depth_estimator import DepthEstimator
+        from hypersplat.pipeline.wrappers.depth import DepthEstimator
         import cv2
-        
+
         # Load first image for benchmark
         images = sorted(args.images_dir.glob("*.jpg"))
         if not images:
@@ -129,7 +129,11 @@ def main():
         if images:
             image = cv2.imread(str(images[0]))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            DepthEstimator.benchmark(image)
+            depth_estimator = DepthEstimator(model=args.model, device="cuda")
+            depth_estimator.benchmark(image)
+            depth_estimator.unload()
+        else:
+            logger.warning(f"No images found in {args.images_dir}, cannot benchmark")
         return
     
     count = precompute_depths(args.images_dir, args.output_dir, args.model)
