@@ -29,9 +29,9 @@ Setting up and activating Visual Studio can be done through these steps:
     ```bash
     conda activate <your_conda_environment>
     ```
-    Replace `<your_conda_environment>` with the name of your conda environment. For example:
+    Replace `<your_conda_environment>` with the name of your conda environment. For example, this project's Windows environment created by `setup_env.bat`:
     ```bash
-    conda activate gsplat
+    conda activate 3dgrut
     ```
 
 3. Activate your Visual C++ environment:

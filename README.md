@@ -28,7 +28,7 @@ The **HyperSplat Interactive Demo** provides a WebSocket-powered web interface. 
 HyperSplat uses a dual-environment strategy to maximize compatibility between Windows hosts and WSL2.
 
 ### 🪄 One-Click Setup (Recommended)
-We provide a unified script that automatically builds both the Windows (`hypersplat`) and WSL (`ace0`) environments.
+We provide a unified script that automatically builds both the Windows (`3dgrut`) and WSL (`ace0`) environments.
 1.  Ensure you have **Conda** installed and **WSL2** enabled.
 2.  Run the setup script from your Windows terminal:
     ```powershell
@@ -44,8 +44,8 @@ If you prefer to configure environments manually:
 #### Step 1: Main Reconstruction Environment (Windows)
 This environment handles the training engine, RAG indexing, and the UI server.
 ```powershell
-conda create -n hypersplat python=3.10 -y
-conda activate hypersplat
+conda create -n 3dgrut python=3.10 -y
+conda activate 3dgrut
 
 # Install PyTorch with CUDA 11.8
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
@@ -77,18 +77,20 @@ The easiest way to start is with the provided Windows launcher:
 ```powershell
 ./demo/run_demo.bat
 ```
-This starts the job queue and launches the web interface at `http://localhost:5000`.
+This starts the job queue and launches the web interface at `http://localhost:8081`.
 
 ### 2. Run the Automated Pipeline
 For advanced users who want fine-grained control via the CLI:
 ```powershell
-python scripts/pipeline/automated_intelligent_pipeline.py --input path/to/video.mp4 --output results/my_scene
+python scripts/pipeline/automated_intelligent_pipeline.py path/to/video.mp4 --output_dir results/my_scene
 ```
 
 ### 3. Key CLI Arguments
 *   `--depth-model {depth_anything, zoedepth}`: Select your depth estimator.
-*   `--iterations 7000`: Set training budget (7k is optimized for HyperSplat).
-*   `--strategy mcmc`: Use Markov Chain Monte Carlo for cleaner reconstruction.
+*   `--max_steps 7000`: Set training budget (7k is optimized for HyperSplat).
+*   `--data_factor 2`: Downsample factor for input images (1=full res, 2=half).
+
+Note: the training strategy (e.g. MCMC) is a hardcoded internal default, not a user-facing CLI flag.
 
 ---
 

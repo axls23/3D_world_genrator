@@ -9,10 +9,12 @@ Trained DQN agent identifies and removes noisy Gaussians that appear as floaters
 ## Usage
 
 ```bash
-python scripts/pipeline/dqn_floater_pruner.py \
-    --ply_path results/final.ply \
-    --output_path results/pruned.ply
+python scripts/post/dqn_pruner/prune.py \
+    -i results/final.ply \
+    -o results/pruned.ply
 ```
+
+`-i/--input` and `-o/--output` are required. Optional flags: `-m/--model` (path to a trained DQN `.pt` file, defaults to the bundled `pretrained_pruner.pt`) and `--context-aware`/`--basic` (context-aware scoring is on by default).
 
 ## Results
 

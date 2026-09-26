@@ -20,7 +20,9 @@ python scripts/pipeline/automated_intelligent_pipeline.py video.mp4 --genvs --ge
 |-------|------|-------------|
 | **L2** | `ace_zero` | ACE-Zero → 3DGS MCMC (default, recommended) |
 | L1 | `simple` | Direct training on pre-processed data |
-| L3 | `chunked` | Legacy COLMAP-based chunked pipeline |
+| L3 | `chunked` | COLMAP-based chunked pipeline — support level may be limited, see note below |
+
+> **Note on Level 3 (chunked):** `hypersplat/pipeline/wrapper.py`'s `_run_chunked_pipeline` invokes `automated_intelligent_pipeline.py` with `--use_colmap` and `--min_chunk_duration` flags. Depending on which fixes have landed on your checkout, `manager.py`'s CLI may or may not currently accept these flags — treat chunked mode as experimental/may be limited until you've confirmed `--use_colmap`/`--min_chunk_duration` are recognized by `python scripts/pipeline/automated_intelligent_pipeline.py --help` on your branch.
 
 ---
 
@@ -38,7 +40,7 @@ Video → Frame Extraction → ACE-Zero Pose Estimation → [GeNVS] → 3DGS MCM
 | `--fps` | 1.5 | Frame extraction rate |
 | `--max_steps` | 7000 | Training iterations |
 | `--data_factor` | 2 | Image downsampling (1=full, 2=half) |
-| `--with_ut` | enabled | Enable 3DGUT features |
+| `--with_ut` | disabled | Enable 3DGUT (Unscented Transform) features. This is an `action="store_true"` flag, so it is off unless passed. It is also force-disabled automatically when `--pose-opt` is active (the default), since UT + joint pose optimization are currently incompatible in gsplat — see `hypersplat/pipeline/manager.py`. |
 | `--genvs` | disabled | Enable novel view synthesis |
 | `--genvs-views` | 20 | Number of synthetic views |
 
@@ -86,9 +88,9 @@ Augments training data with synthetic back-views using diffusion models.
 Removes floater Gaussians using reinforcement learning.
 
 ```bash
-python scripts/pipeline/dqn_floater_pruner.py \
-    --ply_path output/results/final.ply \
-    --output_path output/results/pruned.ply
+python scripts/post/dqn_pruner/prune.py \
+    -i output/results/final.ply \
+    -o output/results/pruned.ply
 ```
 
 Typical reduction: 15-25% Gaussians removed.
@@ -118,7 +120,7 @@ Web interface for the pipeline:
 
 ```bash
 cd demo && python demo_server.py
-# Open http://localhost:8080
+# Open http://localhost:8081
 ```
 
 API endpoints:
