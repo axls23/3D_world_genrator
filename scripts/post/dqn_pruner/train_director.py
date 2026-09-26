@@ -27,7 +27,7 @@ sys.path.append(str(PROJECT_ROOT))
 sys.path.append(str(PROJECT_ROOT / "examples"))
 
 from scripts.post.dqn_pruner.agent import DQNAgent, QNetwork
-from scripts.post.dqn_pruner.governor import PipelineGovernor
+from scripts.post.dqn_pruner.governor import PipelineGovernor, director_vector
 from scripts.post.dqn_pruner.config import ActionSpace
 from hypersplat.pipeline.manager import IntelligentPipeline, PipelineConfig
 
@@ -347,22 +347,14 @@ class DirectorTrainer:
         return loss.item()
 
     def dict_to_tensor(self, state_dict):
-        """Convert state dictionary to 32-dim tensor with heuristic features."""
-        vec = torch.zeros(32, dtype=torch.float32)
-        
-        # Progress (Normalized)
-        vec[0] = float(self.current_iter) / STEPS_PER_EPISODE
-        
-        # Geometric Metrics
-        vec[8] = state_dict.get("ace_confidence", 1.0) 
-        vec[9] = state_dict.get("gs_psnr", 0.0) / 40.0 
-        vec[12] = state_dict.get("gs_density", 0.0) / 200000.0
-        
-        # Heuristic Triggers (One-hot style)
-        vec[15] = 1.0 if state_dict.get("gs_density", 0) < 10000 else 0.0   # Low density signal
-        vec[16] = 1.0 if state_dict.get("gs_psnr", 0) > 30.0 else 0.0      # High quality signal
-        
-        return vec.unsqueeze(0) # [1, 32]
+        """Convert state dictionary to the 32-dim director input.
+
+        Uses governor.director_vector so training and inference share one set of
+        normalizers (relative PSNR / density, profile-derived ACE confidence); only the
+        progress slot [0] is training-specific.
+        """
+        progress = float(self.current_iter) / STEPS_PER_EPISODE
+        return director_vector(state_dict, progress=progress).unsqueeze(0)  # [1, 32]
 
     def run_environment_step(self, action_idx):
         """
