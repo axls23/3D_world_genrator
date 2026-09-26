@@ -5,6 +5,11 @@ services:
     container_name: gsplat-server
     restart: unless-stopped
     ports:
+      # NOTE: `command:` below overrides the Dockerfile's own uvicorn CMD to
+      # run demo/demo_server.py, which binds HYPERSPLAT_SERVER_PORT (8081)
+      # instead of 8080. This mapping is kept for compatibility with anything
+      # that still expects 8080 (e.g. running without the command override),
+      # but nothing listens on 8080 in the current compose setup.
       - "8080:8080"
       - "8081:8081"
       # Expose visualization port (if needed)
