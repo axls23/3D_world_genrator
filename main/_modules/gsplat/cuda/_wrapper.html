@@ -327,7 +327,7 @@
     <span class="kn">from</span><span class="w"> </span><span class="nn">._backend</span><span class="w"> </span><span class="kn">import</span> <span class="n">_C</span>
 
     <span class="n">obj</span> <span class="o">=</span> <span class="n">_C</span>
-    <span class="k">for</span> <span class="n">name_split</span> <span class="ow">in</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">name_split</span> <span class="ow">in</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">):</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">_C</span><span class="p">,</span> <span class="n">name_split</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">obj</span>
 
@@ -340,7 +340,7 @@
     <span class="n">GLOBAL</span> <span class="o">=</span> <span class="mi">4</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">to_cpp</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ShutterType.</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">"ShutterType.</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
 
 <span class="nd">@dataclass</span>
@@ -356,7 +356,7 @@
     <span class="n">require_all_sigma_points_valid</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">to_cpp</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">&quot;UnscentedTransformParameters&quot;</span><span class="p">)()</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">"UnscentedTransformParameters"</span><span class="p">)()</span>
         <span class="n">p</span><span class="o">.</span><span class="n">alpha</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span>
         <span class="n">p</span><span class="o">.</span><span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">beta</span>
         <span class="n">p</span><span class="o">.</span><span class="n">kappa</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kappa</span>
@@ -371,7 +371,7 @@
     <span class="n">ANGLE_TO_PIXELDIST</span> <span class="o">=</span> <span class="mi">1</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">to_cpp</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;FThetaPolynomialType.</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">"FThetaPolynomialType.</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
 
 <span class="nd">@dataclass</span>
@@ -383,7 +383,7 @@
     <span class="n">linear_cde</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span>  <span class="c1"># [3]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">to_cpp</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">&quot;FThetaCameraDistortionParameters&quot;</span><span class="p">)()</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">"FThetaCameraDistortionParameters"</span><span class="p">)()</span>
         <span class="n">p</span><span class="o">.</span><span class="n">reference_poly</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">reference_poly</span><span class="o">.</span><span class="n">to_cpp</span><span class="p">()</span>
         <span class="n">p</span><span class="o">.</span><span class="n">pixeldist_to_angle_poly</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pixeldist_to_angle_poly</span>
         <span class="n">p</span><span class="o">.</span><span class="n">angle_to_pixeldist_poly</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">angle_to_pixeldist_poly</span>
@@ -393,7 +393,7 @@
 
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_cpp_default</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">&quot;FThetaCameraDistortionParameters&quot;</span><span class="p">)()</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="s2">"FThetaCameraDistortionParameters"</span><span class="p">)()</span>
         <span class="k">return</span> <span class="n">p</span>
 
 
@@ -404,7 +404,7 @@
     <span class="n">covars</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., N, 3, 3]</span>
     <span class="n">viewmats</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., C, 4, 4]</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Transforms Gaussians from world to camera coordinate system.</span>
+<span class="w">    </span><span class="sd">"""Transforms Gaussians from world to camera coordinate system.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        means: Gaussian means. [..., N, 3]</span>
@@ -416,13 +416,13 @@
 
 <span class="sd">        - **Gaussian means in camera coordinate system**. [..., C, N, 3]</span>
 <span class="sd">        - **Gaussian covariances in camera coordinate system**. [..., C, N, 3, 3]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">._torch_impl</span><span class="w"> </span><span class="kn">import</span> <span class="n">_world_to_cam</span>
 
     <span class="n">warnings</span><span class="o">.</span><span class="n">warn</span><span class="p">(</span>
-        <span class="s2">&quot;world_to_cam() is removed from the CUDA backend as it&#39;s relatively easy to &quot;</span>
-        <span class="s2">&quot;implement in PyTorch. Currently use the PyTorch implementation instead. &quot;</span>
-        <span class="s2">&quot;This function will be completely removed in a future release.&quot;</span><span class="p">,</span>
+        <span class="s2">"world_to_cam() is removed from the CUDA backend as it's relatively easy to "</span>
+        <span class="s2">"implement in PyTorch. Currently use the PyTorch implementation instead. "</span>
+        <span class="s2">"This function will be completely removed in a future release."</span><span class="p">,</span>
         <span class="ne">DeprecationWarning</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
@@ -449,7 +449,7 @@
     <span class="n">b2</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
     <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;adam&quot;</span><span class="p">)(</span>
+    <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"adam"</span><span class="p">)(</span>
         <span class="n">param</span><span class="p">,</span> <span class="n">param_grad</span><span class="p">,</span> <span class="n">exp_avg</span><span class="p">,</span> <span class="n">exp_avg_sq</span><span class="p">,</span> <span class="n">valid</span><span class="p">,</span> <span class="n">lr</span><span class="p">,</span> <span class="n">b1</span><span class="p">,</span> <span class="n">b2</span><span class="p">,</span> <span class="n">eps</span>
     <span class="p">)</span>
 
@@ -462,7 +462,7 @@
     <span class="n">coeffs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., K, 3]</span>
     <span class="n">masks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [...,]</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Computes spherical harmonics.</span>
+<span class="w">    </span><span class="sd">"""Computes spherical harmonics.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        degrees_to_use: The degree to be used.</span>
@@ -472,7 +472,7 @@
 
 <span class="sd">    Returns:</span>
 <span class="sd">        Spherical harmonics. [..., 3]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">assert</span> <span class="p">(</span><span class="n">degrees_to_use</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span> <span class="o">&lt;=</span> <span class="n">coeffs</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">coeffs</span><span class="o">.</span><span class="n">shape</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">dirs</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
     <span class="k">assert</span> <span class="n">dirs</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="mi">3</span><span class="p">,),</span> <span class="n">dirs</span><span class="o">.</span><span class="n">shape</span>
@@ -499,7 +499,7 @@
     <span class="n">compute_preci</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="n">triu</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">],</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Converts quaternions and scales to covariance and precision matrices.</span>
+<span class="w">    </span><span class="sd">"""Converts quaternions and scales to covariance and precision matrices.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        quats: Quaternions (No need to be normalized). [..., 4]</span>
@@ -515,7 +515,7 @@
 
 <span class="sd">        - **Covariance matrices**. If `triu` is True the returned shape is [..., 6], otherwise [..., 3, 3].</span>
 <span class="sd">        - **Precision matrices**. If `triu` is True the returned shape is [..., 6], otherwise [..., 3, 3].</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
     <span class="k">assert</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="mi">4</span><span class="p">,),</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">assert</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="mi">3</span><span class="p">,),</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span>
@@ -535,7 +535,7 @@
     <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Perspective projection on Gaussians.</span>
+<span class="w">    </span><span class="sd">"""Perspective projection on Gaussians.</span>
 <span class="sd">    DEPRECATED: please use `proj` with `ortho=False` instead.</span>
 
 <span class="sd">    Args:</span>
@@ -550,10 +550,10 @@
 
 <span class="sd">        - **Projected means**. [..., C, N, 2]</span>
 <span class="sd">        - **Projected covariances**. [..., C, N, 2, 2]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">warnings</span><span class="o">.</span><span class="n">warn</span><span class="p">(</span>
-        <span class="s2">&quot;persp_proj is deprecated and will be removed in a future release. &quot;</span>
-        <span class="s2">&quot;Use proj with ortho=False instead.&quot;</span><span class="p">,</span>
+        <span class="s2">"persp_proj is deprecated and will be removed in a future release. "</span>
+        <span class="s2">"Use proj with ortho=False instead."</span><span class="p">,</span>
         <span class="ne">DeprecationWarning</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">proj</span><span class="p">(</span><span class="n">means</span><span class="p">,</span> <span class="n">covars</span><span class="p">,</span> <span class="n">Ks</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">ortho</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -567,9 +567,9 @@
     <span class="n">Ks</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., C, 3, 3]</span>
     <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projection of Gaussians (perspective or orthographic).</span>
+<span class="w">    </span><span class="sd">"""Projection of Gaussians (perspective or orthographic).</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        means: Gaussian means. [..., C, N, 3]</span>
@@ -583,10 +583,10 @@
 
 <span class="sd">        - **Projected means**. [..., C, N, 2]</span>
 <span class="sd">        - **Projected covariances**. [..., C, N, 2, 2]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">assert</span> <span class="p">(</span>
-        <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">&quot;ftheta&quot;</span>
-    <span class="p">),</span> <span class="s2">&quot;ftheta camera is only supported via UT, please set with_ut=True in the rasterization()&quot;</span>
+        <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">"ftheta"</span>
+    <span class="p">),</span> <span class="s2">"ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"</span>
 
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">3</span><span class="p">]</span>
     <span class="n">C</span><span class="p">,</span> <span class="n">N</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">3</span><span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
@@ -618,10 +618,10 @@
     <span class="n">packed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">sparse_grad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">calc_compensations</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
     <span class="n">opacities</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., N] or None</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D.</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D.</span>
 
 <span class="sd">    This function fuse the process of computing covariances</span>
 <span class="sd">    (:func:`quat_scale_to_covar_preci()`), transforming to camera space (:func:`world_to_cam()`),</span>
@@ -686,7 +686,7 @@
 <span class="sd">        - **depths**. The z-depth of the projected Gaussians. [..., C, N]</span>
 <span class="sd">        - **conics**. Inverse of the projected covariances. Return the flattend upper triangle with [..., C, N, 3]</span>
 <span class="sd">        - **compensations**. The view-dependent opacity compensation factor. [..., C, N]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">N</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">C</span> <span class="o">=</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">3</span><span class="p">]</span>
@@ -698,22 +698,22 @@
         <span class="k">assert</span> <span class="n">covars</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">6</span><span class="p">),</span> <span class="n">covars</span><span class="o">.</span><span class="n">shape</span>
         <span class="n">covars</span> <span class="o">=</span> <span class="n">covars</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="k">else</span><span class="p">:</span>
-        <span class="k">assert</span> <span class="n">quats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;covars or quats is required&quot;</span>
-        <span class="k">assert</span> <span class="n">scales</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;covars or scales is required&quot;</span>
+        <span class="k">assert</span> <span class="n">quats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"covars or quats is required"</span>
+        <span class="k">assert</span> <span class="n">scales</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"covars or scales is required"</span>
         <span class="k">assert</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span>
         <span class="k">assert</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span>
         <span class="n">quats</span> <span class="o">=</span> <span class="n">quats</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="n">scales</span> <span class="o">=</span> <span class="n">scales</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">sparse_grad</span><span class="p">:</span>
-        <span class="k">assert</span> <span class="n">packed</span><span class="p">,</span> <span class="s2">&quot;sparse_grad is only supported when packed is True&quot;</span>
-        <span class="k">assert</span> <span class="n">batch_dims</span> <span class="o">==</span> <span class="p">(),</span> <span class="s2">&quot;sparse_grad does not support batch dimensions&quot;</span>
+        <span class="k">assert</span> <span class="n">packed</span><span class="p">,</span> <span class="s2">"sparse_grad is only supported when packed is True"</span>
+        <span class="k">assert</span> <span class="n">batch_dims</span> <span class="o">==</span> <span class="p">(),</span> <span class="s2">"sparse_grad does not support batch dimensions"</span>
     <span class="k">if</span> <span class="n">opacities</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">opacities</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,),</span> <span class="n">opacities</span><span class="o">.</span><span class="n">shape</span>
         <span class="n">opacities</span> <span class="o">=</span> <span class="n">opacities</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
 
     <span class="k">assert</span> <span class="p">(</span>
-        <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">&quot;ftheta&quot;</span>
-    <span class="p">),</span> <span class="s2">&quot;ftheta camera is only supported via UT, please set with_ut=True in the rasterization()&quot;</span>
+        <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">"ftheta"</span>
+    <span class="p">),</span> <span class="s2">"ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"</span>
 
     <span class="n">viewmats</span> <span class="o">=</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="n">Ks</span> <span class="o">=</span> <span class="n">Ks</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
@@ -774,7 +774,7 @@
     <span class="n">image_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">gaussian_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Maps projected Gaussians to intersecting tiles.</span>
+<span class="w">    </span><span class="sd">"""Maps projected Gaussians to intersecting tiles.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        means2d: Projected Gaussian means. [..., N, 2] if packed is False, [nnz, 2] if packed is True.</span>
@@ -800,15 +800,15 @@
 <span class="sd">          Xc and Xt are the maximum number of bits required to represent the image and</span>
 <span class="sd">          tile ids, respectively. Int64 [n_isects]</span>
 <span class="sd">        - **Flatten ids**. The global flatten indices in [I * N] or [nnz] (packed). [n_isects]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">if</span> <span class="n">packed</span><span class="p">:</span>
         <span class="n">nnz</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">nnz</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span>
         <span class="k">assert</span> <span class="n">radii</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">nnz</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">radii</span><span class="o">.</span><span class="n">shape</span>
         <span class="k">assert</span> <span class="n">depths</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">nnz</span><span class="p">,),</span> <span class="n">depths</span><span class="o">.</span><span class="n">shape</span>
-        <span class="k">assert</span> <span class="n">image_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;image_ids is required if packed is True&quot;</span>
-        <span class="k">assert</span> <span class="n">gaussian_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;gaussian_ids is required if packed is True&quot;</span>
-        <span class="k">assert</span> <span class="n">n_images</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;n_images is required if packed is True&quot;</span>
+        <span class="k">assert</span> <span class="n">image_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"image_ids is required if packed is True"</span>
+        <span class="k">assert</span> <span class="n">gaussian_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"gaussian_ids is required if packed is True"</span>
+        <span class="k">assert</span> <span class="n">n_images</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"n_images is required if packed is True"</span>
         <span class="n">image_ids</span> <span class="o">=</span> <span class="n">image_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="n">gaussian_ids</span> <span class="o">=</span> <span class="n">gaussian_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="n">I</span> <span class="o">=</span> <span class="n">n_images</span>
@@ -821,7 +821,7 @@
         <span class="k">assert</span> <span class="n">radii</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">image_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">radii</span><span class="o">.</span><span class="n">shape</span>
         <span class="k">assert</span> <span class="n">depths</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">image_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,),</span> <span class="n">depths</span><span class="o">.</span><span class="n">shape</span>
 
-    <span class="n">tiles_per_gauss</span><span class="p">,</span> <span class="n">isect_ids</span><span class="p">,</span> <span class="n">flatten_ids</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;intersect_tile&quot;</span><span class="p">)(</span>
+    <span class="n">tiles_per_gauss</span><span class="p">,</span> <span class="n">isect_ids</span><span class="p">,</span> <span class="n">flatten_ids</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"intersect_tile"</span><span class="p">)(</span>
         <span class="n">means2d</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
         <span class="n">radii</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
         <span class="n">depths</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -847,7 +847,7 @@
     <span class="n">tile_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">tile_height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Encodes intersection ids to offsets.</span>
+<span class="w">    </span><span class="sd">"""Encodes intersection ids to offsets.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        isect_ids: Intersection ids. [n_isects]</span>
@@ -857,8 +857,8 @@
 
 <span class="sd">    Returns:</span>
 <span class="sd">        Offsets. [I, tile_height, tile_width]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="k">return</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;intersect_offset&quot;</span><span class="p">)(</span>
+<span class="sd">    """</span>
+    <span class="k">return</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"intersect_offset"</span><span class="p">)(</span>
         <span class="n">isect_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span> <span class="n">n_images</span><span class="p">,</span> <span class="n">tile_width</span><span class="p">,</span> <span class="n">tile_height</span>
     <span class="p">)</span></div>
 
@@ -881,7 +881,7 @@
     <span class="n">packed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">absgrad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterizes Gaussians to pixels.</span>
+<span class="w">    </span><span class="sd">"""Rasterizes Gaussians to pixels.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        means2d: Projected Gaussian means. [..., N, 2] if packed is False, [nnz, 2] if packed is True.</span>
@@ -903,7 +903,7 @@
 
 <span class="sd">        - **Rendered colors**. [..., image_height, image_width, channels]</span>
 <span class="sd">        - **Rendered alphas**. [..., image_height, image_width, 1]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">image_dims</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">channels</span> <span class="o">=</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
@@ -930,7 +930,7 @@
     <span class="c1"># Pad the channels to the nearest supported number if necessary</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="o">&gt;</span> <span class="mi">513</span> <span class="ow">or</span> <span class="n">channels</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="c1"># TODO: maybe worth to support zero channels?</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="mi">1</span><span class="p">,</span>
         <span class="mi">2</span><span class="p">,</span>
@@ -976,10 +976,10 @@
     <span class="n">tile_height</span><span class="p">,</span> <span class="n">tile_width</span> <span class="o">=</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_height</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_height</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">"</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_width</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_width</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">"</span>
 
     <span class="n">render_colors</span><span class="p">,</span> <span class="n">render_alphas</span> <span class="o">=</span> <span class="n">_RasterizeToPixels</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span>
         <span class="n">means2d</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -1017,7 +1017,7 @@
     <span class="n">flatten_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [n_isects]</span>
     <span class="n">backgrounds</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, channels]</span>
     <span class="n">masks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, tile_height, tile_width]</span>
-    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
     <span class="n">ut_params</span><span class="p">:</span> <span class="n">UnscentedTransformParameters</span> <span class="o">=</span> <span class="n">UnscentedTransformParameters</span><span class="p">(),</span>
     <span class="c1"># distortion</span>
     <span class="n">radial_coeffs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, 6] or [..., C, 4]</span>
@@ -1028,7 +1028,7 @@
     <span class="n">rolling_shutter</span><span class="p">:</span> <span class="n">RollingShutterType</span> <span class="o">=</span> <span class="n">RollingShutterType</span><span class="o">.</span><span class="n">GLOBAL</span><span class="p">,</span>
     <span class="n">viewmats_rs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, 4, 4]</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterizes Gaussians to pixels.</span>
+<span class="w">    </span><span class="sd">"""Rasterizes Gaussians to pixels.</span>
 
 <span class="sd">    Similar to `rasterize_to_pixels()`, but compute the Gaussian responses in the</span>
 <span class="sd">    3D world space instead of the 2D image space. Supports rolling shutter and</span>
@@ -1039,7 +1039,7 @@
 
 <span class="sd">        - **Rendered colors**. [..., C, image_height, image_width, channels]</span>
 <span class="sd">        - **Rendered alphas**. [..., C, image_height, image_width, 1]</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">num_batch_dims</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_dims</span><span class="p">)</span>
     <span class="n">N</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
@@ -1055,7 +1055,7 @@
 
     <span class="k">assert</span> <span class="n">colors</span><span class="o">.</span><span class="n">ndim</span> <span class="ow">in</span> <span class="p">(</span><span class="n">num_batch_dims</span> <span class="o">+</span> <span class="mi">2</span><span class="p">,</span> <span class="n">num_batch_dims</span> <span class="o">+</span> <span class="mi">3</span><span class="p">),</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">if</span> <span class="n">colors</span><span class="o">.</span><span class="n">ndim</span> <span class="o">==</span> <span class="n">num_batch_dims</span> <span class="o">+</span> <span class="mi">2</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;packed mode is not supported yet&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"packed mode is not supported yet"</span><span class="p">)</span>
         <span class="k">assert</span> <span class="p">(</span>
             <span class="n">colors</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="ow">and</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="n">channels</span>
         <span class="p">),</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span>
@@ -1093,7 +1093,7 @@
     <span class="n">channels</span> <span class="o">=</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="o">&gt;</span> <span class="mi">513</span> <span class="ow">or</span> <span class="n">channels</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="c1"># TODO: maybe worth to support zero channels?</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="mi">1</span><span class="p">,</span>
         <span class="mi">2</span><span class="p">,</span>
@@ -1139,10 +1139,10 @@
     <span class="n">tile_height</span><span class="p">,</span> <span class="n">tile_width</span> <span class="o">=</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_height</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_height</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">"</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_width</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_width</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">"</span>
 
     <span class="n">render_colors</span><span class="p">,</span> <span class="n">render_alphas</span> <span class="o">=</span> <span class="n">_RasterizeToPixelsEval3D</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span>
         <span class="n">means</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -1192,7 +1192,7 @@
     <span class="n">isect_offsets</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., tile_height, tile_width]</span>
     <span class="n">flatten_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [n_isects]</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterizes a batch of Gaussians to images but only returns the indices.</span>
+<span class="w">    </span><span class="sd">"""Rasterizes a batch of Gaussians to images but only returns the indices.</span>
 
 <span class="sd">    .. note::</span>
 
@@ -1220,7 +1220,7 @@
 <span class="sd">        - **Gaussian ids**. Gaussian ids for the pixel intersection. A flattened list of shape [M].</span>
 <span class="sd">        - **Pixel ids**. pixel indices (row-major). A flattened list of shape [M].</span>
 <span class="sd">        - **Image ids**. image indices. A flattened list of shape [M].</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">image_dims</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">tile_height</span><span class="p">,</span> <span class="n">tile_width</span> <span class="o">=</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
@@ -1238,12 +1238,12 @@
     <span class="p">),</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_height</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_height</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">"</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_width</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_width</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">"</span>
 
-    <span class="n">out_gauss_ids</span><span class="p">,</span> <span class="n">out_indices</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;rasterize_to_indices_3dgs&quot;</span><span class="p">)(</span>
+    <span class="n">out_gauss_ids</span><span class="p">,</span> <span class="n">out_indices</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"rasterize_to_indices_3dgs"</span><span class="p">)(</span>
         <span class="n">range_start</span><span class="p">,</span>
         <span class="n">range_end</span><span class="p">,</span>
         <span class="n">transmittances</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -1263,7 +1263,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_QuatScaleToCovarPreci</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Converts quaternions and scales to covariance and precision matrices.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Converts quaternions and scales to covariance and precision matrices."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1274,7 +1274,7 @@
         <span class="n">compute_preci</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">triu</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-        <span class="n">covars</span><span class="p">,</span> <span class="n">precis</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;quat_scale_to_covar_preci_fwd&quot;</span><span class="p">)(</span>
+        <span class="n">covars</span><span class="p">,</span> <span class="n">precis</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"quat_scale_to_covar_preci_fwd"</span><span class="p">)(</span>
             <span class="n">quats</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">compute_covar</span><span class="p">,</span> <span class="n">compute_preci</span><span class="p">,</span> <span class="n">triu</span>
         <span class="p">)</span>
         <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="n">quats</span><span class="p">,</span> <span class="n">scales</span><span class="p">)</span>
@@ -1293,7 +1293,7 @@
             <span class="n">v_covars</span> <span class="o">=</span> <span class="n">v_covars</span><span class="o">.</span><span class="n">to_dense</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">compute_preci</span> <span class="ow">and</span> <span class="n">v_precis</span><span class="o">.</span><span class="n">is_sparse</span><span class="p">:</span>
             <span class="n">v_precis</span> <span class="o">=</span> <span class="n">v_precis</span><span class="o">.</span><span class="n">to_dense</span><span class="p">()</span>
-        <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;quat_scale_to_covar_preci_bwd&quot;</span><span class="p">)(</span>
+        <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"quat_scale_to_covar_preci_bwd"</span><span class="p">)(</span>
             <span class="n">quats</span><span class="p">,</span>
             <span class="n">scales</span><span class="p">,</span>
             <span class="n">triu</span><span class="p">,</span>
@@ -1304,7 +1304,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_Proj</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Perspective fully_fused_projection on Gaussians.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Perspective fully_fused_projection on Gaussians."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1314,17 +1314,17 @@
         <span class="n">Ks</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., C, 3, 3]</span>
         <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
         <span class="k">assert</span> <span class="p">(</span>
-            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">&quot;ftheta&quot;</span>
-        <span class="p">),</span> <span class="s2">&quot;ftheta camera is only supported via UT, please set with_ut=True in the rasterization()&quot;</span>
+            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">"ftheta"</span>
+        <span class="p">),</span> <span class="s2">"ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"</span>
 
         <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
 
-        <span class="n">means2d</span><span class="p">,</span> <span class="n">covars2d</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;projection_ewa_simple_fwd&quot;</span><span class="p">)(</span>
+        <span class="n">means2d</span><span class="p">,</span> <span class="n">covars2d</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"projection_ewa_simple_fwd"</span><span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>
             <span class="n">Ks</span><span class="p">,</span>
@@ -1344,7 +1344,7 @@
         <span class="n">width</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">width</span>
         <span class="n">height</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">height</span>
         <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">camera_model_type</span>
-        <span class="n">v_means</span><span class="p">,</span> <span class="n">v_covars</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;projection_ewa_simple_bwd&quot;</span><span class="p">)(</span>
+        <span class="n">v_means</span><span class="p">,</span> <span class="n">v_covars</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"projection_ewa_simple_bwd"</span><span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>
             <span class="n">Ks</span><span class="p">,</span>
@@ -1358,7 +1358,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_FullyFusedProjection</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1376,20 +1376,20 @@
         <span class="n">far_plane</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
         <span class="n">radius_clip</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
         <span class="n">calc_compensations</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
         <span class="n">opacities</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., N] or None</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
         <span class="k">assert</span> <span class="p">(</span>
-            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">&quot;ftheta&quot;</span>
-        <span class="p">),</span> <span class="s2">&quot;ftheta camera is only supported via UT, please set with_ut=True in the rasterization()&quot;</span>
+            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">"ftheta"</span>
+        <span class="p">),</span> <span class="s2">"ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"</span>
 
         <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
 
-        <span class="c1"># &quot;covars&quot; and {&quot;quats&quot;, &quot;scales&quot;} are mutually exclusive</span>
+        <span class="c1"># "covars" and {"quats", "scales"} are mutually exclusive</span>
         <span class="n">radii</span><span class="p">,</span> <span class="n">means2d</span><span class="p">,</span> <span class="n">depths</span><span class="p">,</span> <span class="n">conics</span><span class="p">,</span> <span class="n">compensations</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_ewa_3dgs_fused_fwd&quot;</span>
+            <span class="s2">"projection_ewa_3dgs_fused_fwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>
@@ -1439,7 +1439,7 @@
         <span class="k">if</span> <span class="n">v_compensations</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">v_compensations</span> <span class="o">=</span> <span class="n">v_compensations</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="n">v_means</span><span class="p">,</span> <span class="n">v_covars</span><span class="p">,</span> <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span><span class="p">,</span> <span class="n">v_viewmats</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_ewa_3dgs_fused_bwd&quot;</span>
+            <span class="s2">"projection_ewa_3dgs_fused_bwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>
@@ -1504,7 +1504,7 @@
     <span class="n">far_plane</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e10</span><span class="p">,</span>
     <span class="n">radius_clip</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
     <span class="n">calc_compensations</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+    <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
     <span class="n">ut_params</span><span class="p">:</span> <span class="n">UnscentedTransformParameters</span> <span class="o">=</span> <span class="n">UnscentedTransformParameters</span><span class="p">(),</span>
     <span class="c1"># distortion</span>
     <span class="n">radial_coeffs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, 6] or [..., C, 4]</span>
@@ -1515,14 +1515,14 @@
     <span class="n">rolling_shutter</span><span class="p">:</span> <span class="n">RollingShutterType</span> <span class="o">=</span> <span class="n">RollingShutterType</span><span class="o">.</span><span class="n">GLOBAL</span><span class="p">,</span>
     <span class="n">viewmats_rs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, 4, 4]</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D using Unscented Transform (UT).</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D using Unscented Transform (UT).</span>
 
 <span class="sd">    similar to `fully_fused_projection()`, but supports camera distortion and</span>
 <span class="sd">    rolling shutter.</span>
 
 <span class="sd">    .. warning::</span>
 <span class="sd">        This function is not differentiable to any input.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">N</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">C</span> <span class="o">=</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">3</span><span class="p">]</span>
@@ -1544,10 +1544,10 @@
     <span class="k">if</span> <span class="n">viewmats_rs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">viewmats_rs</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="n">viewmats_rs</span><span class="o">.</span><span class="n">shape</span>
 
-    <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span><span class="sa">f</span><span class="s2">"CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="n">radii</span><span class="p">,</span> <span class="n">means2d</span><span class="p">,</span> <span class="n">depths</span><span class="p">,</span> <span class="n">conics</span><span class="p">,</span> <span class="n">compensations</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-        <span class="s2">&quot;projection_ut_3dgs_fused&quot;</span>
+        <span class="s2">"projection_ut_3dgs_fused"</span>
     <span class="p">)(</span>
         <span class="n">means</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
         <span class="n">quats</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -1579,7 +1579,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_RasterizeToPixels</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterize gaussians&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Rasterize gaussians"""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1598,7 +1598,7 @@
         <span class="n">absgrad</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
         <span class="n">render_colors</span><span class="p">,</span> <span class="n">render_alphas</span><span class="p">,</span> <span class="n">last_ids</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;rasterize_to_pixels_3dgs_fwd&quot;</span>
+            <span class="s2">"rasterize_to_pixels_3dgs_fwd"</span>
         <span class="p">)(</span>
             <span class="n">means2d</span><span class="p">,</span>
             <span class="n">conics</span><span class="p">,</span>
@@ -1663,7 +1663,7 @@
             <span class="n">v_conics</span><span class="p">,</span>
             <span class="n">v_colors</span><span class="p">,</span>
             <span class="n">v_opacities</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;rasterize_to_pixels_3dgs_bwd&quot;</span><span class="p">)(</span>
+        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"rasterize_to_pixels_3dgs_bwd"</span><span class="p">)(</span>
             <span class="n">means2d</span><span class="p">,</span>
             <span class="n">conics</span><span class="p">,</span>
             <span class="n">colors</span><span class="p">,</span>
@@ -1709,7 +1709,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_RasterizeToPixelsEval3D</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterize gaussians&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Rasterize gaussians"""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1728,7 +1728,7 @@
         <span class="n">tile_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">isect_offsets</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., C, tile_height, tile_width]</span>
         <span class="n">flatten_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>  <span class="c1"># [..., n_isects]</span>
-        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
         <span class="n">ut_params</span><span class="p">:</span> <span class="n">UnscentedTransformParameters</span> <span class="o">=</span> <span class="n">UnscentedTransformParameters</span><span class="p">(),</span>
         <span class="c1"># distortion</span>
         <span class="n">radial_coeffs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., C, 6] or [..., C, 4]</span>
@@ -1742,7 +1742,7 @@
         <span class="n">ut_params</span> <span class="o">=</span> <span class="n">ut_params</span><span class="o">.</span><span class="n">to_cpp</span><span class="p">()</span>
         <span class="n">rs_type</span> <span class="o">=</span> <span class="n">rolling_shutter</span><span class="o">.</span><span class="n">to_cpp</span><span class="p">()</span>
         <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
         <span class="n">ftheta_coeffs</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">ftheta_coeffs</span><span class="o">.</span><span class="n">to_cpp</span><span class="p">()</span>
@@ -1751,7 +1751,7 @@
         <span class="p">)</span>
 
         <span class="n">render_colors</span><span class="p">,</span> <span class="n">render_alphas</span><span class="p">,</span> <span class="n">last_ids</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;rasterize_to_pixels_from_world_3dgs_fwd&quot;</span>
+            <span class="s2">"rasterize_to_pixels_from_world_3dgs_fwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
@@ -1840,7 +1840,7 @@
         <span class="n">ftheta_coeffs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">ftheta_coeffs</span>
 
         <span class="p">(</span><span class="n">v_means</span><span class="p">,</span> <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span><span class="p">,</span> <span class="n">v_colors</span><span class="p">,</span> <span class="n">v_opacities</span><span class="p">,)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;rasterize_to_pixels_from_world_3dgs_bwd&quot;</span>
+            <span class="s2">"rasterize_to_pixels_from_world_3dgs_bwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
@@ -1907,7 +1907,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_FullyFusedProjectionPacked</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D. Return packed tensors.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D. Return packed tensors."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -1926,15 +1926,15 @@
         <span class="n">radius_clip</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
         <span class="n">sparse_grad</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
         <span class="n">calc_compensations</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;pinhole&quot;</span><span class="p">,</span> <span class="s2">&quot;ortho&quot;</span><span class="p">,</span> <span class="s2">&quot;fisheye&quot;</span><span class="p">,</span> <span class="s2">&quot;ftheta&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;pinhole&quot;</span><span class="p">,</span>
+        <span class="n">camera_model</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"pinhole"</span><span class="p">,</span> <span class="s2">"ortho"</span><span class="p">,</span> <span class="s2">"fisheye"</span><span class="p">,</span> <span class="s2">"ftheta"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"pinhole"</span><span class="p">,</span>
         <span class="n">opacities</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># [..., N] or None</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
         <span class="k">assert</span> <span class="p">(</span>
-            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">&quot;ftheta&quot;</span>
-        <span class="p">),</span> <span class="s2">&quot;ftheta camera is only supported via UT, please set with_ut=True in the rasterization()&quot;</span>
+            <span class="n">camera_model</span> <span class="o">!=</span> <span class="s2">"ftheta"</span>
+        <span class="p">),</span> <span class="s2">"ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"</span>
 
         <span class="n">camera_model_type</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_obj</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"CameraModelType.</span><span class="si">{</span><span class="n">camera_model</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
 
         <span class="p">(</span>
@@ -1947,7 +1947,7 @@
             <span class="n">depths</span><span class="p">,</span>
             <span class="n">conics</span><span class="p">,</span>
             <span class="n">compensations</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;projection_ewa_3dgs_packed_fwd&quot;</span><span class="p">)(</span>
+        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"projection_ewa_3dgs_packed_fwd"</span><span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>  <span class="c1"># optional</span>
             <span class="n">quats</span><span class="p">,</span>  <span class="c1"># optional</span>
@@ -2030,7 +2030,7 @@
         <span class="k">if</span> <span class="n">v_compensations</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">v_compensations</span> <span class="o">=</span> <span class="n">v_compensations</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="n">v_means</span><span class="p">,</span> <span class="n">v_covars</span><span class="p">,</span> <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span><span class="p">,</span> <span class="n">v_viewmats</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_ewa_3dgs_packed_bwd&quot;</span>
+            <span class="s2">"projection_ewa_3dgs_packed_bwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">covars</span><span class="p">,</span>
@@ -2127,13 +2127,13 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_SphericalHarmonics</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Spherical Harmonics&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Spherical Harmonics"""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
         <span class="n">ctx</span><span class="p">,</span> <span class="n">sh_degree</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">dirs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">coeffs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">masks</span><span class="p">:</span> <span class="n">Tensor</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
-        <span class="n">colors</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;spherical_harmonics_fwd&quot;</span><span class="p">)(</span>
+        <span class="n">colors</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"spherical_harmonics_fwd"</span><span class="p">)(</span>
             <span class="n">sh_degree</span><span class="p">,</span> <span class="n">dirs</span><span class="p">,</span> <span class="n">coeffs</span><span class="p">,</span> <span class="n">masks</span>
         <span class="p">)</span>
         <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="n">dirs</span><span class="p">,</span> <span class="n">coeffs</span><span class="p">,</span> <span class="n">masks</span><span class="p">)</span>
@@ -2147,7 +2147,7 @@
         <span class="n">sh_degree</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">sh_degree</span>
         <span class="n">num_bases</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">num_bases</span>
         <span class="n">compute_v_dirs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">needs_input_grad</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
-        <span class="n">v_coeffs</span><span class="p">,</span> <span class="n">v_dirs</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;spherical_harmonics_bwd&quot;</span><span class="p">)(</span>
+        <span class="n">v_coeffs</span><span class="p">,</span> <span class="n">v_dirs</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"spherical_harmonics_bwd"</span><span class="p">)(</span>
             <span class="n">num_bases</span><span class="p">,</span>
             <span class="n">sh_degree</span><span class="p">,</span>
             <span class="n">dirs</span><span class="p">,</span>
@@ -2179,7 +2179,7 @@
     <span class="n">packed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">sparse_grad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Prepare Gaussians for rasterization</span>
+<span class="w">    </span><span class="sd">"""Prepare Gaussians for rasterization</span>
 
 <span class="sd">    This function prepares ray-splat intersection matrices, computes</span>
 <span class="sd">    per splat bounding box and 2D means in image space.</span>
@@ -2221,7 +2221,7 @@
 <span class="sd">        - **ray_transforms**. transformation matrices that transforms xy-planes in pixel spaces into splat coordinates [..., C, N, 3, 3]</span>
 <span class="sd">        - **normals**. The normals in camera spaces. [..., C, N, 3]</span>
 
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">batch_dims</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">N</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">C</span> <span class="o">=</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">3</span><span class="p">]</span>
@@ -2229,14 +2229,14 @@
     <span class="k">assert</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">assert</span> <span class="n">Ks</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span> <span class="n">Ks</span><span class="o">.</span><span class="n">shape</span>
     <span class="n">means</span> <span class="o">=</span> <span class="n">means</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-    <span class="k">assert</span> <span class="n">quats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;quats is required&quot;</span>
-    <span class="k">assert</span> <span class="n">scales</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;scales is required&quot;</span>
+    <span class="k">assert</span> <span class="n">quats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"quats is required"</span>
+    <span class="k">assert</span> <span class="n">scales</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"scales is required"</span>
     <span class="k">assert</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="n">quats</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">assert</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">batch_dims</span> <span class="o">+</span> <span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span>
     <span class="n">quats</span> <span class="o">=</span> <span class="n">quats</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="n">scales</span> <span class="o">=</span> <span class="n">scales</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">sparse_grad</span><span class="p">:</span>
-        <span class="k">assert</span> <span class="n">packed</span><span class="p">,</span> <span class="s2">&quot;sparse_grad is only supported when packed is True&quot;</span>
+        <span class="k">assert</span> <span class="n">packed</span><span class="p">,</span> <span class="s2">"sparse_grad is only supported when packed is True"</span>
 
     <span class="n">viewmats</span> <span class="o">=</span> <span class="n">viewmats</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
     <span class="n">Ks</span> <span class="o">=</span> <span class="n">Ks</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
@@ -2272,7 +2272,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_FullyFusedProjection2DGS</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -2290,7 +2290,7 @@
         <span class="n">radius_clip</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
         <span class="n">radii</span><span class="p">,</span> <span class="n">means2d</span><span class="p">,</span> <span class="n">depths</span><span class="p">,</span> <span class="n">ray_transforms</span><span class="p">,</span> <span class="n">normals</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_2dgs_fused_fwd&quot;</span>
+            <span class="s2">"projection_2dgs_fused_fwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
@@ -2336,7 +2336,7 @@
         <span class="n">height</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">height</span>
         <span class="n">eps2d</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">eps2d</span>
         <span class="n">v_means</span><span class="p">,</span> <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span><span class="p">,</span> <span class="n">v_viewmats</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_2dgs_fused_bwd&quot;</span>
+            <span class="s2">"projection_2dgs_fused_bwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
@@ -2379,7 +2379,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_FullyFusedProjectionPacked2DGS</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Projects Gaussians to 2D. Return packed tensors.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Projects Gaussians to 2D. Return packed tensors."""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -2406,7 +2406,7 @@
             <span class="n">depths</span><span class="p">,</span>
             <span class="n">ray_transforms</span><span class="p">,</span>
             <span class="n">normals</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;projection_2dgs_packed_fwd&quot;</span><span class="p">)(</span>
+        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"projection_2dgs_packed_fwd"</span><span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
             <span class="n">scales</span><span class="p">,</span>
@@ -2472,7 +2472,7 @@
         <span class="n">sparse_grad</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">sparse_grad</span>
 
         <span class="n">v_means</span><span class="p">,</span> <span class="n">v_quats</span><span class="p">,</span> <span class="n">v_scales</span><span class="p">,</span> <span class="n">v_viewmats</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span>
-            <span class="s2">&quot;projection_2dgs_packed_bwd&quot;</span>
+            <span class="s2">"projection_2dgs_packed_bwd"</span>
         <span class="p">)(</span>
             <span class="n">means</span><span class="p">,</span>
             <span class="n">quats</span><span class="p">,</span>
@@ -2572,7 +2572,7 @@
     <span class="n">absgrad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">distloss</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterize Gaussians to pixels.</span>
+<span class="w">    </span><span class="sd">"""Rasterize Gaussians to pixels.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        means2d: Projected Gaussian means. [..., N, 2] if packed is False, [nnz, 2] if packed is True.</span>
@@ -2599,7 +2599,7 @@
 <span class="sd">        - **Rendered median depth**.[..., image_height, image_width, 1]</span>
 
 
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">image_dims</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">channels</span> <span class="o">=</span> <span class="n">colors</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
     <span class="n">device</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">device</span>
@@ -2622,7 +2622,7 @@
     <span class="c1"># Pad the channels to the nearest supported number if necessary</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="o">&gt;</span> <span class="mi">512</span> <span class="ow">or</span> <span class="n">channels</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="c1"># TODO: maybe worth to support zero channels?</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unsupported number of color channels: </span><span class="si">{</span><span class="n">channels</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">channels</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">):</span>
         <span class="n">padded_channels</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">channels</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">bit_length</span><span class="p">())</span> <span class="o">-</span> <span class="n">channels</span>
         <span class="c1"># Make sure the depth (last channel if present) remains in the last channel after padding (for depth distortion and median depth in CUDA kernel)</span>
@@ -2649,10 +2649,10 @@
     <span class="n">tile_height</span><span class="p">,</span> <span class="n">tile_width</span> <span class="o">=</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_height</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_height</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">"</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_width</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_width</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">"</span>
 
     <span class="p">(</span>
         <span class="n">render_colors</span><span class="p">,</span>
@@ -2704,7 +2704,7 @@
     <span class="n">isect_offsets</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
     <span class="n">flatten_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterizes a batch of Gaussians to images but only returns the indices.</span>
+<span class="w">    </span><span class="sd">"""Rasterizes a batch of Gaussians to images but only returns the indices.</span>
 
 <span class="sd">    .. note::</span>
 
@@ -2733,7 +2733,7 @@
 <span class="sd">        - **Pixel ids**. pixel indices (row-major). A flattened list of shape [M].</span>
 <span class="sd">        - **Camera ids**. Camera indices. A flattened list of shape [M].</span>
 <span class="sd">        - **Batch ids**. Batch indices. A flattened list of shape [M].</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">image_dims</span> <span class="o">=</span> <span class="n">means2d</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
     <span class="n">tile_height</span><span class="p">,</span> <span class="n">tile_width</span> <span class="o">=</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
@@ -2751,12 +2751,12 @@
     <span class="p">),</span> <span class="n">isect_offsets</span><span class="o">.</span><span class="n">shape</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_height</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_height</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_height</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_height</span><span class="si">}</span><span class="s2">"</span>
     <span class="k">assert</span> <span class="p">(</span>
         <span class="n">tile_width</span> <span class="o">*</span> <span class="n">tile_size</span> <span class="o">&gt;=</span> <span class="n">image_width</span>
-    <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">),</span> <span class="sa">f</span><span class="s2">"Assert Failed: </span><span class="si">{</span><span class="n">tile_width</span><span class="si">}</span><span class="s2"> * </span><span class="si">{</span><span class="n">tile_size</span><span class="si">}</span><span class="s2"> &gt;= </span><span class="si">{</span><span class="n">image_width</span><span class="si">}</span><span class="s2">"</span>
 
-    <span class="n">out_gauss_ids</span><span class="p">,</span> <span class="n">out_indices</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;rasterize_to_indices_2dgs&quot;</span><span class="p">)(</span>
+    <span class="n">out_gauss_ids</span><span class="p">,</span> <span class="n">out_indices</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"rasterize_to_indices_2dgs"</span><span class="p">)(</span>
         <span class="n">range_start</span><span class="p">,</span>
         <span class="n">range_end</span><span class="p">,</span>
         <span class="n">transmittances</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
@@ -2776,7 +2776,7 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_RasterizeToPixels2DGS</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Rasterize gaussians 2DGS&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Rasterize gaussians 2DGS"""</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
@@ -2805,7 +2805,7 @@
             <span class="n">render_median</span><span class="p">,</span>
             <span class="n">last_ids</span><span class="p">,</span>
             <span class="n">median_ids</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;rasterize_to_pixels_2dgs_fwd&quot;</span><span class="p">)(</span>
+        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"rasterize_to_pixels_2dgs_fwd"</span><span class="p">)(</span>
             <span class="n">means2d</span><span class="p">,</span>
             <span class="n">ray_transforms</span><span class="p">,</span>
             <span class="n">colors</span><span class="p">,</span>
@@ -2891,7 +2891,7 @@
             <span class="n">v_opacities</span><span class="p">,</span>
             <span class="n">v_normals</span><span class="p">,</span>
             <span class="n">v_densify</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">&quot;rasterize_to_pixels_2dgs_bwd&quot;</span><span class="p">)(</span>
+        <span class="p">)</span> <span class="o">=</span> <span class="n">_make_lazy_cuda_func</span><span class="p">(</span><span class="s2">"rasterize_to_pixels_2dgs_bwd"</span><span class="p">)(</span>
             <span class="n">means2d</span><span class="p">,</span>
             <span class="n">ray_transforms</span><span class="p">,</span>
             <span class="n">colors</span><span class="p">,</span>
