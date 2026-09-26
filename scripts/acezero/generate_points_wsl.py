@@ -17,17 +17,6 @@ logger = logging.getLogger(__name__)
 sys.path.append(str(Path(__file__).parent))
 import dataset_io
 
-# Repo root, for the stdlib-only dynamic-parameter package (py3.8-safe to import from this env)
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.append(str(_REPO_ROOT))
-try:
-    from hypersplat.pipeline.params import SceneProfile
-    from hypersplat.pipeline.params.strategies import points as point_budget
-except Exception as e:  # params unavailable: keep the old fixed fraction
-    logger.warning(f"Dynamic params unavailable ({e}); using fixed subsample")
-    SceneProfile = point_budget = None
-
 def write_points3D_binary(points3D, path):
     """
     Write 3D points to a COLMAP binary file.
@@ -49,60 +38,25 @@ def write_points3D_binary(points3D, path):
             f.write(struct.pack("Q", 0))   # track_len (0 = no track info)
             # No track content follows if len is 0
 
-def resolve_image(images_root, img_rel_path):
-    """Find a frame by name under images_root, else at its original (ACE-recorded) path."""
-    img_path = Path(images_root) / Path(img_rel_path).name
-    if img_path.exists():
-        return img_path
-    img_path = Path(img_rel_path)
-    return img_path if img_path.exists() else None
-
-
-def point_budget_subsample(user_value, profile, images_root, rgb_files):
-    """Subsample fraction: explicit value > the profile's GPU point budget > 0.02."""
-    if point_budget is None:
-        return user_value if user_value is not None else 0.02
-    w = h = 0
-    for rel in rgb_files:  # frames share one resolution; size from the first readable one
-        img_path = resolve_image(images_root, rel)
-        img = cv2.imread(str(img_path)) if img_path is not None else None
-        if img is not None:
-            h, w = img.shape[:2]
-            break
-    return point_budget.resolve_subsample(user_value, profile, w, h, len(rgb_files))
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("poses_file", help="Path to poses_final.txt (ACE format)")
     parser.add_argument("images_root", help="Root directory containing images")
     parser.add_argument("output_path", help="Path to write points3D.bin")
-    parser.add_argument("--subsample", type=float, default=None,
-                        help="Fraction of pixels to keep (0.01 = 1%%); default: derived from the "
-                             "GPU point budget in $HYPERSPLAT_PROFILE, else 0.02")
-    parser.add_argument("--depth_model", default="depth_anything",
-                        help="Depth model for unprojection (depth_anything | zoedepth)")
+    parser.add_argument("--subsample", type=float, default=0.02, help="Fraction of points to keep (0.01 = 1%)")
     args = parser.parse_args()
 
-    # Prefer the pipeline's confidence-filtered poses over the raw ACE-Zero output
-    poses_file = point_budget.pick_poses_file(args.poses_file) if point_budget else Path(args.poses_file)
-    logger.info(f"Using poses: {poses_file}")
-
     # Load poses using existing utility
-    # Confidence 0 to take all poses that made it to the (filtered) final file
+    # Confidence 0 to take all poses that made it to final file
     try:
-        rgb_files, poses, focal_lengths, _ = dataset_io.load_dataset_ace(str(poses_file), confidence_threshold=0)
+        rgb_files, poses, focal_lengths, _ = dataset_io.load_dataset_ace(args.poses_file, confidence_threshold=0)
     except Exception as e:
         logger.error(f"Failed to load poses: {e}")
         return
 
-    # Size the cloud to a point budget: fraction = target / (W*H*N), unless --subsample is given
-    profile = SceneProfile.from_env() if SceneProfile else None
-    subsample = point_budget_subsample(args.subsample, profile, args.images_root, rgb_files)
-
     # Load Depth Model
-    logger.info(f"Loading depth model ({args.depth_model})...")
-    model = dataset_io.get_depth_model(model_type=args.depth_model)
+    logger.info("Loading ZoeDepth model...")
+    model = dataset_io.get_depth_model()
     
     all_points_xyz = []
     all_points_rgb = []
@@ -121,10 +75,14 @@ def main():
         # ACE usually stores absolute paths in WSL. We might need to re-root them.
         # But for now, assume we use the filename to find it in images_root
         img_name = Path(img_rel_path).name
-        img_path = resolve_image(args.images_root, img_rel_path)
-        if img_path is None:
-            logger.warning(f"Image not found: {img_name}")
-            continue
+        img_path = Path(args.images_root) / img_name
+        
+        if not img_path.exists():
+            # Try original path
+            img_path = Path(img_rel_path)
+            if not img_path.exists():
+                logger.warning(f"Image not found: {img_name}")
+                continue
                 
         # Read Image
         img = cv2.imread(str(img_path))
@@ -140,8 +98,7 @@ def main():
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h))
             
-        # Unproject. Principal point at the image centre: ACE-Zero only refines the focal
-        # length, it does not estimate cx/cy (intrinsics are handled elsewhere in the pipeline)
+        # Unproject
         cx, cy = w / 2, h / 2
         u, v = np.meshgrid(np.arange(w), np.arange(h))
         
@@ -154,7 +111,7 @@ def main():
         colors = img_rgb.reshape(-1, 3)
         
         # Apply random subsampling
-        mask = np.random.rand(points_cam.shape[0]) < subsample
+        mask = np.random.rand(points_cam.shape[0]) < args.subsample
         points_cam = points_cam[mask]
         colors = colors[mask]
         
@@ -187,9 +144,6 @@ def main():
     # Zip for writer
     points_data = list(zip(final_xyz, final_rgb))
     write_points3D_binary(points_data, args.output_path)
-    if profile is not None:
-        profile.set("points.count", int(len(final_xyz)), "generate_points_wsl")
-        profile.save()
     logger.info("Done.")
 
 if __name__ == "__main__":

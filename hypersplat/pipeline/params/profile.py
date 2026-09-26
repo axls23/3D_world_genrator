@@ -77,14 +77,8 @@ class SceneProfile:
         items.append(item)
         self.set(key, items, source)
 
-    def discard(self, *keys: str) -> None:
-        """Drop top-level sections (e.g. per-run results) and write without merging."""
-        for key in keys:
-            self.data.pop(key, None)
-        self.save(merge=False)
-
-    def save(self, merge: bool = True) -> None:
-        """Write to disk, merging with what is already there (unless merge=False).
+    def save(self) -> None:
+        """Write to disk, merging with what is already there.
 
         Stage subprocesses (e.g. the ACE-Zero point generator) and in-process helpers may
         hold their own SceneProfile of the same file; a plain overwrite from a stale copy
@@ -93,8 +87,8 @@ class SceneProfile:
         """
         if self.path is None:
             return
-        if merge:
-            self.data = _merge(SceneProfile.load(self.path).data, self.data)
+        on_disk = SceneProfile.load(self.path).data
+        self.data = _merge(on_disk, self.data)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self.data, indent=2, default=str))
