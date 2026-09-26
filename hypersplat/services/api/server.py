@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import List, Optional, Dict, Set
 from pydantic import BaseModel
 
+from hypersplat.pipeline import log_parsing
+
 # Suppress noisy /api/status polling logs
 import logging
 
@@ -360,52 +362,20 @@ class AppState:
             await self.broadcast_queue_update()
             
     def _is_repetitive_match(self, last_line: str, new_line: str) -> bool:
-        if "it/s]" in last_line and "it/s]" in new_line:
-            return True
-        if "Iteration" in last_line and "Iteration" in new_line:
-            return True
-        return False
-        
-    def parse_progress(self, line: str, job: dict):
-        if "TRAINING_VIEWER_URL:" in line:
-            parts = line.split("TRAINING_VIEWER_URL:")
-            if len(parts) > 1:
-                job["training_viewer_url"] = parts[1].strip()
-                
-        if "ACE-ZERO POSE ESTIMATION" in line:
-            job["progress"] = 15
-            job["status"] = "processing"
-        if "Extracting frames" in line:
-            job["progress"] = 20
-        if "Extracted" in line and "frames" in line:
-            job["progress"] = 30
-        if "3DGS TRAINING" in line:
-            job["progress"] = 40
-            job["status"] = "processing"
-            
-        if "STEP 1:" in line: 
-            job["progress"] = 10
-        if "STEP 2:" in line: 
-            job["progress"] = 40
-        if "STEP 3:" in line: 
-            job["progress"] = 70
-        
-        if "it/s]" in line and "/" in line:
-            try:
-                parts = line.split("|")
-                if len(parts) >= 2:
-                    step_part = parts[-1].strip()
-                    if "/" in step_part:
-                        current, total = step_part.split("/")[0], step_part.split("/")[1].split()[0]
-                        current, total = int(current.strip()), int(total.strip())
-                        train_progress = (current / total) * 55
-                        job["progress"] = 40 + int(train_progress)
-            except:
-                pass
+        return log_parsing.is_repetitive_match(last_line, new_line)
 
-        if "PIPELINE COMPLETE" in line or "PIPELINE SUMMARY" in line: 
-            job["progress"] = 100
-            
+    def parse_progress(self, line: str, job: dict):
+        result = log_parsing.parse_marker_progress(line)
+
+        if result.viewer_url is not None:
+            job["training_viewer_url"] = result.viewer_url
+
+        if result.saw_ace_zero_pose or result.saw_3dgs_training:
+            job["status"] = "processing"
+
+        if result.progress is not None:
+            job["progress"] = result.progress
+
     async def broadcast_status(self, job):
         job_id = job["job_id"]
         message = {

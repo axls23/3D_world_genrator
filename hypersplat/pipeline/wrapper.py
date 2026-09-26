@@ -17,6 +17,8 @@ import collections
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from hypersplat.pipeline import log_parsing
+
 
 class PipelineMode:
     """Pipeline execution modes"""
@@ -387,60 +389,21 @@ class TrainingManager:
 
     def _is_repetitive_match(self, last_line: str, new_line: str) -> bool:
         """Check if new line is a progress update of the same type as last line"""
-        # Match tqdm style
-        if "it/s]" in last_line and "it/s]" in new_line:
-            return True
-        # Match iteration style
-        if "Iteration" in last_line and "Iteration" in new_line:
-            return True
-        return False
-            
-
+        return log_parsing.is_repetitive_match(last_line, new_line)
 
     def _parse_log_line(self, line: str):
         """Parse log line for progress and events"""
-        # Capture Viewer URL
-        if "TRAINING_VIEWER_URL:" in line:
-            parts = line.split("TRAINING_VIEWER_URL:")
-            if len(parts) > 1:
-                self.training_viewer_url = parts[1].strip()
-                self.logs.append(f"Training Viewer Detected: {self.training_viewer_url}")
+        result = log_parsing.parse_marker_progress(line)
 
-        # ACE-Zero specific progress
-        if "ACE-ZERO POSE ESTIMATION" in line:
-            self.progress = 15
-        if "Extracting frames" in line:
-            self.progress = 20
-        if "Extracted" in line and "frames" in line:
-            self.progress = 30
-        if "3DGS TRAINING" in line:
-            self.progress = 40
-            
-        # Legacy progress indicators
-        if "STEP 1:" in line: 
-            self.progress = 10
-        if "STEP 2:" in line: 
-            self.progress = 40
-        if "STEP 3:" in line: 
-            self.progress = 70
-        
-        # Training step progress (from tqdm output)
-        if "it/s]" in line and "/" in line:
-            try:
-                # Parse format like: 375/500 [00:38<00:12, 10.25it/s]
-                parts = line.split("|")
-                if len(parts) >= 2:
-                    step_part = parts[-1].strip()
-                    if "/" in step_part:
-                        current, total = step_part.split("/")[0], step_part.split("/")[1].split()[0]
-                        current, total = int(current.strip()), int(total.strip())
-                        # Map 40-95% to training progress
-                        train_progress = (current / total) * 55
-                        self.progress = 40 + int(train_progress)
-            except:
-                pass
+        if result.viewer_url is not None:
+            self.training_viewer_url = result.viewer_url
+            self.logs.append(f"Training Viewer Detected: {self.training_viewer_url}")
 
-        # Chunk progress (for Level 3)
+        if result.progress is not None:
+            self.progress = result.progress
+
+        # Chunk progress (for Level 3) -- not part of the shared marker set,
+        # since server.py's AppState.parse_progress has no equivalent.
         if "[Progress]" in line and "chunks completed" in line:
             try:
                 parts = line.split("]")[1].strip().split("chunks")[0].strip()
@@ -450,10 +413,9 @@ class TrainingManager:
             except:
                 pass
 
-        if "PIPELINE COMPLETE" in line or "PIPELINE SUMMARY" in line: 
-            self.progress = 100
+        if result.is_complete:
             self.status = "training_complete"
-    
+
     def _check_early_stopping(self, line: str):
         """Check if training should stop early based on loss convergence."""
         if not self.training_config.get("early_stopping", False):
