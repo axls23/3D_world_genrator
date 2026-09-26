@@ -12,12 +12,8 @@ produced pure noise). Instead of hallucinating views from scratch, we:
   4. Write an augmented COLMAP dataset (original points3D kept) plus image_weights.json,
      which examples/datasets/colmap.py reads to weight each image's RGB loss.
 
-Pseudo-view weight = pseudo_weight * source_confidence_weight * angle falloff * change trust,
-so views derived from shaky poses, far from real coverage, or heavily rewritten by Difix get
-less trust. "Change PSNR" = PSNR(raw render, Difix output) per view: a low value means Difix
-changed a lot (likely hallucinating), so those views are dropped and the round's statistics are
-appended to the scene profile (difix.rounds) for the closed-loop strategies in
-hypersplat/pipeline/params/strategies/difix.py.
+Pseudo-view weight = pseudo_weight * source_confidence_weight * angle falloff, so views
+derived from shaky poses or far from real coverage get less trust.
 
 Difix weights are released under the NVIDIA non-commercial license (see LICENSE_DIFIX.txt).
 
@@ -48,12 +44,6 @@ from datasets.colmap import Parser  # noqa: E402
 from datasets.normalize import transform_cameras  # noqa: E402
 from gsplat import rasterization  # noqa: E402
 
-from hypersplat.pipeline.params import SceneProfile  # noqa: E402
-from hypersplat.pipeline.params.strategies.difix import (  # noqa: E402
-    confidence_ramp,
-    pseudo_view_weights,
-    round_stats,
-)
 from hypersplat.beta.genvs.run_completion import (  # noqa: E402
     BaseImage,
     read_images_binary,
@@ -64,20 +54,6 @@ from hypersplat.beta.genvs.run_completion import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 DIFIX_PROMPT = "remove degradation"
-
-# Pseudo-camera placement, tied to the round's max_angle:
-#   ANGLE_STEP_DEG  views are spread over ceil(max_angle / step) progressive levels (clamped to
-#                   [1, MAX_LEVELS]), i.e. roughly one level per 3 deg - the spacing at which
-#                   difix_ref's faithfulness was validated (3/6/12 deg). A 6 deg round uses
-#                   {3, 6}; a 20 deg round uses {5, 10, 15, 20}.
-#   PITCH_JITTER    pitch is drawn in +-PITCH_JITTER * yaw, so the orbit stays mostly along the
-#                   camera path's horizontal arc and the total angle stays <= ~1.04 * max_angle.
-#   ANGLE_FALLOFF   within a round the farthest view gets (1 - ANGLE_FALLOFF) of the nearest
-#                   view's weight; actual hallucination is handled by the change-PSNR trust.
-ANGLE_STEP_DEG = 3.0
-MAX_LEVELS = 4
-PITCH_JITTER = 0.3
-ANGLE_FALLOFF = 0.5
 
 
 # ----------------------------------------------------------------------------
@@ -107,13 +83,10 @@ def load_ace_confidence(data_dir: Path) -> Dict[str, float]:
     return conf
 
 
-def confidence_weights(conf: Dict[str, float], min_conf: Optional[float] = None,
-                       floor: Optional[float] = None) -> Dict[str, float]:
-    """Linear ramp: min_conf -> floor, median confidence and above -> 1.0.
-    min_conf / floor default to values derived from the confidence distribution."""
+def confidence_weights(conf: Dict[str, float], min_conf: float, floor: float) -> Dict[str, float]:
+    """Linear ramp: registration threshold -> floor, median confidence and above -> 1.0."""
     if not conf:
         return {}
-    min_conf, floor = confidence_ramp(conf.values(), min_conf, floor)
     median = float(np.median(list(conf.values())))
     span = max(median - min_conf, 1e-6)
     return {name: float(np.clip((c - min_conf) / span, floor, 1.0)) for name, c in conf.items()}
@@ -172,57 +145,17 @@ def orbit_pose(c2w: np.ndarray, pivot: np.ndarray, yaw_deg: float, pitch_deg: fl
     return out
 
 
-def camera_spread_deg(camtoworlds: np.ndarray, points: np.ndarray) -> float:
-    """Angular extent (deg) of the camera positions as seen from the scene pivot (median look-at
-    point): 2 x the 90th-percentile angle to the mean viewing direction. Scale invariant, so it
-    works in Parser's normalized frame."""
-    if len(camtoworlds) < 2:
-        return 0.0
-    if len(points) > 20000:
-        points = points[np.linspace(0, len(points) - 1, 20000).astype(int)]
-    centers, fwd = camtoworlds[:, :3, 3], camtoworlds[:, :3, 2]
-    depths = np.array([look_at_depth(c2w, points) for c2w in camtoworlds])
-    pivot = np.median(centers + fwd * depths[:, None], axis=0)
-    d = centers - pivot
-    d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
-    mean = d.mean(0)
-    mean /= max(np.linalg.norm(mean), 1e-9)
-    ang = np.degrees(np.arccos(np.clip(d @ mean, -1.0, 1.0)))
-    return float(2.0 * np.percentile(ang, 90))
-
-
-def train_indices(n: int, test_every: int) -> np.ndarray:
-    """Train-split indices (must match the trainer's held-out split)."""
-    return np.array([i for i in range(n) if i % test_every != 0])
-
-
-def measure_camera_spread(data_dir: Path, test_every: int = 8) -> float:
-    """camera_spread_deg of the train cameras of a COLMAP dataset (CPU only)."""
-    parser = Parser(str(data_dir), factor=1, normalize=True, test_every=test_every)
-    return camera_spread_deg(parser.camtoworlds[train_indices(len(parser.image_names), test_every)],
-                             parser.points)
-
-
-def change_psnr(render: np.ndarray, fixed: np.ndarray) -> float:
-    """PSNR (dB) between a raw render and its Difix output: how much Difix changed it."""
-    mse = np.mean((render.astype(np.float64) - fixed.astype(np.float64)) ** 2)
-    return float("inf") if mse <= 0 else float(10.0 * np.log10(255.0 ** 2 / mse))
-
-
 def make_pseudo_poses(
     camtoworlds: np.ndarray,
     src_weights: np.ndarray,
     points: np.ndarray,
     num_views: int,
     max_angle: float,
-    levels: Optional[int] = None,
+    levels: int = 3,
     seed: int = 0,
 ) -> List[Tuple[int, np.ndarray, float]]:
     """Return (source_index, c2w, angle_deg) for pseudo views around confident cameras.
-    levels defaults to ~one per ANGLE_STEP_DEG of max_angle (see module constants).
     seed > 0 also rotates which confident cameras seed the views (fresh coverage per round)."""
-    if levels is None:
-        levels = int(np.clip(np.ceil(max_angle / ANGLE_STEP_DEG), 1, MAX_LEVELS))
     order = np.argsort(-src_weights, kind="stable")
     rng = np.random.default_rng(seed)
     if seed:
@@ -234,7 +167,7 @@ def make_pseudo_poses(
         level = 1 + (k * levels) // max(num_views, 1)
         angle = max_angle * level / levels
         yaw = angle * (1 if k % 2 == 0 else -1)
-        pitch = rng.uniform(-PITCH_JITTER, PITCH_JITTER) * angle
+        pitch = rng.uniform(-0.3, 0.3) * angle
         c2w = camtoworlds[src]
         pivot = c2w[:3, 3] + c2w[:3, 2] * look_at_depth(c2w, points)
         poses.append((src, orbit_pose(c2w, pivot, yaw, pitch), float(np.hypot(yaw, pitch))))
@@ -346,8 +279,7 @@ def write_downscaled(out_dir: Path, factors=(2, 4)):
         d.mkdir(exist_ok=True)
         for img_path in sorted((out_dir / "images").iterdir()):
             dst = d / (img_path.stem + ".png")
-            # Real frames never change; pseudo views are re-rendered every round
-            if dst.exists() and not img_path.name.startswith("pseudo_"):
+            if dst.exists():
                 continue
             img = Image.open(img_path).convert("RGB")
             img.resize((round(img.width / f), round(img.height / f)), Image.BICUBIC).save(dst)
@@ -364,11 +296,11 @@ def run(args) -> Path:
 
     # 1. Pose confidence -> per-image weights
     conf = load_ace_confidence(data_dir)
-    real_w = confidence_weights(conf, getattr(args, "min_conf", None), getattr(args, "weight_floor", None))
+    real_w = confidence_weights(conf, args.min_conf, args.weight_floor)
     weights = {n: real_w.get(n, 1.0) for n in names}
 
     # Only train-split cameras may seed pseudo views (don't leak eval frames)
-    train_idx = train_indices(len(names), args.test_every)
+    train_idx = np.array([i for i in range(len(names)) if i % args.test_every != 0])
 
     # 1b. Pose uncertainty from joint pose optimization of the checkpoint's own dataset
     ckpt_dir = Path(args.ckpt_data_dir or args.data_dir)
@@ -409,54 +341,25 @@ def run(args) -> Path:
         del fixer
         torch.cuda.empty_cache()
 
-    # 4. Trust each view by how much Difix changed it; drop likely hallucinations
-    angles = [angle for _, _, angle in poses]
-    changes = [None if args.no_difix else change_psnr(raw, img) for raw, img in zip(renders, fixed)]
-    base = [args.pseudo_weight * float(src_w[src]) *
-            max(1.0 - ANGLE_FALLOFF * angle / max(args.max_angle, 1e-6), 0.0)
-            for src, _, angle in poses]
-    pseudo_w, threshold = pseudo_view_weights(base, changes)
-
-    # 5. Write augmented dataset + weights
-    pseudo_entries, pseudo_imgs, views = [], [], []
+    # 4. Write augmented dataset + weights
+    pseudo_entries = []
     debug_dir = out_dir / "pseudo_debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
-    for k, ((src, c2w, angle), raw, img, change, w) in enumerate(zip(poses, renders, fixed, changes, pseudo_w)):
+    for k, ((src, c2w, angle), raw, img) in enumerate(zip(poses, renders, fixed)):
         name = f"pseudo_{k:04d}.png"
-        views.append({"name": name, "angle": round(angle, 3), "weight": w,
-                      "change_psnr": round(change, 3) if change is not None and np.isfinite(change) else None})
-        Image.fromarray(np.concatenate([raw, img], axis=1)).save(debug_dir / name)
-        if w <= 0.0:
-            continue
         pseudo_entries.append((name, normalized_to_raw(c2w, parser.transform)))
-        pseudo_imgs.append(img)
-        weights[name] = w
-    stats = round_stats(getattr(args, "loop", None), args.max_angle, angles, changes, threshold,
-                        len(pseudo_entries))
-    logger.info(f"Difix change PSNR: mean {stats['mean_change_psnr']}, min {stats['min_change_psnr']} dB; "
-                f"kept {stats['n_kept']}/{stats['n_views']} views (threshold {threshold:.1f} dB)")
+        weights[name] = args.pseudo_weight * float(src_w[src]) * (1.0 - 0.5 * angle / max(args.max_angle, 1e-6))
+        Image.fromarray(np.concatenate([raw, img], axis=1)).save(debug_dir / name)
 
-    # Dropped views leave gaps in the numbering; stale pseudo images from an earlier run of this
-    # out_dir would break the trainer's sorted images_<f>/ <-> images/ mapping
-    for stale in out_dir.glob("images*/pseudo_*"):
-        stale.unlink()
     write_augmented_colmap(data_dir, out_dir, pseudo_entries)
-    for (name, _), img in zip(pseudo_entries, pseudo_imgs):
+    for (name, _), img in zip(pseudo_entries, fixed):
         Image.fromarray(img).save(out_dir / "images" / name)
     write_downscaled(out_dir)
     (out_dir / "image_weights.json").write_text(json.dumps(weights, indent=2))
-    spread = camera_spread_deg(parser.camtoworlds[train_idx], parser.points)
     meta = {"ckpt": str(args.ckpt), "num_views": args.num_views, "max_angle": args.max_angle,
             "pseudo_weight": args.pseudo_weight, "difix": not args.no_difix,
-            "camera_spread_deg": spread, "round": stats, "views": views,
             "ace_confidence": conf}
-    (out_dir / "difix_augment.json").write_text(json.dumps(meta, indent=2, default=str))
-
-    profile = SceneProfile.load(args.profile) if getattr(args, "profile", None) else SceneProfile.from_env()
-    if profile is not None:
-        profile.append("difix.rounds", stats, "difix.augment")
-        profile.set("difix.camera_spread_deg", round(spread, 3), "difix.augment")
-        profile.save()
+    (out_dir / "difix_augment.json").write_text(json.dumps(meta, indent=2))
     logger.info(f"Wrote {len(pseudo_entries)} pseudo views to {out_dir} (before|after in {debug_dir})")
     return out_dir
 
@@ -470,10 +373,8 @@ def main():
     ap.add_argument("--num_views", type=int, default=24)
     ap.add_argument("--max_angle", type=float, default=20.0, help="Max orbit angle (deg) from a real camera")
     ap.add_argument("--pseudo_weight", type=float, default=0.5, help="Base loss weight of pseudo views")
-    ap.add_argument("--min_conf", type=float, default=None,
-                    help="Confidence mapped to the weight floor (default: min(P5, median/2) of ACE confidences)")
-    ap.add_argument("--weight_floor", type=float, default=None,
-                    help="Minimum weight for registered frames (default: P5/median clipped to [0.1, 0.5])")
+    ap.add_argument("--min_conf", type=float, default=1000.0, help="ACE-Zero registration threshold")
+    ap.add_argument("--weight_floor", type=float, default=0.2, help="Minimum weight for registered frames")
     ap.add_argument("--test_every", type=int, default=8, help="Must match the trainer's test_every")
     ap.add_argument("--pose_rel_scale", type=float, default=0.1,
                     help="Pose correction (fraction of camera spacing) that maps to weight exp(-1)")
@@ -483,9 +384,6 @@ def main():
     ap.add_argument("--model_id", default="nvidia/difix_ref",
                     help="nvidia/difix_ref (conditions on the source photo, less hallucination) or nvidia/difix")
     ap.add_argument("--no_difix", action="store_true", help="Use raw renders (ablation)")
-    ap.add_argument("--loop", type=int, default=None, help="Feedback-loop index recorded with the round stats")
-    ap.add_argument("--profile", default=None,
-                    help="scene_profile.json to append difix.rounds to (default: $HYPERSPLAT_PROFILE)")
     run(ap.parse_args())
 
 

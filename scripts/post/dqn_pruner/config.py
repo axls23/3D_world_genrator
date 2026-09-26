@@ -12,14 +12,25 @@ class PrunerConfig:
     DENSITY_K: int = 16          # Number of neighbors for KNN
     DENSITY_RADIUS: float = 0.1  # Radius for density calculation
     
-    # Heuristic Thresholds (Tunable)
+    # Heuristic Thresholds (Tunable). Absolute fallbacks, used only when the matching
+    # *_PCT below is None; otherwise thresholds come from the model's own distribution
+    # (mean kNN distance is in scene units and opacity logits drift with training, so a
+    # fixed value prunes very different fractions on different scenes).
     PRUNE_OPACITY_THR: float = -2.0  # Loggit opacity threshold (approx 0.1 after sigmoid)
     PRUNE_ISOLATION_THR: float = 0.5 # Mean neighbor distance threshold
+    HEURISTIC_OPACITY_PCT: Optional[float] = 10.0    # ghost: opacity below this percentile...
+    HEURISTIC_GHOST_ISOLATION_PCT: Optional[float] = 90.0  # ...and isolation above this one
+    HEURISTIC_ISOLATION_PCT: Optional[float] = 99.0  # floater: isolation above this percentile
+
+    # Context-aware pruning budget and safety gates (percentiles of the model itself)
+    PRUNE_BUDGET_FRAC: float = 0.03       # prune at most this fraction (top scores only)
+    PRUNE_PROTECT_OPACITY_PCT: float = 50.0  # never prune opacity above this percentile
+    PRUNE_MIN_ISOLATION_PCT: float = 75.0    # only prune isolation above this percentile
     
     # Context-Aware Thresholds
-    PRUNE_SCALE_RATIO_THR: float = 5.0    # Prune if max_scale/min_scale > this (elongated splats)
-    PRUNE_SCALE_OUTLIER_THR: float = 3.0  # Prune if scale > mean + this * std (giant splats)
-    PRUNE_COLOR_OUTLIER_THR: float = 2.5  # Prune if color distance > this * std (weird colors)
+    PRUNE_SCALE_RATIO_THR: float = 5.0    # Needle score saturates at max/mid scale ratio 1 + this
+    PRUNE_SCALE_OUTLIER_THR: float = 3.0  # Giant: log(max scale / local spacing) > median + this * robust std
+    PRUNE_COLOR_OUTLIER_THR: float = 2.5  # Colour vs kNN neighbours > this * robust std
     PRUNE_DEPTH_OUTLIER_THR: float = 2.0  # Prune if depth from center > this * std (behind scene)
     
     # Neighborhood coherence

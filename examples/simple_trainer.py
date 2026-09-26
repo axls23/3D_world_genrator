@@ -32,6 +32,12 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from trainer_schedule import (
+    PlateauDetector,
+    early_stop_defaults,
+    floater_prune_mask,
+    resolve_trainer_schedule,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -121,6 +127,11 @@ class Config:
     save_object_ply: bool = False # Save only the masked object
     run_pruner: bool = False  # Run DQN post-process pruner on the object PLY
     dqn_pruning: bool = True  # Enable online DQN-style floater elimination during training
+    # Floater pruning starts after / runs every N steps (None: schedule-relative, 2000 / 400 @ 30k)
+    floater_prune_start: Optional[int] = None
+    floater_prune_every: Optional[int] = None
+    # Max fraction of Gaussians killed per floater-pruning pass
+    floater_max_frac: float = 0.02
     mask_dir: str = "masks"   # Directory name for masks
 
     # Steps to save the model as ply
@@ -136,8 +147,8 @@ class Config:
     init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
-    # Turn on another SH degree every this steps
-    sh_degree_interval: int = 1000
+    # Turn on another SH degree every this steps (None: schedule-relative, 1000 @ 30k steps)
+    sh_degree_interval: Optional[int] = None
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -221,10 +232,19 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
-    # Warm-up: no depth loss before this step (let Gaussians settle first)
-    depth_warmup_steps: int = 100
-    # Ramp: linearly increase depth_lambda from 0 to target over this many steps
-    depth_ramp_steps: int = 500
+    # Warm-up: no depth loss before this step (None: schedule-relative, 100 @ 30k steps)
+    depth_warmup_steps: Optional[int] = None
+    # Ramp: linearly increase depth_lambda over this many steps (None: schedule-relative, 500 @ 30k)
+    depth_ramp_steps: Optional[int] = None
+
+    # Early stopping on a plateau of the (EMA-smoothed) training loss
+    early_stopping: bool = False
+    # Stop after this many steps without relative improvement (None: ~7% of max_steps)
+    early_stop_patience: Optional[int] = None
+    # Minimum relative EMA-loss improvement that resets patience
+    early_stop_min_delta: float = 1e-3
+    # Never stop before this step (None: ~30% of max_steps)
+    early_stop_min_steps: Optional[int] = None
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -250,7 +270,8 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
-        self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        if self.sh_degree_interval is not None:
+            self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -264,6 +285,41 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+    def resolve_schedule(self, refine_stop_explicit: bool = False):
+        """Fill schedule-relative step constants from max_steps (explicit values win)."""
+        sched = resolve_trainer_schedule(self.max_steps)
+        if self.sh_degree_interval is None:
+            self.sh_degree_interval = sched.sh_degree_interval
+        if self.depth_warmup_steps is None:
+            self.depth_warmup_steps = sched.depth_warmup_steps
+        if self.depth_ramp_steps is None:
+            self.depth_ramp_steps = sched.depth_ramp_steps
+        if self.floater_prune_start is None:
+            self.floater_prune_start = sched.floater_start
+        if self.floater_prune_every is None:
+            self.floater_prune_every = sched.floater_every
+        if isinstance(self.strategy, MCMCStrategy) and not refine_stop_explicit:
+            # MCMC's 25k default outlives short pipeline runs (relocation until the last step)
+            self.strategy.refine_stop_iter = sched.refine_stop_iter
+        self.early_stop_patience, self.early_stop_min_steps = early_stop_defaults(
+            self.max_steps, self.early_stop_patience, self.early_stop_min_steps
+        )
+        print(
+            f"[Schedule] max_steps={self.max_steps} sh_degree_interval={self.sh_degree_interval} "
+            f"depth_warmup/ramp={self.depth_warmup_steps}/{self.depth_ramp_steps} "
+            f"floater_prune start/every={self.floater_prune_start}/{self.floater_prune_every} "
+            f"refine_stop_iter={getattr(self.strategy, 'refine_stop_iter', None)}"
+        )
+        print(
+            f"[Schedule] early_stopping={self.early_stopping} patience={self.early_stop_patience} "
+            f"min_delta={self.early_stop_min_delta} min_steps={self.early_stop_min_steps}"
+        )
+
+
+def _flag_given(argv: List[str], *names: str) -> bool:
+    """True if any of the CLI flags ``names`` appears in argv (``--x v`` or ``--x=v``)."""
+    return any(a == n or a.startswith(n + "=") for a in argv for n in names)
 
 
 def create_splats_with_optimizers(
@@ -303,11 +359,12 @@ def create_splats_with_optimizers(
         pcd = o3d.io.read_point_cloud(init_ply_path)
         points = torch.tensor(np.asarray(pcd.points)).float()
         rgbs = torch.tensor(np.asarray(pcd.colors)).float()
-        # Ensure we don't have too many points if memory is tight, though current GPUs can handle millions.
-        # But for 'simple_trainer', let's be safe.
-        if points.shape[0] > 500_000:
+        # Ensure we don't have too many points if memory is tight; with MCMC the
+        # (smaller) strategy cap applies so the cloud never starts above cap_max.
+        ext_cap = min(500_000, max_init_pts) if max_init_pts is not None else 500_000
+        if points.shape[0] > ext_cap:
              # Random subsample
-             indices = torch.randperm(points.shape[0])[:500_000]
+             indices = torch.randperm(points.shape[0])[:ext_cap]
              points = points[indices]
              rgbs = rgbs[indices]
     else:
@@ -429,6 +486,8 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.sh_degree_interval is None:  # not resolved by the CLI entry point
+            cfg.resolve_schedule()
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -1151,6 +1210,19 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+        # Early stopping: plateau of the EMA training loss. Disabled for streaming/GeNVS
+        # (data changes mid-run) and multi-GPU (ranks would have to agree on the stop step).
+        plateau = None
+        if cfg.early_stopping:
+            if cfg.streaming or cfg.genvs_ckpt or world_size > 1:
+                print("[EarlyStop] Disabled (streaming / GeNVS / distributed run)")
+            else:
+                plateau = PlateauDetector(
+                    patience=cfg.early_stop_patience,
+                    min_delta=cfg.early_stop_min_delta,
+                    min_steps=cfg.early_stop_min_steps,
+                )
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -1389,7 +1461,11 @@ class Runner:
                 l1loss = l1loss.mean()
              
             # ONLINE FLOATER ELIMINATION (DQN-style Heuristic)
-            if cfg.dqn_pruning and step > 2000 and step % 400 == 0:
+            if (
+                cfg.dqn_pruning
+                and step > cfg.floater_prune_start
+                and step % cfg.floater_prune_every == 0
+            ):
                  self.eliminate_floaters(verbose=True)
 
 
@@ -1446,7 +1522,8 @@ class Runner:
                 [p for p in self.splats.values()], max_norm=0.1
             )
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            loss_val = loss.item()
+            desc = f"loss={loss_val:.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1454,6 +1531,15 @@ class Runner:
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
+
+            # Early stop: this step becomes the final one (ckpt/ply/eval saved below as at max_steps)
+            stop_now = plateau is not None and step < max_steps - 1 and plateau.update(step, loss_val)
+            if stop_now:
+                print(
+                    f"\n[EarlyStop] Loss plateau at step {step}: EMA {plateau.ema:.5f}, no "
+                    f"{cfg.early_stop_min_delta:.2%} improvement since step {plateau.best_step}"
+                )
+            is_final_step = step == max_steps - 1 or stop_now
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -1482,7 +1568,7 @@ class Runner:
                 self.writer.flush()
 
             # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+            if step in [i - 1 for i in cfg.save_steps] or is_final_step:
                 try:
                     mem_alloc = torch.cuda.memory_allocated() / 1024**3
                     mem_max = torch.cuda.max_memory_allocated() / 1024**3
@@ -1525,7 +1611,7 @@ class Runner:
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
             if (
-                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
+                step in [i - 1 for i in cfg.ply_steps] or is_final_step
             ) and cfg.save_ply:
 
                 if self.cfg.app_opt:
@@ -1693,13 +1779,14 @@ class Runner:
                 )
                 trainloader_iter = iter(trainloader)
 
-            # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            # eval the full set; always on the final step (early stop, or eval_steps past max_steps)
+            is_eval_step = step in [i - 1 for i in cfg.eval_steps] or is_final_step
+            if is_eval_step:
                 self.eval(step)
                 self.render_traj(step)
 
             # run compression
-            if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
+            if cfg.compression is not None and is_eval_step:
                 self.run_compression(step=step)
 
             if not cfg.disable_viewer:
@@ -1714,6 +1801,9 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+            if stop_now:
+                break
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -2088,95 +2178,51 @@ class Runner:
     def eliminate_floaters(self, verbose=False):
         """
         Online Floater Elimination (Context-Aware Heuristic).
-        Identifies and kills Gaussians that are:
+        Identifies and kills Gaussians that are, relative to the model's own
+        distributions (percentile scores, see trainer_schedule.floater_prune_mask):
         1. Isolated (High KNN distance)
         2. Low opacity (Ghosting)
         3. Giant/Elongated (Scale artifacts)
+        At most cfg.floater_max_frac of the Gaussians are killed per call.
         """
         with torch.no_grad():
             means = self.splats["means"].detach()
             opacities = torch.sigmoid(self.splats["opacities"].detach())
-            scales = torch.exp(self.splats["scales"].detach())
             N = len(means)
             device = self.device
-            
-            # --- 1. Isolation (KNN) ---
+
+            # --- Isolation (KNN) ---
             # Compute on CPU using sklearn to act as a memory safeguard
+            iso = None
             try:
                 from sklearn.neighbors import NearestNeighbors
                 means_np = means.cpu().numpy()
-                # K=5 neighbors
-                nbrs = NearestNeighbors(n_neighbors=6, algorithm='auto', n_jobs=-1).fit(means_np)
+                # K=5 neighbors (+ self)
+                nbrs = NearestNeighbors(n_neighbors=min(6, N), algorithm='auto', n_jobs=-1).fit(means_np)
                 distances, _ = nbrs.kneighbors(means_np)
                 # Mean distance to 5 neighbors (excluding self at index 0)
                 iso = torch.tensor(distances[:, 1:].mean(axis=1), device=device, dtype=torch.float32)
-                
-                # Normalize isolation score robustly
-                iso_mean = iso.mean()
-                iso_std = iso.std() + 1e-6
-                iso_score = torch.clamp((iso - iso_mean) / (3 * iso_std), 0, 1)
             except ImportError:
                 if verbose: print("[Warning] sklearn not found, skipping isolation check.")
-                iso_score = torch.zeros(N, device=device)
             except Exception as e:
                 # Fallback if too large for CPU memory or other error
                 if verbose: print(f"[Warning] Isolation check failed: {e}")
-                iso_score = torch.zeros(N, device=device)
 
-            # --- 2. Opacity Score ---
-            # Low opacity = higher score (bad)
-            opacity_score = 1.0 - opacities.squeeze(-1)
-            
-            # --- 3. Scale Anomaly ---
-            # Max scale / Min scale ratio (Elongation)
-            scale_max = scales.max(dim=1).values
-            scale_min = scales.min(dim=1).values + 1e-6
-            elongation = scale_max / scale_min
-            elongation_score = torch.clamp((elongation - 1) / 50.0, 0, 1) # Threshold ~50
-            
-            # Size outlier
-            scale_mag = scales.abs().max(dim=1).values
-            scale_mean = scale_mag.mean()
-            scale_std = scale_mag.std() + 1e-6
-            size_outlier = (scale_mag - scale_mean) / scale_std
-            size_score = torch.clamp(size_outlier / 10.0, 0, 1) # >10 sigma is huge
-            
-            # --- Combined Decision ---
-            # We are harsher on isolated points
-            floater_prob = (
-                0.4 * iso_score + 
-                0.3 * opacity_score + 
-                0.15 * elongation_score + 
-                0.15 * size_score
+            # scales are log-scales; the mask helper works in log space
+            to_prune = floater_prune_mask(
+                iso,
+                opacities.reshape(-1),
+                self.splats["scales"].detach(),
+                max_frac=self.cfg.floater_max_frac,
             )
-            
-            # Threshold
-            # Prune if score > 0.6
-            to_prune = floater_prob > 0.6
-            
-            # ALSO: Hard rules
-            # 1. Extremely isolated (sky floaters)
-            to_prune |= (iso_score > 0.8)
-            # 2. Giant spikes
-            to_prune |= (size_score > 0.8)
-            
+
             n_prune = to_prune.sum().item()
             if n_prune > 0:
                 if verbose:
                     print(f"[FloaterEliminator] Pruning {n_prune} / {N} Gaussians ({100*n_prune/N:.2f}%)")
-                
-                # Apply: Set opacity to -inf (sigmoid -> 0)
-                # self.splats["opacities"][to_prune] = -100.0  # Soft kill?
-                # Actually, MCMC strategy handles pruning based on opacity.
-                # If we set opacity very low, the strategy logic will likely split or prune it later.
-                # But to force removal, we can verify if we can reset opacity directly.
-                # The optimizer tracks "opacities".
-                
-                # We modify the parameter tensor in-place
-                # Invert sigmoid: logit(0) = -inf. -10.0 is approx 4e-5.
-                with torch.no_grad():
-                     self.splats["opacities"].data[to_prune] = -100.0
-
+                # Kill via opacity (sigmoid(-100) ~ 0); MCMC relocates dead Gaussians
+                # while refinement is active, afterwards they simply stay invisible.
+                self.splats["opacities"].data[to_prune] = -100.0
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
@@ -2261,6 +2307,11 @@ if __name__ == "__main__":
     }
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
+    cfg.resolve_schedule(
+        refine_stop_explicit=_flag_given(
+            sys.argv, "--strategy.refine-stop-iter", "--strategy.refine_stop_iter"
+        )
+    )
 
     # Import BilateralGrid and related functions based on configuration
     if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:

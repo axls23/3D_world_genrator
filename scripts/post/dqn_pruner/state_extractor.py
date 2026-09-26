@@ -48,26 +48,35 @@ class StateExtractor:
             'plydata': plydata # Keep original for saving
         }
 
-    def compute_density(self, positions):
+    def knn(self, positions, k=None):
+        """(distances, indices) of the K nearest neighbours of every point, self excluded.
+
+        K = DENSITY_K, clamped to N-1 so tiny clouds work. Uses CPU sklearn to avoid GPU
+        OOM on large clouds. Returns numpy arrays of shape (N, K).
+        """
+        from sklearn.neighbors import NearestNeighbors
+
+        pos_np = positions.detach().cpu().numpy()
+        N = pos_np.shape[0]
+        K = min(int(k or self.config.DENSITY_K), max(N - 1, 1))
+        nbrs = NearestNeighbors(n_neighbors=min(K + 1, N), algorithm='auto', n_jobs=-1).fit(pos_np)
+        distances, indices = nbrs.kneighbors(pos_np)
+        # Exclude self (index 0)
+        return distances[:, 1:], indices[:, 1:]
+
+    def compute_density(self, positions, return_indices=False):
         """
         Compute isolation score based on K nearest neighbors.
-        Returns: (N, 1) tensor of mean distance to K neighbors
+        Returns: (N, 1) tensor of mean distance to K neighbors (scene units; consumers that
+        threshold it should use percentiles of this distribution, not absolute values),
+        plus the (N, K) neighbour indices when return_indices=True.
         """
-        # Uses CPU with sklearn to avoid GPU OOM on large clouds
-        from sklearn.neighbors import NearestNeighbors
-        
-        pos_np = positions.cpu().numpy()
-        N = pos_np.shape[0]
-        K = self.config.DENSITY_K
-        
-        # Fit NN
-        nbrs = NearestNeighbors(n_neighbors=K+1, algorithm='auto', n_jobs=-1).fit(pos_np)
-        distances, _ = nbrs.kneighbors(pos_np)
-        
-        # Exclude self (index 0)
-        mean_dist = distances[:, 1:].mean(axis=1)
-        
-        return torch.tensor(mean_dist.astype(np.float32)).unsqueeze(1)
+        distances, indices = self.knn(positions)
+        mean_dist = distances.mean(axis=1) if distances.shape[1] else np.zeros(len(distances))
+        iso = torch.tensor(mean_dist.astype(np.float32)).unsqueeze(1)
+        if return_indices:
+            return iso, torch.from_numpy(indices.astype(np.int64))
+        return iso
 
     def extract_features(self, data):
         """
@@ -80,7 +89,10 @@ class StateExtractor:
         
         # 1. Density / Isolation
         print(f"Computing density for {pos.shape[0]} points...")
-        isolation = self.compute_density(pos).to(self.device)
+        isolation, knn_idx = self.compute_density(pos, return_indices=True)
+        isolation = isolation.to(self.device)
+        # Cache the neighbourhood for context-aware agents (colour vs neighbours etc.)
+        data['knn_idx'] = knn_idx
         
         # Move others to device
         ops = ops.to(self.device)
