@@ -21,5 +21,5 @@ services:
     volumes:
       # Mount the whole project root to /workspace for zero-copy data flow
       - ../../:/workspace
-      # Mount user's Downloads folder for input videos
-      - C:/Users/sxhil_25660/Downloads:/workspace/downloads:ro
+      # Mount user's Downloads folder for input videos (override via ACEZERO_DOWNLOADS_DIR)
+      - ${ACEZERO_DOWNLOADS_DIR:-./downloads}:/workspace/downloads:ro
