@@ -45,6 +45,7 @@ from typing import List, Optional, Dict, Set
 from pydantic import BaseModel
 
 from hypersplat.pipeline import log_parsing
+from hypersplat.pipeline.wrapper import build_pipeline_args, validate_pipeline_config
 
 # Suppress noisy /api/status polling logs
 import logging
@@ -120,6 +121,22 @@ def get_python_executable() -> str:
             return candidate
 
     return sys.executable or "python"
+
+
+def build_pipeline_command(video_path: str, config: dict, output_dir: Path = OUTPUT_DIR) -> List[str]:
+    """Build the manager command for a job config (without --skip-ace).
+
+    Flags come from the shared builder in hypersplat.pipeline.wrapper, which
+    only emits values the client actually sent (not None); everything else
+    reaches the manager as "auto".
+    """
+    pipeline_script = SCRIPTS_DIR / "automated_intelligent_pipeline.py"
+    return [
+        get_python_executable(), "-u", str(pipeline_script),
+        video_path,
+        "--output_dir", str(output_dir),
+        *build_pipeline_args(config),
+    ]
 
 
 class AppState:
@@ -230,68 +247,7 @@ class AppState:
         video_path = job["video_path"]
         config = job["config"]
         
-        pipeline_script = SCRIPTS_DIR / "automated_intelligent_pipeline.py"
-        
-        cmd = [
-            get_python_executable(), "-u", str(pipeline_script),
-            video_path,
-            "--output_dir", str(OUTPUT_DIR),
-            "--fps", str(config.get("fps", 2.0)),
-            "--max_steps", str(config.get("max_steps", 7000)),
-            "--data_factor", str(config.get("data_factor", 2)),
-        ]
-        
-        if config.get("with_ut"):
-            cmd.append("--with_ut")
-        if config.get("with_eval3d"):
-            cmd.append("--with_eval3d")
-            
-        if config.get("use_zero123") or config.get("genvs"):
-            cmd.append("--genvs")
-            num_views = config.get("genvs_views", 20)
-            cmd.extend(["--genvs-views", str(num_views)])
-            
-        if not config.get("prune", True):
-            cmd.append("--no-prune")
-            
-        if config.get("unified_stream") or config.get("streaming"):
-            cmd.append("--streaming")
-            
-        quality_mode = config.get("quality_mode", "balanced")
-        cmd.extend(["--quality-mode", quality_mode])
-        
-        min_conf = config.get("min_registration_confidence", 1000)
-        cmd.extend(["--min-registration-confidence", str(min_conf)])
-        
-        depth_model = config.get("depth_model", "depth_anything")
-        cmd.extend(["--depth-model", depth_model])
-
-        if "sh_degree" in config:
-            cmd.extend(["--sh_degree", str(config["sh_degree"])])
-        if "means_lr" in config:
-            cmd.extend(["--means_lr", str(config["means_lr"])])
-        if "opacity_reg" in config:
-            cmd.extend(["--opacity_reg", str(config["opacity_reg"])])
-        if "scale_reg" in config:
-            cmd.extend(["--scale_reg", str(config["scale_reg"])])
-        if "ssim_lambda" in config:
-            cmd.extend(["--ssim_lambda", str(config["ssim_lambda"])])
-        if config.get("random_bkgd"):
-            cmd.append("--random_bkgd")
-        if config.get("pose_opt", True):
-            cmd.append("--pose-opt")
-        else:
-            cmd.append("--no-pose-opt")
-        if config.get("app_opt"):
-            cmd.append("--app_opt")
-            
-        if config.get("early_stopping", True):
-            cmd.append("--early-stopping")
-            cmd.extend(["--early-stop-patience", str(config.get("early_stop_patience", 500))])
-            cmd.extend(["--early-stop-min-delta", str(config.get("early_stop_min_delta", 0.001))])
-            cmd.extend(["--early-stop-min-steps", str(config.get("early_stop_min_steps", 2000))])
-        else:
-            cmd.append("--no-early-stopping")
+        cmd = build_pipeline_command(video_path, config)
 
         # Skip ACE-Zero pose estimation if requested by the user, or if auto-detected and not explicitly overridden
         skip_ace_requested = config.get("skip_ace")
@@ -525,29 +481,40 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 class TrainRequest(BaseModel):
-    """Training request parameters"""
+    """Training request parameters.
+
+    Numeric/tunable fields default to None = "auto": the field is not passed
+    to the manager, which derives it per scene. Send a value to pin it.
+    """
     video_path: Optional[str] = None
     mode: str = "ace_zero"  # ace_zero, simple, chunked
-    max_steps: int = 7000
-    data_factor: int = 2
-    fps: float = 1.5
+    max_steps: Optional[int] = None
+    data_factor: Optional[int] = None
+    fps: Optional[float] = None
     with_ut: bool = False
     with_eval3d: bool = False
-    early_stopping: bool = True
+    early_stopping: Optional[bool] = None
+    early_stop_patience: Optional[int] = None
+    early_stop_min_delta: Optional[float] = None
+    early_stop_min_steps: Optional[int] = None
     use_zero123: bool = False
-    quality_mode: str = "balanced"
-    min_registration_confidence: int = 1000
-    depth_model: str = "depth_anything"
+    genvs_views: Optional[int] = None
+    quality_mode: Optional[str] = None
+    min_registration_confidence: Optional[int] = None
+    depth_model: Optional[str] = None
     skip_ace: Optional[bool] = None
-    
+    colmap_input: Optional[str] = None
+
     # Advanced Hyperparameters
-    sh_degree: int = 3
-    means_lr: float = 0.00016
-    opacity_reg: float = 0.0
-    scale_reg: float = 0.0
-    ssim_lambda: float = 0.2
+    sh_degree: Optional[int] = None
+    means_lr: Optional[float] = None
+    opacity_reg: Optional[float] = None
+    scale_reg: Optional[float] = None
+    ssim_lambda: Optional[float] = None
+    init_scale: Optional[float] = None
+    cap_max: Optional[int] = None
     random_bkgd: bool = False
-    pose_opt: bool = True
+    pose_opt: Optional[bool] = None
     app_opt: bool = False
 
 
@@ -572,6 +539,10 @@ async def submit_job(request: TrainRequest = TrainRequest()):
         )
         
     config = request.dict()
+    try:
+        validate_pipeline_config(config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     job_id = state.enqueue_job(video_path, config)
     
     # Broadcast queue update to all global WebSocket clients
