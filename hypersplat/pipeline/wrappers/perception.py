@@ -312,10 +312,15 @@ class ACEZeroPoseEstimator:
         
         return (len(self.poses), 0, None)
         
-    def process_video(self, video_path: str, fps: float = 2.0, streaming: bool = False) -> bool:
-        """Run the full ACE-Zero pipeline: Frames -> Poses -> COLMAP Format"""
+    def process_video(self, video_path: str, fps: Optional[float] = None, streaming: bool = False) -> bool:
+        """Run the full ACE-Zero pipeline: Frames -> Poses -> COLMAP Format
+
+        fps=None derives the extraction rate from the clip (target frame count x motion).
+        """
         try:
             self._setup_directories()
+            if fps is None:
+                fps = self._auto_fps(video_path)
             self.fps = fps  # Store for parameter calculation
             
             # 0. Analyze video for adaptive parameters
@@ -595,6 +600,16 @@ print('Done! VRAM freed for ACE training.')
             
         return subprocess.CompletedProcess(result.args, result.returncode, stdout=result.stdout if capture_output else "", stderr=result.stderr if capture_output else "")
 
+    def _auto_fps(self, video_path: str) -> float:
+        """FPS from the running pipeline's SceneProfile, or a fresh probe of the video."""
+        from hypersplat.pipeline.params import SceneProfile, resolve, signals
+        from hypersplat.pipeline.params.strategies import extraction
+        profile = SceneProfile.from_env() or SceneProfile()
+        if profile.get("video.duration") is None:
+            for k, v in (signals.probe_video(Path(video_path)) or {}).items():
+                profile.set(f"video.{k}", v, "probe_video")
+        return resolve("FPS", None, lambda: extraction.derive(profile, None), 2.0, profile)
+
     def extract_frames(self, video_path: str, fps: float = 2.0) -> int:
         video_path = Path(video_path)
         if not video_path.exists(): raise FileNotFoundError(f"Video not found: {video_path}")
@@ -627,8 +642,12 @@ print('Done! VRAM freed for ACE training.')
         self.images_dir.mkdir(parents=True, exist_ok=True)
         
         output_pattern = str(self.images_dir / "frame_%05d.jpg")
-        # Scale to max 640 width for optimization (ACE-Zero works well at low res)
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vf", f"fps={fps},scale='min(640,iw)':-1", "-q:v", "2", output_pattern]
+        # Keep source detail up to a VRAM-derived long-side budget (never upscale; ACE-Zero
+        # resizes internally and the trainer's data_factor sets training resolution)
+        from hypersplat.pipeline.params import SceneProfile
+        from hypersplat.pipeline.params.strategies import extraction
+        long_side = extraction.max_long_side(SceneProfile.from_env())
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vf", f"fps={fps},{extraction.scale_filter(long_side)}", "-q:v", "2", output_pattern]
         
         logger.info(f"Extracting frames at {fps} FPS...")
         if subprocess.run(cmd).returncode != 0: raise RuntimeError("FFmpeg extraction failed")
