@@ -164,7 +164,7 @@ def generate_gap_filling_poses(existing_c2ws, num_new=10):
 
 def main():
     parser = argparse.ArgumentParser(description="Render images from a trained 3DGS checkpoint")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to 3DGS checkpoint (.pt)")
+    parser.add_argument("--ckpt", "--checkpoint", dest="ckpt", type=str, required=True, help="Path to 3DGS checkpoint (.pt)")
     parser.add_argument("--data_dir", type=str, required=True, help="Original COLMAP dataset directory")
     parser.add_argument("--output_dir", type=str, required=True, help="Where to save rendered images")
     parser.add_argument("--num_views", type=int, default=10, help="Number of novel views to render")

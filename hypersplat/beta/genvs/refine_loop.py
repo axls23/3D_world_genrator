@@ -173,7 +173,7 @@ def main():
             
             inf_cmd = (
                 f'"{sys.executable}" hypersplat/beta/genvs/inference.py '
-                f'--checkpoint "{genvs_ckpt}" '
+                f'--ckpt "{genvs_ckpt}" '
                 f'--data_dir "{current_dataset}" '
                 f'--num_views {args.genvs_gen_views} '
                 f'--output_dir "{gen_out}"'

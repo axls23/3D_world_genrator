@@ -99,7 +99,7 @@ def generate_trajectory(poses, num_views=20):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pt)")
+    parser.add_argument("--checkpoint", "--ckpt", dest="checkpoint", type=str, required=True, help="Path to checkpoint (.pt)")
     parser.add_argument("--data_dir", type=str, required=True, help="ACE output directory")
     parser.add_argument("--num_views", type=int, default=10, help="Number of new views to generate")
     parser.add_argument("--output_dir", type=str, default="results/genvs_refined")
