@@ -182,6 +182,11 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
         return _view_item(self._table, i, 0, self.session)
 
     def __iter__(self):
+        if self.prefetch <= 0:
+            # Inline draws (deterministic runs): each view is drawn after the previous step's
+            # loss report and against that step's snapshot, not ahead of it on a thread
+            while True:
+                yield self.sample()
         # JPEG decode (~5 ms at 960 px, libjpeg releases the GIL) runs on a prefetch thread,
         # overlapped with the GPU step instead of adding to it
         q: "queue.Queue[Dict]" = queue.Queue(maxsize=self.prefetch)

@@ -121,6 +121,14 @@ class Config:
     batch_size: int = 1
     # Data Loader Workers
     data_loader_workers: int = 4
+    # Random seed (torch / numpy / random; per rank)
+    seed: int = 42
+    # Reproducible runs: deterministic torch/cuDNN/cuBLAS kernels, the stream sampler draws
+    # inline instead of on a prefetch thread, and a file source is fully localized before
+    # step 0, so seeds, depth maps and new views arrive at the same steps in every run (live
+    # sources cannot be pinned). Remaining spread: float atomics in the rasterizer backward
+    # and the ACE sidecar's RANSAC.
+    deterministic: bool = False
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
@@ -478,6 +486,14 @@ class Config:
         )
 
 
+def enable_determinism():
+    """Deterministic torch kernels where they exist (warn, not fail, where they do not)."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def _flag_given(argv: List[str], *names: str) -> bool:
     """True if any of the CLI flags ``names`` appears in argv (``--x v`` or ``--x=v``)."""
     return any(a == n or a.startswith(n + "=") for a in argv for n in names)
@@ -644,7 +660,9 @@ class Runner:
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
-        set_random_seed(42 + local_rank)
+        set_random_seed(cfg.seed + local_rank)
+        if cfg.deterministic:
+            enable_determinism()
 
         self.cfg = cfg
         if cfg.sh_degree_interval is None:  # not resolved by the CLI entry point
@@ -966,9 +984,12 @@ class Runner:
             if self.dashboard is not None:
                 self.dashboard.stop()
             raise RuntimeError(f"[Stream] No ACE map: {reason}")
+        if cfg.deterministic:
+            self._wait_stream_settled()
         self.parser = StreamParser(self.stream, cfg.result_dir)
-        self.trainset = StreamTrainSet(self.stream, seed=42, hard_mix=cfg.stream_hard_view_mix,
-                                       hard_power=cfg.stream_hard_view_power)
+        self.trainset = StreamTrainSet(self.stream, seed=cfg.seed, hard_mix=cfg.stream_hard_view_mix,
+                                       hard_power=cfg.stream_hard_view_power,
+                                       prefetch=0 if cfg.deterministic else 2)
         self.valset = StreamValSet(self.stream)
         self.stream_voxel = seed_voxel_size(self.parser.points, self.parser.scene_scale)
         self.stream_horizon = StreamHorizon(cfg.max_steps, getattr(cfg.strategy, "refine_stop_iter", cfg.max_steps),
@@ -1064,6 +1085,22 @@ class Runner:
         if hasattr(cfg.strategy, "refine_stop_iter"):
             cfg.strategy.refine_stop_iter = h.refine_stop_iter
         return False
+
+    def _wait_stream_settled(self, timeout: float = 600.0):
+        """Deterministic runs: let a file source finish localizing before step 0, so every
+        keyframe, seed and depth job exists from the start instead of arriving at a step
+        that depends on wall-clock timing. Live sources never finish: no wait."""
+        s = self.stream
+        if s.kind != "file":
+            print(f"[Stream] deterministic: {s.kind} source cannot be pinned; arrival steps vary")
+            return
+        t0, end = time.time(), time.time() + timeout
+        while not s.finished and not s.failed and time.time() < end:
+            if self.stream_stop_file.requested():
+                return
+            time.sleep(0.2)
+        print(f"[Stream] deterministic: waited {time.time() - t0:.1f} s for the source to be fully "
+              f"localized ({s.views_registered} views{'' if s.finished else ', timed out'})")
 
     def _maybe_settle(self, step: int):
         """Pull the end in once coverage has settled, so the LR anneals now (see
