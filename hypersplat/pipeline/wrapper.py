@@ -61,6 +61,7 @@ _VALUE_FLAGS = (
     ("stream_viewer_port", "--stream-viewer-port"),
     ("stream_dashboard_port", "--stream-dashboard-port"),
     ("stream_bootstrap_cooldown", "--stream-bootstrap-cooldown"),
+    ("stream_map_cache", "--stream-map-cache"),
     ("stream_record_seconds", "--stream-record-seconds"),
     ("stream_record_keyframes", "--stream-record-keyframes"),
     ("stream_target_psnr", "--stream-target-psnr"),

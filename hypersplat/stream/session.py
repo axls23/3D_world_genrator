@@ -28,6 +28,7 @@ Nothing is written outside the tmpfs work dir (ACE-res frames + the live ACE hea
 evicted keyframes are removed from it and from the sidecar immediately.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -86,6 +87,10 @@ class StreamConfig:
     # Dense depth (hypersplat/stream/depth.py): queue registered keyframes with their ACE
     # points for the trainer's depth worker, and keep the aligned maps (half res, fp16)
     depth: bool = False
+    # File sources: keep the bootstrap ACE map here and load it on later runs of the same
+    # capture instead of re-bootstrapping (A/B runs on one map; ~65-90 s saved per run).
+    # Separate bootstraps of one capture differed by 0.55 dB, more than any knob tested.
+    map_cache: Optional[str] = None
 
 
 def normalization_transform(c2ws: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -395,6 +400,26 @@ class StreamSession:
             values["cooldown_iterations"] = int(self.cfg.bootstrap_cooldown)
         return values
 
+    def _map_cache(self) -> Optional[Tuple[Path, Dict, bool]]:
+        """(cache dir, meta, usable) for a file source with stream map caching on, else None.
+        A cache made from a different file (path, size or mtime) is not usable."""
+        if not self.cfg.map_cache or self.kind != "file":
+            return None
+        cache = Path(self.cfg.map_cache)
+        try:
+            st = os.stat(self.cfg.source)
+            key = {"source": str(Path(self.cfg.source).resolve()), "size": st.st_size, "mtime": int(st.st_mtime)}
+        except OSError:
+            return None
+        meta = {}
+        try:
+            meta = json.loads((cache / "meta.json").read_text())
+        except (OSError, ValueError):
+            pass
+        usable = ((cache / "head.pt").exists() and (cache / "poses.txt").exists()
+                  and all(meta.get(k) == v for k, v in key.items()) and not getattr(self, "_cache_failed", False))
+        return cache, {**meta, **key}, usable
+
     def _start_bootstrap(self):
         frames = [kf.ace_path for kf in self.store.frames() if kf.ace_path][: self._bootstrap_target]
         self._bootstrap_attempted = len(frames)
@@ -403,11 +428,23 @@ class StreamSession:
         self.store.conf_threshold = float(self.ace_values["registration_confidence"])
         self._job = "bootstrap"
         self._job_t0 = time.time()
+        cached = self._map_cache()
+        if cached is not None and cached[2]:
+            cache, meta, _ = cached
+            logger.info(f"[Stream] Loading the cached ACE map {cache} for {len(frames)} keyframes")
+            self.sidecar.load(str(cache / "head.pt"), str(cache / "poses.txt"), frames,
+                              image_resolution=int(meta.get("image_resolution", self.cfg.ace_short_side)))
+            return
+        cache_dir = ""
+        if cached is not None:
+            cache_dir = str(cached[0])
+            cached[0].mkdir(parents=True, exist_ok=True)
+            (cached[0] / "meta.json").write_text(json.dumps({k: cached[1][k] for k in ("source", "size", "mtime")}))
         logger.info(f"[Stream] Bootstrapping ACE map from {len(frames)} keyframes "
                     f"(avg motion {self.gate.avg_motion or 0:.1f}, "
                     f"{self.ace_values['hybrid_train_iterations']} iterations, "
                     f"cooldown {self.ace_values['cooldown_iterations']})")
-        self.sidecar.bootstrap(frames, build_ace_args(self.ace_values, hybrid=True))
+        self.sidecar.bootstrap(frames, build_ace_args(self.ace_values, hybrid=True), cache_dir=cache_dir)
 
     def _maybe_refit(self, force: bool = False):
         """Caller holds _cond."""
@@ -516,7 +553,7 @@ class StreamSession:
         logger.info(f"[Stream] ACE map v{self.map_version} ({meta.get('reason')}, {meta.get('seconds')} s): "
                     f"{n_reg}/{len(self.store)} keyframes registered, focal {self.focal_file:.1f} px")
         with self._cond:
-            if meta.get("reason") == "bootstrap":
+            if meta.get("reason") in ("bootstrap", "load"):
                 self.stats_counters["bootstrap_s"] = meta.get("seconds")
             elif meta.get("reason") == "refit":
                 self.stats_counters["refits"] += 1
@@ -542,7 +579,11 @@ class StreamSession:
         cmd, msg = meta.get("cmd"), meta.get("msg")
         logger.warning(f"[Stream] ACE sidecar {cmd} error: {msg}")
         with self._cond:
-            if cmd == "bootstrap":
+            if cmd == "load":  # unusable cache: bootstrap from scratch (and rewrite the cache)
+                self._job = None
+                self._cache_failed = True
+                self._start_bootstrap()
+            elif cmd == "bootstrap":
                 self._job = None
                 self._bootstrap_target += self.cfg.bootstrap_retry_frames
                 if not self.source_ended:

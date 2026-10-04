@@ -295,6 +295,9 @@ class Config:
     # Cap on the first ACE map's LR cooldown (None: the ACE preset); shorter = map sooner,
     # background refits recover the accuracy
     stream_bootstrap_cooldown: Optional[int] = None
+    # File sources: cache the first ACE map in this directory and reuse it on later runs of
+    # the same file (StreamConfig.map_cache)
+    stream_map_cache: Optional[str] = None
     # Keyframe gate novelty threshold (mean abs gray difference, 0-255)
     stream_min_motion: float = 8.0
     # Steps between pulls of new seed points (new keyframes/poses are picked up every step)
@@ -921,6 +924,7 @@ class Runner:
             test_every=cfg.test_every, min_motion=cfg.stream_min_motion,
             bootstrap_frames=cfg.stream_bootstrap_frames, flight_port=cfg.stream_flight_port,
             bootstrap_cooldown=cfg.stream_bootstrap_cooldown,
+            map_cache=cfg.stream_map_cache,
             record_stop_file=os.path.join(cfg.result_dir, "STOP_RECORDING"),
             record_seconds=cfg.stream_record_seconds, record_keyframes=cfg.stream_record_keyframes,
             depth=cfg.stream_depth,
@@ -1897,6 +1901,13 @@ class Runner:
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
+        elif horizon is not None and self.view_adjust is not None and self.view_adjust.pose_optimizers:
+            # Per-keyframe stream pose deltas decay like batch pose_opt, against the moving end
+            schedulers.append(
+                torch.optim.lr_scheduler.LambdaLR(
+                    self.view_adjust.pose_optimizers[0], lambda s: horizon.lr_factor(s, 0.01)
                 )
             )
         if cfg.use_bilateral_grid:

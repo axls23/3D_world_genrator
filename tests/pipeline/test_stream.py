@@ -776,3 +776,26 @@ def test_sidecar_send_never_blocks_caller():
     for i in range(1000):  # far more than a 64 KB pipe holds; nothing drains it here
         sc.localize(f"/f/{i}.jpg")
     assert sc._outbox.qsize() == 1000
+
+
+def test_map_cache_is_keyed_to_the_capture_file(tmp_path):
+    import json as _json
+    import os as _os
+    from types import SimpleNamespace
+
+    from hypersplat.stream.session import StreamConfig, StreamSession
+
+    video = tmp_path / "cap.mp4"
+    video.write_bytes(b"x" * 10)
+    cache = tmp_path / "cache"
+    fake = SimpleNamespace(cfg=StreamConfig(source=str(video), map_cache=str(cache)), kind="file")
+    d, meta, usable = StreamSession._map_cache(fake)
+    assert d == cache and not usable  # nothing cached yet
+    cache.mkdir()
+    (cache / "head.pt").write_bytes(b"h")
+    (cache / "poses.txt").write_text("p")
+    (cache / "meta.json").write_text(_json.dumps({**meta, "image_resolution": 480}))
+    assert StreamSession._map_cache(fake)[2]
+    _os.utime(video, (1, 1))  # the capture changed: the cache no longer applies
+    assert not StreamSession._map_cache(fake)[2]
+    assert StreamSession._map_cache(SimpleNamespace(cfg=fake.cfg, kind="camera")) is None

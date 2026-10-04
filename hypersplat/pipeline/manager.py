@@ -206,6 +206,7 @@ class PipelineConfig:
         # Per-keyframe pose deltas / exposure for streams (the generic pose_opt is per-image)
         self.STREAM_POSE_OPT = getattr(args, 'stream_pose_opt', False)
         self.STREAM_BOOTSTRAP_COOLDOWN = getattr(args, 'stream_bootstrap_cooldown', None)
+        self.STREAM_MAP_CACHE = getattr(args, 'stream_map_cache', None)
         # Raw trainer overrides (KEY=VALUE -> --KEY VALUE), appended last so they win
         # (scripts/experiments/ab_test.py uses these to vary trainer hyperparameters)
         self.TRAINER_ARGS = list(getattr(args, 'trainer_arg', None) or [])
@@ -1058,6 +1059,10 @@ class IntelligentPipeline:
             self.config.TRAINING_EVAL_STEPS = [steps]
         if "TRAINING_SAVE_STEPS" not in self.config.USER_SET:
             self.config.TRAINING_SAVE_STEPS = [steps]
+        if "POSE_OPT_WARMUP" not in self.config.USER_SET:
+            # Same fraction as the batch budget (the fixed 1000 was half of a 2k run)
+            from hypersplat.pipeline.params.strategies.training_budget import WARMUP_FRACTION
+            self.config.POSE_OPT_WARMUP = int(steps * WARMUP_FRACTION / 10.0 + 0.5) * 10
         extra = ["--stream_source", source, "--stream_pace", self.config.STREAM_PACE,
                  "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB), "--ply_steps", str(steps),
                  "--stream_max_steps_cap", str(steps)]
@@ -1076,6 +1081,8 @@ class IntelligentPipeline:
             extra += ["--stream_pose_opt"]
         if self.config.STREAM_BOOTSTRAP_COOLDOWN:
             extra += ["--stream_bootstrap_cooldown", str(self.config.STREAM_BOOTSTRAP_COOLDOWN)]
+        if self.config.STREAM_MAP_CACHE and kind == "file":
+            extra += ["--stream_map_cache", str(self.config.STREAM_MAP_CACHE)]
         if self.config.STREAM_EXPOSURE_OPT:
             extra += ["--stream_exposure_opt"]
         if self.config.STREAM_TARGET_PSNR:
@@ -1622,6 +1629,9 @@ def main():
                              "repeatable, applied last so it overrides the pipeline's value")
     parser.add_argument("--stream-bootstrap-cooldown", dest="stream_bootstrap_cooldown", type=int, default=None,
                         help="Cap the first ACE map's cooldown iterations (sooner first map)")
+    parser.add_argument("--stream-map-cache", dest="stream_map_cache", default=None,
+                        help="File sources: keep the first ACE map in this directory and reuse it on "
+                             "later runs of the same file (A/B runs on one map, no bootstrap wait)")
     parser.add_argument("--stream-pose-opt", dest="stream_pose_opt", action="store_true",
                         help="Refine each keyframe's ACE pose during stream training")
     parser.add_argument("--stream-exposure-opt", dest="stream_exposure_opt", action="store_true",

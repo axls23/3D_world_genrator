@@ -233,6 +233,8 @@ class Sidecar:
             _, focal = self.read_pose_file(out / "poses_final.txt")
             if focal:
                 self.focal = focal
+            if params.get("cache_dir"):
+                self._save_cache(Path(params["cache_dir"]), out)
             self._publish_map(self.load_head(out / "hybrid_pass.pt"), out / "hybrid_pass.pt",
                               frames, "bootstrap", t0)
         except Exception as e:  # report and stay alive: the client retries with more frames
@@ -241,6 +243,19 @@ class Sidecar:
             shutil.rmtree(str(self.map_dir / "bootstrap"), ignore_errors=True)
         finally:
             shutil.rmtree(str(stage), ignore_errors=True)
+
+    def _save_cache(self, cache, out):
+        """Keep the bootstrap map (head, poses with focal, ACE resolution) for later runs on
+        the same capture: they ``load`` it instead of re-bootstrapping."""
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(out / "hybrid_pass.pt"), str(cache / "head.pt"))
+            shutil.copyfile(str(out / "poses_final.txt"), str(cache / "poses.txt"))
+            meta = json.loads((cache / "meta.json").read_text()) if (cache / "meta.json").exists() else {}
+            meta["image_resolution"] = self.image_resolution
+            (cache / "meta.json").write_text(json.dumps(meta))
+        except OSError as e:
+            _logger.warning(f"map cache not written: {e}")
 
     def load(self, frames, args, params):
         t0 = time.time()

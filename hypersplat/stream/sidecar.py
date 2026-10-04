@@ -108,8 +108,8 @@ class AceSidecar:
             raise RuntimeError(f"ACE sidecar exited with code {self.proc.returncode}")
         self._outbox.put(command_batch(cmd, frames, args, **params))
 
-    def bootstrap(self, frames: List[str], args: List[str], focal: float = -1.0):
-        self._send("bootstrap", frames, args, focal=focal)
+    def bootstrap(self, frames: List[str], args: List[str], focal: float = -1.0, cache_dir: str = ""):
+        self._send("bootstrap", frames, args, focal=focal, cache_dir=cache_dir)
 
     def localize(self, frame: str):
         self._send("localize", [frame])

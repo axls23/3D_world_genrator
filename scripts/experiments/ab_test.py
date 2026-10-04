@@ -22,6 +22,10 @@ Spec keys:
     random               optional {"n": 4, "seed": 0, "space": {"key": [v1, v2, ...]}}:
                          n extra variants sampled from the space
     keep_checkpoints     false (default) deletes ckpts/ after a run is scored (PLY is kept)
+    map_cache            true: every run of a capture trains on one cached ACE map
+                         (experiments/map_cache/<capture stem>; the first run builds it).
+                         Separate bootstraps of one capture differed by 0.55 dB, which hides
+                         knob effects; on one map the baseline repeats within ~0.02 dB
 """
 
 import argparse
@@ -78,6 +82,8 @@ def planned_runs(spec: Dict) -> List[Dict]:
 def command(spec: Dict, run: Dict, out_dir: Path) -> List[str]:
     cmd = [str(PY), "-u", str(PIPELINE), str(ROOT / run["capture"]) if not Path(run["capture"]).is_absolute()
            else run["capture"], "--stream", "--output_dir", str(out_dir), *spec["flags"]]
+    if spec.get("map_cache"):
+        cmd += ["--stream-map-cache", str(ROOT / "experiments" / "map_cache" / Path(run["capture"]).stem)]
     for k, v in run["overrides"].items():
         cmd += ["--trainer-arg", f"{k}={v}"]
     return cmd
@@ -104,6 +110,8 @@ def score(out_dir: Path, log_text: str) -> Dict:
             pass
     ws = re.findall(r"\[WorldStop\] World reconstructed at step (\d+)", log)
     m["world_stop_step"] = int(ws[-1]) if ws else None
+    st = re.findall(r"\[Stream\] step (\d+): coverage settled .*?annealing to step (\d+)", log)
+    m["settle_step"], m["settle_end"] = (int(st[-1][0]), int(st[-1][1])) if st else (None, None)
     m["difix_rounds"] = len(re.findall(r"\[Difix-online\] Round \d+ @", log))
     return m
 
