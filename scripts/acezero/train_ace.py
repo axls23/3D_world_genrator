@@ -30,6 +30,11 @@ if __name__ == '__main__':
     parser.add_argument('--base_seed', type=int, default=2089,
                         help='seed to control randomness')
 
+    parser.add_argument('--deterministic', type=_strtobool, default=False,
+                        help='fixed cuDNN algorithms and deterministic kernels: the cuDNN autotuner '
+                             'picks algorithms by timing, so a run sharing the GPU trained a different '
+                             'map (the inlier-triggered cooldown amplifies the tiny numeric change)')
+
     # === Data definition ==============================================================================================
 
     parser.add_argument('--pose_files', type=str, default=None,

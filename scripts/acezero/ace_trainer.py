@@ -69,6 +69,15 @@ class TrainerACE:
         self.base_seed = self.options.base_seed
         _logger.info(f"Setting random seed to {self.base_seed}")
         set_seed(self.base_seed)
+        self.deterministic = bool(getattr(self.options, "deterministic", False))
+        if self.deterministic:
+            # Same map from the same frames, whatever else runs on the GPU: no timing-based
+            # cuDNN algorithm choice, deterministic reductions (cuBLAS needs its workspace
+            # config before its first handle)
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True, warn_only=True)
 
         # Used to generate batch indices.
         self.batch_generator = torch.Generator()
@@ -512,8 +521,9 @@ class TrainerACE:
         if self.iteration >= self.training_scheduler.max_iterations:
             return False
 
-        # Enable benchmarking since all operations work on the same tensor size.
-        torch.backends.cudnn.benchmark = True
+        # Enable benchmarking since all operations work on the same tensor size (not when
+        # deterministic: the autotuner's choice depends on timing, i.e. on other GPU load).
+        torch.backends.cudnn.benchmark = not self.deterministic
 
         # Shuffle indices.
         random_indices = torch.randperm(self.training_buffer_size, generator=self.training_generator)

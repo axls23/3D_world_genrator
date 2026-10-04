@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -68,12 +69,13 @@ MAP_ID = "stream_map"
 
 class Sidecar:
     def __init__(self, work_dir, encoder_path, hypotheses, threshold, max_points, out,
-                 device="cuda"):
+                 device="cuda", max_tries=16):
         self.work_dir = Path(work_dir)
         self.map_dir = self.work_dir / "map"
         self.map_dir.mkdir(parents=True, exist_ok=True)
         self.encoder_state = torch.load(encoder_path, map_location="cpu")
         self.hypotheses = hypotheses
+        self.max_tries = max_tries      # re-draws of an invalid RANSAC hypothesis
         self.threshold = threshold
         self.max_points = max_points
         self.device = torch.device(device)
@@ -89,7 +91,7 @@ class Sidecar:
         self.out_lock = threading.Lock()
         self.busy = threading.Lock()    # one background bootstrap/refit/load at a time
         self.stopping = threading.Event()
-        self.rng = np.random.default_rng(0)
+        self.seed = 0                   # seed points per frame: rng from (seed, frame name)
         self.child = None               # running ACE script (bootstrap / refit), for shutdown
 
     # ------------------------------------------------------------------ io
@@ -173,9 +175,9 @@ class Sidecar:
         f, cx, cy = K[0, 0].item(), K[0, 2].item(), K[1, 2].item()
         # Same arguments as register_mapping.py (inlier alpha / max pixel error 100, 16 tries)
         conf = dsacstar.forward_rgb(sc.unsqueeze(0), c2w, self.hypotheses, self.threshold, f, cx, cy,
-                                    100, 100, network.OUTPUT_SUBSAMPLE, 1305, 16)
+                                    100, 100, network.OUTPUT_SUBSAMPLE, 1305, self.max_tries)
         w2c = np.linalg.inv(c2w.numpy().astype(np.float64))
-        points, pix = self._inlier_points(sc.numpy(), w2c, f, cx, cy, image.shape[1:],
+        points, pix = self._inlier_points(Path(frame).name, sc.numpy(), w2c, f, cx, cy, image.shape[1:],
                                           network.OUTPUT_SUBSAMPLE)
         row.update(w2c=w2c.reshape(-1).tolist(), conf=float(conf),
                    focal=self.focal if self.focal > 0 else ds.get_focal_length(0),
@@ -183,7 +185,7 @@ class Sidecar:
                    pix=pix.astype(np.float32).reshape(-1).tolist())
         return row
 
-    def _inlier_points(self, sc, w2c, f, cx, cy, hw, sub):
+    def _inlier_points(self, frame_key, sc, w2c, f, cx, cy, hw, sub):
         """Scene coordinates that reproject within the RANSAC threshold under the found pose."""
         _, h, w = sc.shape
         X = sc.reshape(3, -1).T
@@ -196,7 +198,10 @@ class Sidecar:
             err = np.linalg.norm(proj - px, axis=1)
         keep = np.where((z > 1e-3) & (err < self.threshold) & np.isfinite(err))[0]
         if len(keep) > self.max_points:
-            keep = self.rng.choice(keep, self.max_points, replace=False)
+            # Per-frame rng: the same frame gets the same seed points whatever was localized
+            # before it (a process-wide rng made them depend on the call history)
+            rng = np.random.default_rng([self.seed, zlib.crc32(str(frame_key).encode())])
+            keep = rng.choice(keep, self.max_points, replace=False)
         H, W = hw
         return X[keep], px[keep] / np.array([W, H], dtype=np.float64)
 
@@ -366,11 +371,12 @@ def main():
     ap.add_argument("--encoder_path", default=str(HERE / "ace_encoder_pretrained.pt"))
     ap.add_argument("--hypotheses", type=int, default=64, help="RANSAC hypotheses per frame")
     ap.add_argument("--threshold", type=float, default=10.0, help="RANSAC inlier threshold (px)")
+    ap.add_argument("--max_tries", type=int, default=16, help="re-draws of an invalid RANSAC hypothesis")
     ap.add_argument("--max_points", type=int, default=1500, help="Seed points returned per frame")
     args = ap.parse_args()
     out = IpcWriter(proto, EVENT_SCHEMA)
     sidecar = Sidecar(args.work_dir, args.encoder_path, args.hypotheses, args.threshold,
-                      args.max_points, out)
+                      args.max_points, out, max_tries=args.max_tries)
     try:
         sidecar.serve(ipc_batches(sys.stdin.buffer))
     finally:

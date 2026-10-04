@@ -144,6 +144,8 @@ if __name__ == '__main__':
     parser.add_argument('--dense_point_cloud', type=_strtobool, default=False)
 
     parser.add_argument('--random_seed', type=int, default=1305)
+    parser.add_argument('--deterministic', type=_strtobool, default=False,
+                        help='train the map with deterministic cuDNN/kernels (train_ace.py)')
 
     opt = parser.parse_args()
 
@@ -240,6 +242,7 @@ if __name__ == '__main__':
         "--render_flipped_portrait", str(opt.render_flipped_portrait),
         "--iterations_output", str(opt.iterations_output),
         "--render_depth_hist", str(opt.render_depth_hist),
+        "--deterministic", str(opt.deterministic),
     ]
 
     # Loss structure
