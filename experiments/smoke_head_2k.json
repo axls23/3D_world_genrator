@@ -1,0 +1,12 @@
+{
+  "name": "smoke_head_2k",
+  "output": "experiments/results/smoke_head_2k",
+  "captures": ["demo/input/drone_demo.mp4"],
+  "flags": ["--stream-depth", "--no-early-stopping", "--max_steps", "2000",
+            "--trainer-arg", "stream_cycle_refit_min=1000000"],
+  "repeats": {"baseline": 1, "default": 1},
+  "variants": {"baseline": {}},
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "Smoke test of feat/stream-convergence HEAD (settle anneal, schedule MCMC growth, hard-view sampling, map cache); also builds experiments/map_cache/drone_demo"
+}
