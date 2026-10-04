@@ -40,6 +40,8 @@ Options:
   --depth             dense depth per keyframe (Depth Anything V2, aligned to ACE points):
                       denser seeding + depth loss, ~20 ms per keyframe
   --refine-poses      refine each keyframe's pose and exposure while training
+  --map-cache DIR     videos only: keep the first ACE map in DIR and reuse it when the same
+                      file is run again (no bootstrap wait, same poses run to run)
   --no-difix          disable online Difix refinement
   --no-view           no viewer / dashboard / browser
   --no-browser        start the dashboard but do not open a browser
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --record-keyframes) EXTRA+=(--stream-record-keyframes "$2"); shift ;;
         --depth)          EXTRA+=(--stream-depth) ;;
         --refine-poses)   EXTRA+=(--stream-pose-opt --stream-exposure-opt) ;;
+        --map-cache)      EXTRA+=(--stream-map-cache "$2"); shift ;;
         --no-difix)       DIFIX=0 ;;
         --no-view)        VIEW=0 ;;
         --no-browser)     BROWSER=0 ;;
