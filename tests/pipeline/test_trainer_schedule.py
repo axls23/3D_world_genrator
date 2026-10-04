@@ -243,3 +243,42 @@ def test_world_growth_ignored_when_disabled():
             hit = i
             break
     assert hit == 4  # window of 3 probes + 2 confirmations
+
+
+def test_stream_horizon_settle_anneals_continuously_to_the_earlier_end():
+    from trainer_schedule import StreamHorizon
+
+    h = StreamHorizon(10_000, 8_333)
+    before = h.lr_factor(2_500, 0.1)
+    assert h.settle(2_500, 3_000) and h.settled and h.value == 5_500
+    assert h.lr_factor(2_500, 0.1) == pytest.approx(before)  # no jump at the settle step
+    assert h.lr_factor(5_500, 0.1) == pytest.approx(0.1)  # fully annealed at the new end
+    assert h.lr_factor(4_000, 0.01) < h.lr_factor(4_000, 0.1)  # every final LR anneals with it
+    assert h.anneal_progress(4_000) == pytest.approx(0.5)
+    assert h.refine_stop_iter == 5_500 - h.refine_gap
+    assert not h.settle(3_000, 1_000)  # once only
+
+
+def test_stream_horizon_settle_never_extends_and_resumes_on_new_views():
+    from trainer_schedule import StreamHorizon
+
+    h = StreamHorizon(2_000, 1_667)
+    assert not h.settle(1_500, 1_000) and not h.settled  # would end later than 2000
+    h = StreamHorizon(10_000, 8_333, extend=3_000)
+    h.settle(2_000, 2_000)
+    assert h.on_new_views(3_000) and not h.settled and h.value == 6_000
+    assert h.lr_factor(3_000, 0.1) == pytest.approx(0.1 ** 0.5)  # moving schedule again
+
+
+def test_settle_defaults_are_schedule_relative():
+    s2, s30 = resolve_trainer_schedule(2_000), resolve_trainer_schedule(30_000)
+    assert s2.settle_tail_steps == 1_000 and s30.settle_tail_steps == 10_000
+    assert s2.settle_quiet_steps == 300 and s30.settle_quiet_steps == 4_500
+
+
+def test_world_converges_on_noisy_plateau():
+    # The 10k stream run's probes: ~0.5 dB jitter around 20 dB with no trend. The old
+    # best-minus-first test kept seeing a "gain" and never converged.
+    noisy = [19.93, 20.87, 20.41, 19.67, 20.39, 20.8, 20.1, 20.09, 20.73, 20.43]
+    conv = WorldConvergence(min_steps=0, window=3, confirm=2, quiet_steps=0, target_psnr=30)
+    assert _run_world(conv, noisy) is not None

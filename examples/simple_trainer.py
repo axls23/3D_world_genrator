@@ -323,7 +323,20 @@ class Config:
     stream_converge_quiet_steps: int = 1500
     stream_converge_target_psnr: float = 22.0
     stream_converge_min_gain: float = 0.15
-    stream_converge_probe_views: int = 6
+    # Probe views per held-out PSNR probe (full resolution, a few ms each): 6 views jittered
+    # ~0.5 dB between probes on a plateau, more than min_gain
+    stream_converge_probe_views: int = 12
+    # The early stop also waits until the settle anneal below is this far along: stopping on
+    # a plateau before the LR anneals keeps the noisy, unconverged model
+    stream_converge_min_anneal: float = 0.75
+    # Anneal on settle: once coverage settles (file source fully localized, or no new views
+    # for settle_quiet_steps with the ACE map idle) the end is pulled in to step +
+    # settle_tail_steps and the LR anneals from where it is (trainer_schedule.StreamHorizon.
+    # settle). New views on a live source resume the moving schedule. None: schedule-relative.
+    stream_settle: bool = True
+    stream_settle_quiet_steps: Optional[int] = None
+    stream_settle_tail_steps: Optional[int] = None
+    stream_settle_min_steps: Optional[int] = None
     # Dense depth for streams (hypersplat/stream/depth.py): Depth Anything V2 on each
     # registered keyframe, aligned to its ACE points, used to seed Gaussians densely and as a
     # log-depth loss. Keyframes per sync step, seed pixel stride, loss weight.
@@ -429,6 +442,12 @@ class Config:
             self.floater_prune_start = sched.floater_start
         if self.floater_prune_every is None:
             self.floater_prune_every = sched.floater_every
+        if self.stream_settle_quiet_steps is None:
+            self.stream_settle_quiet_steps = sched.settle_quiet_steps
+        if self.stream_settle_tail_steps is None:
+            self.stream_settle_tail_steps = sched.settle_tail_steps
+        if self.stream_settle_min_steps is None:
+            self.stream_settle_min_steps = sched.settle_min_steps
         if isinstance(self.strategy, MCMCStrategy) and not refine_stop_explicit:
             # MCMC's 25k default outlives short pipeline runs (relocation until the last step)
             self.strategy.refine_stop_iter = sched.refine_stop_iter
@@ -991,8 +1010,12 @@ class Runner:
             self._last_view_step = step
             if self.world_conv is not None:
                 self.world_conv.on_data_change(step)
+        was_settled = h.settled
         if seen > self._views_seen and h.on_new_views(step):
-            if h.value - self._horizon_logged >= h.extend:
+            if was_settled:
+                print(f"\n[Stream] step {step}: new views after settling; training resumes to {h.value} steps")
+                self._horizon_logged = h.value
+            elif h.value - self._horizon_logged >= h.extend:
                 print(f"\n[Stream] step {step}: {seen} views registered so far; training extended to "
                       f"{h.value} steps (densify until {h.refine_stop_iter})")
                 self._horizon_logged = h.value
@@ -1022,9 +1045,31 @@ class Runner:
         if s.finished and not h.finished and cfg.stream_tail_steps is not None:
             h.finish(step + cfg.stream_tail_steps)
             print(f"\n[Stream] Source fully localized at step {step}; {cfg.stream_tail_steps} more steps")
+        if cfg.stream_settle and not h.finished and not h.settled and step >= cfg.stream_settle_min_steps:
+            self._maybe_settle(step)
         if hasattr(cfg.strategy, "refine_stop_iter"):
             cfg.strategy.refine_stop_iter = h.refine_stop_iter
         return False
+
+    def _maybe_settle(self, step: int):
+        """Pull the end in once coverage has settled, so the LR anneals now (see
+        StreamHorizon.settle) instead of on a plateau toward a far-away end."""
+        cfg = self.cfg
+        s = self.stream
+        st = s.stats()
+        quiet = step - self._last_view_step
+        map_idle = s.map_ready.is_set() and st["job"] is None and st["pending"] == 0
+        if not (map_idle and (s.finished or quiet >= cfg.stream_settle_quiet_steps)):
+            return
+        h = self.stream_horizon
+        old_end = h.value
+        if h.settle(step, cfg.stream_settle_tail_steps):
+            why = "source fully localized" if s.finished else f"no new views for {quiet} steps"
+            print(f"\n[Stream] step {step}: coverage settled ({why}); annealing to step {h.value} "
+                  f"instead of {old_end} (densify until {h.refine_stop_iter})")
+            self._horizon_logged = h.value
+            if self.world_rank == 0 and cfg.tb_every > 0:
+                self.writer.add_scalar("stream/settle_end", h.value, step)
 
     def _stream_depth(self, step: int) -> Tuple[np.ndarray, np.ndarray]:
         """Dense depth for up to stream_depth_per_sync newly registered keyframes; returns
@@ -1072,6 +1117,10 @@ class Runner:
         wait = None
         if not s.map_ready.is_set():
             wait = "first map"
+        elif cfg.stream_settle and not self.stream_horizon.finished:
+            done = self.stream_horizon.anneal_progress(step)
+            if done < cfg.stream_converge_min_anneal:
+                wait = f"LR anneal {done:.0%}" if self.stream_horizon.settled else "coverage to settle"
         conv = self.world_conv
         done = conv.update(step, psnr=self._probe_psnr(step), loss_ema=self._loss_ema,
                            num_gs=len(self.splats["means"]), views_quiet_steps=step - self._last_view_step,

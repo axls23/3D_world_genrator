@@ -38,6 +38,9 @@ class TrainerSchedule:
     depth_ramp_steps: int  # linear depth-lambda ramp length (500 @ 30k)
     floater_start: int  # online floater pruning starts after this step (2000 @ 30k)
     floater_every: int  # ... and runs every N steps (400 @ 30k)
+    settle_quiet_steps: int  # stream: no new views this long = coverage settled (4500 @ 30k)
+    settle_tail_steps: int  # stream: anneal length once settled (10000 @ 30k)
+    settle_min_steps: int  # stream: never settle before this step (3000 @ 30k)
 
 
 def resolve_trainer_schedule(max_steps: int) -> TrainerSchedule:
@@ -54,6 +57,11 @@ def resolve_trainer_schedule(max_steps: int) -> TrainerSchedule:
         # Interval stays 400: each pass is a CPU kNN over all Gaussians and kills up
         # to floater_max_frac, so short schedules get fewer passes, not denser ones.
         floater_every=400,
+        settle_quiet_steps=schedule_relative(max_steps, 4_500, min_value=100),
+        # The 2k A/B runs gain ~90% of their loss drop in the last 20% (the anneal); keep
+        # at least 1000 steps of it so a settled short run still gets a full anneal.
+        settle_tail_steps=max(1_000, schedule_relative(max_steps, 10_000)),
+        settle_min_steps=schedule_relative(max_steps, 3_000, min_value=100),
     )
 
 
@@ -83,6 +91,12 @@ class StreamHorizon:
     Densification keeps running while the horizon moves: it stops ``refine_gap`` steps before
     the current end (the static schedule's gap, at most extend / 2), never earlier than the
     static ``refine_stop``. Unextended, both match the static schedule exactly.
+
+    ``settle(step, tail)`` pulls the end in to ``step + tail`` once coverage has settled:
+    the LR anneals from its current value to the final one over the tail instead of
+    following a far-away end. Runs only improve while the LR anneals (the loss is flat
+    before it), so a stream whose data stopped changing would otherwise spend thousands
+    of steps on a plateau. New views on a settled (not finished) horizon resume it.
     """
 
     def __init__(self, initial: int, refine_stop: int, extend: Optional[int] = None,
@@ -94,11 +108,36 @@ class StreamHorizon:
         self.refine_stop0 = int(refine_stop)
         self.refine_gap = min(max(self.initial - self.refine_stop0, 0), self.extend // 2)
         self.finished = False
+        self.anchor: Optional[tuple] = None  # (step, decay exponent) where settle() started the anneal
+
+    def settle(self, step: int, tail: int) -> bool:
+        """Coverage settled at ``step``: anneal to the end over ``tail`` steps (only ever
+        earlier than the current end). True if the end moved."""
+        if self.finished or self.anchor is not None:
+            return False
+        end = step + max(int(tail), 1)
+        if end >= self.value:
+            return False
+        self.anchor = (step, self._exponent(step))
+        self.value = end
+        return True
+
+    @property
+    def settled(self) -> bool:
+        return self.anchor is not None
+
+    def anneal_progress(self, step: int) -> float:
+        """Fraction of the settle anneal done at ``step`` (0 when not settled)."""
+        if self.anchor is None:
+            return 0.0
+        s0 = self.anchor[0]
+        return min(max(step - s0, 0) / max(self.value - s0, 1), 1.0)
 
     def on_new_views(self, step: int) -> bool:
         """New views registered at ``step``; True if the end moved."""
         if self.finished:
             return False
+        self.anchor = None  # the scene changed again: back to the moving schedule
         target = step + self.extend
         if self.cap is not None:
             target = min(target, int(self.cap))
@@ -113,13 +152,23 @@ class StreamHorizon:
 
     @property
     def refine_stop_iter(self) -> int:
+        if self.anchor is not None:
+            # Settled: same gap before the (earlier) end, but never before the settle step
+            return max(self.anchor[0], self.value - self.refine_gap)
         if self.value == self.initial:
             return self.refine_stop0
         return max(self.refine_stop0, self.value - self.refine_gap)
 
+    def _exponent(self, step: int) -> float:
+        if self.anchor is None:
+            return min(step / max(self.value, 1), 1.0)
+        s0, e0 = self.anchor
+        return e0 + (1.0 - e0) * self.anneal_progress(step)
+
     def lr_factor(self, step: int, final: float) -> float:
-        """Exponential decay to ``final`` at the current end (ExponentialLR when unextended)."""
-        return final ** min(step / max(self.value, 1), 1.0)
+        """Exponential decay to ``final`` at the current end (ExponentialLR when unextended).
+        After settle() it continues from the settle step's value, so the LR never jumps."""
+        return final ** self._exponent(step)
 
 
 class PlateauDetector:
@@ -154,6 +203,15 @@ class PlateauDetector:
         return step >= self.min_steps and step - self.best_step >= self.patience
 
 
+def _trend(values: Sequence[float]) -> float:
+    """Least-squares slope of ``values`` per sample (0 for fewer than two)."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    xm, ym = (n - 1) / 2.0, sum(values) / n
+    return sum((i - xm) * (v - ym) for i, v in enumerate(values)) / sum((i - xm) ** 2 for i in range(n))
+
+
 class WorldConvergence:
     """Early stop for stream runs: stop once the world is adequately reconstructed.
 
@@ -164,7 +222,7 @@ class WorldConvergence:
 
       coverage   no newly registered views for ``quiet_steps`` and the ACE map is idle
                  (nothing pending, no refit running): the camera has shown what there is
-      quality    held-out PSNR gained < ``min_gain`` dB over the last ``window`` probes, or
+      quality    held-out PSNR trend < ``min_gain`` dB over the last ``window`` probes, or
                  it is above ``target_psnr`` and gains < ``loose_gain`` dB (a modest world is
                  good enough); without held-out views, the EMA training loss improved
                  < ``loss_rel_gain`` relative over the window
@@ -202,14 +260,18 @@ class WorldConvergence:
         self.streak = 0
 
     def _quality(self) -> tuple:
-        """(ok, human summary) over the last ``window`` + 1 probes."""
+        """(ok, human summary) over the last ``window`` + 1 probes.
+
+        The gain is the least-squares trend over the window, not best-minus-first: probe PSNR
+        jitters by ~0.5 dB between probes on a plateau, and the max of a few noisy samples
+        always beats the first by more than ``min_gain``, so the old test never passed."""
         h = self.history[-(self.window + 1):]
         psnrs = [x[1] for x in h if x[1] is not None]
         if len(psnrs) == len(h):  # held-out views throughout the window
-            best_now, best_then = max(psnrs), max(psnrs[:1])
-            gain = best_now - best_then
-            ok = gain < self.min_gain or (psnrs[-1] >= self.target_psnr and gain < self.loose_gain)
-            return ok, f"PSNR {psnrs[-1]:.2f} dB ({gain:+.2f} over {self.window} probes)"
+            gain = _trend(psnrs) * self.window
+            level = sum(psnrs[-2:]) / len(psnrs[-2:])
+            ok = gain < self.min_gain or (level >= self.target_psnr and gain < self.loose_gain)
+            return ok, f"PSNR {psnrs[-1]:.2f} dB ({gain:+.2f} trend over {self.window} probes)"
         l0, l1 = h[0][2], h[-1][2]
         rel = (l0 - l1) / max(abs(l0), 1e-8)
         return rel < self.loss_rel_gain, f"loss {l1:.4f} ({-rel:+.1%}, no held-out views)"
