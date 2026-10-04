@@ -30,6 +30,8 @@ Spec keys:
 
 import argparse
 import ast
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -135,6 +137,19 @@ def _descendants(pid: int) -> List[int]:
     return out
 
 
+def _run_logged(cmd: List[str], run_dir: Path, env: Dict) -> int:
+    with open(run_dir / "run.log", "w") as log:
+        # Own process group: stopping the harness takes the pipeline, trainer, ACE sidecar
+        # and any ACE refit with it (none left holding the GPU)
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=ROOT,
+                                start_new_session=True)
+        try:
+            return proc.wait()
+        except BaseException:
+            _kill_group(proc)
+            raise
+
+
 def _kill_group(proc: subprocess.Popen):
     """Stop a run and everything it started. The ACE sidecar runs in its own session (so its
     own shutdown can sweep an ACE job); a killed trainer never gets to close it, so every
@@ -172,7 +187,7 @@ def _alive_group(pgid: int) -> bool:
         return False
 
 
-def run_all(spec: Dict, dry: bool, only: Optional[str]):
+def run_all(spec: Dict, dry: bool, only: Optional[str], lock: Optional[str] = None):
     out = Path(spec["output"])
     out.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
@@ -196,17 +211,13 @@ def run_all(spec: Dict, dry: bool, only: Optional[str]):
         if run_dir.exists():
             shutil.rmtree(run_dir)  # an interrupted attempt
         run_dir.mkdir(parents=True)
-        t0 = time.time()
-        with open(run_dir / "run.log", "w") as log:
-            # Own process group: stopping the harness takes the pipeline, trainer, ACE sidecar
-            # and any ACE refit with it (none left holding the GPU)
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=ROOT,
-                                    start_new_session=True)
-            try:
-                code = proc.wait()
-            except BaseException:
-                _kill_group(proc)
-                raise
+        with contextlib.ExitStack() as held:
+            if lock:  # one GPU shared with other harnesses: hold it per run, not per spec
+                fh = held.enter_context(open(lock, "a"))
+                print(f"[ab]     waiting for {lock}", flush=True)
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            t0 = time.time()
+            code = _run_logged(cmd, run_dir, env)
         rec = {**run, "exit": code, "wall_s": round(time.time() - t0, 1)}
         rec.update(score(run_dir, (run_dir / "run.log").read_text(errors="replace")))
         if not spec.get("keep_checkpoints", False):
@@ -291,12 +302,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the commands, run nothing")
     ap.add_argument("--report", action="store_true", help="only (re)write the summary")
     ap.add_argument("--only", help="run only this variant")
+    ap.add_argument("--lock", help="flock this file around each run (a GPU shared with other jobs)")
     a = ap.parse_args()
     spec = load_spec(a.spec)
     if a.report:
         report(spec)
     else:
-        run_all(spec, a.dry_run, a.only)
+        run_all(spec, a.dry_run, a.only, a.lock)
 
 
 if __name__ == "__main__":
