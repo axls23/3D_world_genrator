@@ -72,7 +72,7 @@ if __name__ == '__main__':
                         help='Learning rate for refining calibration parameters.')
 
     parser.add_argument('--use_heuristic_focal_length', type=_strtobool, default=False,
-                        help="Focal length set to 70% of image diagonal. Recommended to activate refine_calibration."
+                        help="Focal length set to 70%% of image diagonal. Recommended to activate refine_calibration."
                              "If False, use_external_focal_length or use_ace_pose_file must be set.")
 
     parser.add_argument('--use_external_focal_length', type=float, default=None,
@@ -218,7 +218,7 @@ if __name__ == '__main__':
                         help='Linear increase of diffusion weight in first N iterations. ACE -> 1000, ACE0 -> -1 (disabled)')
 
     parser.add_argument('--prior_diffusion_subsample', type=float, default=1.0,
-                        help='Sub-sample ratio for inputs to diffusion prior for large batch sizes. 1.0 = no subsampling, 0.1 = use 10% of samples')
+                        help='Sub-sample ratio for inputs to diffusion prior for large batch sizes. 1.0 = no subsampling, 0.1 = use 10%% of samples')
 
     # === Data augmentation ============================================================================================
 
