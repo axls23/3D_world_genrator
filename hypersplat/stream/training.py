@@ -106,17 +106,54 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
     (cached) Arrow snapshot, so new keyframes, refined poses and pseudo views take effect on
     the next step without rebuilding the DataLoader. Views are drawn with probability
     ~ 1/sqrt(1 + times drawn): new keyframes get attention quickly, old ones are not starved.
+
+    With ``hard_mix`` > 0 that weight is also scaled by how badly each real view is fitted:
+    (1 - hard_mix) + hard_mix * hardness, hardness = (loss EMA / median EMA) ** hard_power
+    clipped to [1/4, 4] (views not scored yet and pseudo views count as median). The trainer
+    reports each step's photometric loss through ``report_loss``. A batch of one view per step
+    makes the loss swing 33-63% step to step; drawing under-fitted views more often spends
+    those steps where the error (and the floaters) are.
+
     Use with num_workers=0 (the snapshot lives in this process); decoding is prefetched on a
     thread instead."""
 
-    def __init__(self, session, seed: int = 0, prefetch: int = 2):
+    def __init__(self, session, seed: int = 0, prefetch: int = 2, hard_mix: float = 0.0,
+                 hard_power: float = 1.0, loss_beta: float = 0.7):
         super().__init__()
         self.session = session
         self.prefetch = prefetch
         self.rng = np.random.default_rng(seed)
         self.counts: Dict[str, int] = {}
+        self.hard_mix = float(hard_mix)
+        self.hard_power = float(hard_power)
+        self.loss_beta = float(loss_beta)
+        self.loss_ema: Dict[int, float] = {}   # kid -> photometric loss EMA (real views)
         self._version = None
         self._table = None
+
+    def report_loss(self, kids, losses):
+        """Per-view photometric loss of the step just trained (pseudo views: kid < 0 or skip)."""
+        b = self.loss_beta
+        for kid, loss in zip(kids, losses):
+            kid, loss = int(kid), float(loss)
+            if kid < 0 or not np.isfinite(loss):
+                continue
+            prev = self.loss_ema.get(kid)
+            self.loss_ema[kid] = loss if prev is None else b * prev + (1.0 - b) * loss
+
+    def hardness(self) -> np.ndarray:
+        """Per current train view sampling factor from the loss EMAs (1 = neutral)."""
+        n = len(self._names)
+        if self.hard_mix <= 0 or not self.loss_ema:
+            return np.ones(n)
+        ema = np.array([self.loss_ema.get(k, np.nan) if not p else np.nan
+                        for k, p in zip(self._kids, self._pseudo)], dtype=np.float64)
+        scored = np.isfinite(ema)
+        if scored.sum() < 2:
+            return np.ones(n)
+        rel = np.ones(n)
+        rel[scored] = np.clip((ema[scored] / max(np.median(ema[scored]), 1e-8)) ** self.hard_power, 0.25, 4.0)
+        return (1.0 - self.hard_mix) + self.hard_mix * rel
 
     def __len__(self) -> int:  # informational (CameraOptModule sizing etc.)
         # Read-only: _refresh() swaps the sampler state the prefetch thread is drawing from
@@ -128,6 +165,8 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
         if version != self._version:
             self._table = select_rows(table, split="train")
             self._names = self._table.column("name").to_pylist()
+            self._kids = self._table.column("kid").to_pylist()
+            self._pseudo = [k == "pseudo" for k in self._table.column("kind").to_pylist()]
             self._drawn = np.array([self.counts.get(k, 0) for k in self._names], dtype=np.float64)
             self._version = version
 
@@ -137,7 +176,7 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
             if self._table is not None and self._table.num_rows:
                 break
             time.sleep(0.05)
-        i = weighted_pick(1.0 / np.sqrt(1.0 + self._drawn), self.rng.random())
+        i = weighted_pick(self.hardness() / np.sqrt(1.0 + self._drawn), self.rng.random())
         self._drawn[i] += 1
         self.counts[self._names[i]] = int(self._drawn[i])
         return _view_item(self._table, i, 0, self.session)

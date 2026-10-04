@@ -799,3 +799,18 @@ def test_map_cache_is_keyed_to_the_capture_file(tmp_path):
     _os.utime(video, (1, 1))  # the capture changed: the cache no longer applies
     assert not StreamSession._map_cache(fake)[2]
     assert StreamSession._map_cache(SimpleNamespace(cfg=fake.cfg, kind="camera")) is None
+
+
+def test_hard_view_sampling_prefers_underfit_views():
+    from hypersplat.stream.training import StreamTrainSet
+
+    ts = StreamTrainSet(session=None, hard_mix=0.5)
+    ts._names, ts._kids, ts._pseudo = ["a", "b", "c", "p"], [1, 2, 3, 2], [False, False, False, True]
+    assert (ts.hardness() == 1).all()  # nothing scored yet: novelty-only
+    ts.report_loss([1, 2, 3, -1], [0.02, 0.04, 0.16, 9.0])  # kid -1 (pseudo) is ignored
+    h = ts.hardness()
+    assert h[1] == 1.0  # the median view is neutral
+    assert h[0] == pytest.approx(0.75) and h[2] == pytest.approx(0.5 + 0.5 * 4.0)  # clipped at 4x
+    assert h[3] == 1.0  # pseudo views stay neutral
+    ts.report_loss([3], [0.02])  # EMA, not last value
+    assert 0.02 < ts.loss_ema[3] < 0.16

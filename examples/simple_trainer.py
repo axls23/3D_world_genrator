@@ -316,6 +316,11 @@ class Config:
     # this many seconds / keyframes; also on <result_dir>/STOP_RECORDING or the dashboard button
     stream_record_seconds: Optional[float] = None
     stream_record_keyframes: Optional[int] = None
+    # Loss-aware view sampling: scale each real view's draw weight by (1 - mix) + mix *
+    # (its photometric loss EMA / the median) ** power, clipped to [1/4, 4] (StreamTrainSet).
+    # 0 disables it (novelty-only sampling)
+    stream_hard_view_mix: float = 0.5
+    stream_hard_view_power: float = 1.0
     # Stream early stop (with early_stopping): end training once the world is adequately
     # reconstructed instead of running to max_steps - coverage settled (no new views for
     # quiet_steps, ACE map idle), held-out PSNR plateaued (or >= target_psnr and gaining
@@ -962,7 +967,8 @@ class Runner:
                 self.dashboard.stop()
             raise RuntimeError(f"[Stream] No ACE map: {reason}")
         self.parser = StreamParser(self.stream, cfg.result_dir)
-        self.trainset = StreamTrainSet(self.stream, seed=42)
+        self.trainset = StreamTrainSet(self.stream, seed=42, hard_mix=cfg.stream_hard_view_mix,
+                                       hard_power=cfg.stream_hard_view_power)
         self.valset = StreamValSet(self.stream)
         self.stream_voxel = seed_voxel_size(self.parser.points, self.parser.scene_scale)
         self.stream_horizon = StreamHorizon(cfg.max_steps, getattr(cfg.strategy, "refine_stop_iter", cfg.max_steps),
@@ -2125,6 +2131,7 @@ class Runner:
             rgb_weight = 0.0 if is_depth_only else 1.0
             
             l1loss = F.l1_loss(colors, pixels)
+            view_l1 = (colors.detach() - pixels).abs().mean(dim=(1, 2, 3)) if self.stream is not None else None
             ssimloss = 1.0 - self.ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
             )
@@ -2331,6 +2338,11 @@ class Runner:
 
             loss_val = loss.item()
             self._last_loss = loss_val
+            if view_l1 is not None and "kid" in data and cfg.stream_hard_view_mix > 0:
+                kids = data["kid"].tolist()
+                if "is_pseudo" in data:
+                    kids = [-1 if p else k for k, p in zip(kids, data["is_pseudo"].tolist())]
+                self.trainset.report_loss(kids, view_l1.tolist())
             if loss_val == loss_val and abs(loss_val) != float("inf"):
                 self._loss_ema = loss_val if getattr(self, "_loss_ema", None) is None else \
                     0.99 * self._loss_ema + 0.01 * loss_val
