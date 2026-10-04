@@ -243,6 +243,9 @@ class Sidecar:
             self._publish_map(self.load_head(out / "hybrid_pass.pt"), out / "hybrid_pass.pt",
                               frames, "bootstrap", t0)
         except Exception as e:  # report and stay alive: the client retries with more frames
+            if self.stopping.is_set():  # shutdown terminated it: not a failure
+                _logger.info("bootstrap cancelled (shutdown)")
+                return
             _logger.exception("bootstrap failed")
             self.error("bootstrap", str(e))
             shutil.rmtree(str(self.map_dir / "bootstrap"), ignore_errors=True)
@@ -302,6 +305,10 @@ class Sidecar:
                 if old != out_dir and old.exists():
                     shutil.rmtree(str(old), ignore_errors=True)
         except Exception as e:
+            if self.stopping.is_set():  # training ended mid-refit: not a failure
+                _logger.info("refit cancelled (shutdown)")
+                shutil.rmtree(str(out_dir), ignore_errors=True)
+                return
             _logger.exception("refit failed")
             self.error("refit", str(e))
             shutil.rmtree(str(out_dir), ignore_errors=True)
