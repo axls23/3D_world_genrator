@@ -39,7 +39,11 @@ Options:
   --no-auto-stop      train to the step ceiling instead of stopping on convergence
   --depth             dense depth per keyframe (Depth Anything V2, aligned to ACE points):
                       denser seeding + depth loss, ~20 ms per keyframe
-  --refine-poses      refine each keyframe's pose and exposure while training
+  --refine-poses      refine each keyframe's pose and exposure while training (uses the standard
+                      rasterizer: 3DGUT has no pose gradients, so this turns --ut off)
+  --ut / --no-ut      3DGUT: unscented-transform projection + world-space (eval3d) rasterizer
+                      (default on; same quality as the standard rasterizer on the drone A/B,
+                      handles distorted / rolling-shutter cameras)
   --map-cache DIR     videos only: keep the first ACE map in DIR and reuse it when the same
                       file is run again (no bootstrap wait, same poses run to run)
   --no-difix          disable online Difix refinement
@@ -67,6 +71,7 @@ DEMO_VIDEO="demo/input/drone_demo.mp4"
 EXTRA=()
 DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 PHONE_FACING=back
 DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
+UT=default REFINE_POSES=0
 VIEWER_PORT=8080 DASH_PORT=8090 DASH_HOST=127.0.0.1
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,7 +87,9 @@ while [[ $# -gt 0 ]]; do
         --record-seconds) EXTRA+=(--stream-record-seconds "$2"); shift ;;
         --record-keyframes) EXTRA+=(--stream-record-keyframes "$2"); shift ;;
         --depth)          EXTRA+=(--stream-depth) ;;
-        --refine-poses)   EXTRA+=(--stream-pose-opt --stream-exposure-opt) ;;
+        --refine-poses)   EXTRA+=(--stream-pose-opt --stream-exposure-opt); REFINE_POSES=1 ;;
+        --ut)             UT=1 ;;
+        --no-ut)          UT=0 ;;
         --map-cache)      EXTRA+=(--stream-map-cache "$2"); shift ;;
         --no-difix)       DIFIX=0 ;;
         --difix-share)    DIFIX_SHARE="$2"; shift ;;
@@ -103,6 +110,9 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 EXTRA+=(--seed "$SEED")
+# 3DGUT by default; an explicit --refine-poses wins over the default (UT has no pose gradients)
+[[ "$UT" == default ]] && { [[ $REFINE_POSES -eq 1 ]] && UT=0 || UT=1; }
+[[ $UT -eq 1 ]] && EXTRA+=(--with_ut)
 if [[ $DIFIX -eq 1 ]]; then
     EXTRA+=(--difix-online --trainer-arg "difix_cycle_start_frac=$DIFIX_START")
     [[ "$DIFIX_SHARE" == none ]] || EXTRA+=(--trainer-arg "difix_pseudo_share=$DIFIX_SHARE")
@@ -111,6 +121,9 @@ fi
 fail() { echo "[stream-demo] ERROR: $*" >&2; exit 1; }
 warn() { echo "[stream-demo] WARNING: $*" >&2; }
 info() { echo "[stream-demo] $*"; }
+
+[[ $UT -eq 1 && $REFINE_POSES -eq 1 ]] && warn "--ut has no pose gradients: --refine-poses keeps only exposure"
+[[ $UT -eq 0 && $REFINE_POSES -eq 1 ]] && info "--refine-poses: using the standard rasterizer (3DGUT has no pose gradients)"
 
 # ---------------------------------------------------------------- environments
 PY="$ROOT/.venv_3dgrut/bin/python"
