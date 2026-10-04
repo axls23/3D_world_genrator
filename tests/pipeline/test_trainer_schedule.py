@@ -282,3 +282,23 @@ def test_world_converges_on_noisy_plateau():
     noisy = [19.93, 20.87, 20.41, 19.67, 20.39, 20.8, 20.1, 20.09, 20.73, 20.43]
     conv = WorldConvergence(min_steps=0, window=3, confirm=2, quiet_steps=0, target_psnr=30)
     assert _run_world(conv, noisy) is not None
+
+
+def test_mcmc_schedule_growth_reaches_cap_on_short_schedules():
+    from gsplat.strategy import MCMCStrategy
+
+    def grow(strategy, n, stop):
+        for step in range(0, stop, strategy.refine_every):
+            if strategy.refine_start_iter < step < strategy.refine_stop_iter:
+                n = min(strategy.cap_max, int((1 + strategy.growth_rate(n, step)) * n))
+        return n
+
+    # Haapsalu 2k: 43,782 seeds ended at 74,876 = 1.05^11 with fixed growth
+    fixed = MCMCStrategy(cap_max=300_000, refine_stop_iter=1_667)
+    assert grow(fixed, 43_782, 2_000) == pytest.approx(43_782 * 1.05 ** 11, rel=0.01)
+    sched = MCMCStrategy(cap_max=300_000, refine_stop_iter=1_667, growth="schedule")
+    assert grow(sched, 43_782, 2_000) == 300_000
+    # never slower than the paper's 5%: a 30k schedule is unchanged
+    long = MCMCStrategy(cap_max=300_000, refine_stop_iter=25_000, growth="schedule")
+    assert long.growth_rate(100_000, 1_000) == pytest.approx(0.05)
+    assert sched.growth_rate(43_782, 600) <= sched.growth_max_rate

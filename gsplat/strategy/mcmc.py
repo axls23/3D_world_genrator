@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Literal, Union
 
 import torch
 from torch import Tensor
@@ -29,6 +29,13 @@ class MCMCStrategy(Strategy):
         refine_every (int): Refine GSs every this steps. Default to 100.
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
         verbose (bool): Whether to print verbose information. Default to False.
+        growth (str): "fixed" adds 5% GSs per refine step (the paper). "schedule" adds what is
+          needed to reach ``cap_max`` by ``growth_until`` of the refine window (never less than
+          5%, at most ``growth_max_rate``): with 5% compounding a short schedule cannot reach
+          the cap (2k steps: at most 1.05^11 = 1.7x the seed count). Default to "fixed".
+        growth_until (float): Fraction of the refine window by which "schedule" growth reaches
+          the cap. Default to 0.6.
+        growth_max_rate (float): Largest relative growth per refine step. Default to 0.3.
 
     Examples:
 
@@ -53,6 +60,9 @@ class MCMCStrategy(Strategy):
     refine_every: int = 100
     min_opacity: float = 0.005
     verbose: bool = False
+    growth: Literal["fixed", "schedule"] = "fixed"
+    growth_until: float = 0.6
+    growth_max_rate: float = 0.3
 
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
@@ -130,7 +140,7 @@ class MCMCStrategy(Strategy):
                 print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
 
             # add new GSs
-            n_new_gs = self._add_new_gs(params, optimizers, binoms)
+            n_new_gs = self._add_new_gs(params, optimizers, binoms, step)
             if self.verbose:
                 print(
                     f"Step {step}: Added {n_new_gs} GSs. "
@@ -143,6 +153,18 @@ class MCMCStrategy(Strategy):
         inject_noise_to_position(
             params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
         )
+
+    def growth_rate(self, n: int, step: int) -> float:
+        """Relative growth for the refine step at ``step`` with ``n`` GSs."""
+        if self.growth == "fixed" or n <= 0 or n >= self.cap_max:
+            return 0.05
+        start, stop = self.refine_start_iter, self.refine_stop_iter
+        until = start + self.growth_until * max(stop - start, 0)
+        if step >= until:  # behind plan (e.g. a late horizon change): use what is left
+            until = stop
+        left = max(math.ceil((until - step) / self.refine_every), 1)
+        rate = (self.cap_max / n) ** (1.0 / left) - 1.0
+        return min(max(rate, 0.05), self.growth_max_rate)
 
     @torch.no_grad()
     def _relocate_gs(
@@ -171,9 +193,10 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        step: int = 0,
     ) -> int:
         current_n_points = len(params["means"])
-        n_target = min(self.cap_max, int(1.05 * current_n_points))
+        n_target = min(self.cap_max, int((1.0 + self.growth_rate(current_n_points, step)) * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
             sample_add(

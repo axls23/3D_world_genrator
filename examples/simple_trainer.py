@@ -429,7 +429,7 @@ class Config:
         else:
             assert_never(strategy)
 
-    def resolve_schedule(self, refine_stop_explicit: bool = False):
+    def resolve_schedule(self, refine_stop_explicit: bool = False, growth_explicit: bool = False):
         """Fill schedule-relative step constants from max_steps (explicit values win)."""
         sched = resolve_trainer_schedule(self.max_steps)
         if self.sh_degree_interval is None:
@@ -448,6 +448,10 @@ class Config:
             self.stream_settle_tail_steps = sched.settle_tail_steps
         if self.stream_settle_min_steps is None:
             self.stream_settle_min_steps = sched.settle_min_steps
+        if isinstance(self.strategy, MCMCStrategy) and not growth_explicit:
+            # Reach cap_max within the refine window whatever the schedule length (never slower
+            # than the paper's 5% per refine, so 30k runs are unchanged)
+            self.strategy.growth = "schedule"
         if isinstance(self.strategy, MCMCStrategy) and not refine_stop_explicit:
             # MCMC's 25k default outlives short pipeline runs (relocation until the last step)
             self.strategy.refine_stop_iter = sched.refine_stop_iter
@@ -3158,7 +3162,8 @@ if __name__ == "__main__":
     cfg.resolve_schedule(
         refine_stop_explicit=_flag_given(
             sys.argv, "--strategy.refine-stop-iter", "--strategy.refine_stop_iter"
-        )
+        ),
+        growth_explicit=_flag_given(sys.argv, "--strategy.growth"),
     )
 
     # Import BilateralGrid and related functions based on configuration
