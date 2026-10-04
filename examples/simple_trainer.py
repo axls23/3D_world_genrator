@@ -1075,6 +1075,15 @@ class Runner:
         map_idle = s.map_ready.is_set() and st["job"] is None and st["pending"] == 0
         if not (map_idle and (s.finished or quiet >= cfg.stream_settle_quiet_steps)):
             return
+        # The model must be done growing too: settling as soon as a file is localized (step
+        # 200 of 2k, before depth seeds and MCMC growth) cut the fit phase short (-0.55 dB)
+        if cfg.stream_depth and s.depth_backlog:
+            return
+        if isinstance(cfg.strategy, MCMCStrategy):
+            if len(self.splats["means"]) < 0.98 * cfg.strategy.cap_max and step < self.stream_horizon.refine_stop_iter:
+                return
+        elif step < self.stream_horizon.refine_stop_iter // 2:
+            return
         h = self.stream_horizon
         old_end = h.value
         if h.settle(step, cfg.stream_settle_tail_steps):
