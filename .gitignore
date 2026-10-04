@@ -142,3 +142,5 @@ pipeline_log.txt
 .venv_3dgrut/
 demo/input/
 experiments/*.log
+experiments/.gpu.lock
+experiments/map_cache/
