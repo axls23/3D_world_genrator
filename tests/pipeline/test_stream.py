@@ -584,6 +584,42 @@ def test_session_bootstrap_retry_after_source_end_uses_all_frames(session):
     assert session.failed and "boom again" in session.failed
 
 
+def _refit_map(session, n_registered, version):
+    """Map event of a refit: the first n_registered keyframes register, the rest fail."""
+    rows = _map_rows([k.ace_path for k in session.store.frames()], 900.0, "refit", version)
+    for row in rows[n_registered:]:
+        row["conf"] = 10.0
+    session._on_event("map", rows)
+
+
+def test_session_refits_keep_growing_after_source_end(session):
+    kfs = [_add(session, i) for i in range(8)]
+    session._on_event("map", _map_rows([k.ace_path for k in kfs[:3]], 900.0))
+    session.source_ended = True
+    refits = lambda: [c for c in session.sidecar.calls if c[0] == "refit"]
+    session._maybe_refit(force=True)
+    assert len(refits()) == 1
+    # No live localizations after the source ended: only the map event's gain can chain refits
+    _refit_map(session, 5, 2)
+    assert len(refits()) == 2 and session._job == "refit"
+    _refit_map(session, 6, 3)      # +1 < refit_min_gain: the chain stops
+    assert len(refits()) == 2 and session._job is None
+    assert len(session.store.unregistered()) == 2
+
+
+def test_session_refit_growth_survives_gpu_lease_deferral(session):
+    kfs = [_add(session, i) for i in range(8)]
+    session._on_event("map", _map_rows([k.ace_path for k in kfs[:3]], 900.0))
+    session._maybe_refit(force=True)
+    assert session.gpu_lease.try_acquire("difix") is False  # the refit holds it
+    session.gpu_lease.release("ace")
+    assert session.gpu_lease.try_acquire("difix")
+    _refit_map(session, 6, 2)       # gain while Difix holds the GPU: deferred, not dropped
+    assert session._refit_deferred and len([c for c in session.sidecar.calls if c[0] == "refit"]) == 1
+    session.release_gpu("difix")
+    assert len([c for c in session.sidecar.calls if c[0] == "refit"]) == 2
+
+
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_session_ace_deterministic_reaches_bootstrap_and_refit(session, deterministic):
     session.cfg.ace_deterministic = deterministic

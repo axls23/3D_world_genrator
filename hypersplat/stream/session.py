@@ -75,6 +75,10 @@ class StreamConfig:
     refit_min_unregistered: int = 6     # refit once this many new frames failed to register
     refit_every_registered: int = 40    # ...or this many new frames registered
     refit_iterations: int = 4000
+    # ACE-Zero growth: a refit that registered at least this many more keyframes while others
+    # are still unregistered schedules the next one (the extended map may reach them), also
+    # after the source ended; the chain stops at the first refit that gains fewer
+    refit_min_gain: int = 2
     max_inflight: int = 4               # localize requests in flight (fast pace back-pressure)
     seed_points_per_frame: int = 1500
     flight_port: Optional[int] = None   # also serve views/stats over Arrow Flight
@@ -185,6 +189,7 @@ class StreamSession:
         self._inflight = 0
         self._new_failed = 0                # frames that failed to register since the last refit
         self._new_registered = 0
+        self._grow_pending = False          # last refit gained frames and some are still unregistered
         self._refit_deferred = False        # a refit is due but the GPU lease is taken
         self.gpu_lease = GpuLease()
         self.views_registered = 0           # frames that became registered, ever (monotonic)
@@ -459,7 +464,8 @@ class StreamSession:
         if self._job is not None or not self.map_ready.is_set():
             return
         if not force and not (self._new_failed >= self.cfg.refit_min_unregistered
-                              or self._new_registered >= self.cfg.refit_every_registered):
+                              or self._new_registered >= self.cfg.refit_every_registered
+                              or self._grow_pending):
             return
         frames = [kf.ace_path for kf in self.store.frames() if kf.ace_path and kf.w2c is not None]
         if len(self.store.registered()) < 3:
@@ -480,11 +486,13 @@ class StreamSession:
         self._job = "refit"
         self._job_t0 = time.time()
         self._new_failed = self._new_registered = 0
+        self._grow_pending = False
         self.sidecar.refit(frames, self.cfg.refit_iterations, self.store.conf_threshold, args)
 
     def _maybe_final_refit(self):
         with self._cond:
-            if self.map_ready.is_set() and self.store.unregistered() and self._new_failed > 0:
+            if self.map_ready.is_set() and self.store.unregistered() and (self._new_failed > 0
+                                                                        or self._grow_pending):
                 self._maybe_refit(force=True)
 
     def release_gpu(self, holder: str):
@@ -555,6 +563,7 @@ class StreamSession:
         first = not self.map_ready.is_set()
         if first:
             self._freeze_normalization(rows)
+        n_before = len(self.store.registered())
         for row in rows:
             if row["frame"]:
                 self._on_pose(row, from_map=True)
@@ -569,6 +578,17 @@ class StreamSession:
                 self.stats_counters["last_refit_s"] = meta.get("seconds")
             self._job = None
             self.gpu_lease.release("ace")
+            if meta.get("reason") == "refit":
+                # The map event's poses are not live localizations, so they never reached the
+                # refit counters: once the source ended (no more localize calls) a refit that
+                # just registered more frames was the last one, leaving the rest unregistered
+                gain = n_reg - n_before
+                self._new_registered += max(0, gain)
+                self._grow_pending = gain >= self.cfg.refit_min_gain and bool(self.store.unregistered())
+                if self._grow_pending:
+                    logger.info(f"[Stream] Refit registered {gain} more keyframes, "
+                                f"{len(self.store.unregistered())} still unregistered: refitting again")
+                    self._maybe_refit()
             if first:
                 for kf in self.store.frames():
                     kf.pinned = False
