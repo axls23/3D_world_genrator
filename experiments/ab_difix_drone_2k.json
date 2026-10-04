@@ -1,0 +1,17 @@
+{
+  "name": "ab_difix_drone_2k",
+  "output": "experiments/results/ab_difix_drone_2k",
+  "captures": ["demo/input/drone_demo.mp4"],
+  "flags": ["--stream-depth", "--no-early-stopping", "--max_steps", "2000", "--cap-max", "300000",
+            "--trainer-arg", "stream_cycle_refit_min=1000000"],
+  "repeats": {"baseline": 2, "difix_legacy": 3, "difix_det": 3, "default": 1},
+  "variants": {
+    "baseline": {},
+    "difix_legacy": {"difix_online": true, "difix_seed": "None", "difix_deterministic": false,
+                     "difix_pool_views": 0},
+    "difix_det": {"difix_online": true}
+  },
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "Agent 3. One cached ACE map, fixed cap, ACE refits off: Difix is the only variable. baseline = no Difix; difix_legacy = Difix as before (global-RNG VAE sampling, per-round 2-view judging); difix_det = seeded, posterior-mean latents, decisions pooled over 8 views. n=3 per Difix arm for the run-to-run spread."
+}

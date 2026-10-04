@@ -58,3 +58,20 @@ def test_weight_and_angle_hold_while_pooling():
                                  "judge": "pooling"}, "t")
     assert derive_pseudo_weight(prof, None).value == w
     assert derive_max_angle(prof, None).value == 9.0
+
+
+def test_pseudo_share_cap_keeps_real_views_dominant():
+    import numpy as np
+
+    from hypersplat.stream.training import StreamTrainSet
+
+    ts = StreamTrainSet(session=None, pseudo_share=0.15)
+    ts._pseudo = [False] * 4 + [True] * 4
+    w = np.array([0.2] * 4 + [1.0] * 4)  # fresh pseudo views: novelty favours them (83%)
+    c = ts._cap_pseudo(w)
+    assert c[4:].sum() / c.sum() == pytest.approx(0.15)
+    assert np.allclose(c[:4], w[:4])  # real weights untouched
+    ts._pseudo = [False] * 8  # no pseudo views: nothing to cap
+    assert np.allclose(ts._cap_pseudo(w), w)
+    ts.pseudo_share, ts._pseudo = None, [False] * 4 + [True] * 4  # no cap configured
+    assert np.allclose(ts._cap_pseudo(w), w)

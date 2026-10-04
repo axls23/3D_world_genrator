@@ -118,7 +118,7 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
     thread instead."""
 
     def __init__(self, session, seed: int = 0, prefetch: int = 2, hard_mix: float = 0.0,
-                 hard_power: float = 1.0, loss_beta: float = 0.7):
+                 hard_power: float = 1.0, loss_beta: float = 0.7, pseudo_share: Optional[float] = None):
         super().__init__()
         self.session = session
         self.prefetch = prefetch
@@ -127,6 +127,10 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
         self.hard_mix = float(hard_mix)
         self.hard_power = float(hard_power)
         self.loss_beta = float(loss_beta)
+        # Cap on the probability of drawing a pseudo (Difix) view. Every cycle round adds fresh,
+        # never-drawn pseudo views, which the novelty weight favours: uncapped they took ~40% of
+        # the steps of a 2k drone run. None = no cap
+        self.pseudo_share = pseudo_share
         self.loss_ema: Dict[int, float] = {}   # kid -> photometric loss EMA (real views)
         self._version = None
         self._table = None
@@ -140,6 +144,20 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
                 continue
             prev = self.loss_ema.get(kid)
             self.loss_ema[kid] = loss if prev is None else b * prev + (1.0 - b) * loss
+
+    def _cap_pseudo(self, w: np.ndarray) -> np.ndarray:
+        """Scale pseudo-view weights down so they hold at most ``pseudo_share`` of the draw
+        probability (real views keep their relative weights)."""
+        cap = self.pseudo_share
+        if cap is None or not any(self._pseudo):
+            return w
+        p = np.asarray(self._pseudo, dtype=bool)
+        tot_p, tot_r = float(w[p].sum()), float(w[~p].sum())
+        if tot_r <= 0 or tot_p <= 0 or tot_p / (tot_p + tot_r) <= cap:
+            return w
+        w = w.copy()
+        w[p] *= cap * tot_r / ((1.0 - cap) * tot_p)
+        return w
 
     def hardness(self) -> np.ndarray:
         """Per current train view sampling factor from the loss EMAs (1 = neutral)."""
@@ -176,7 +194,7 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
             if self._table is not None and self._table.num_rows:
                 break
             time.sleep(0.05)
-        i = weighted_pick(self.hardness() / np.sqrt(1.0 + self._drawn), self.rng.random())
+        i = weighted_pick(self._cap_pseudo(self.hardness() / np.sqrt(1.0 + self._drawn)), self.rng.random())
         self._drawn[i] += 1
         self.counts[self._names[i]] = int(self._drawn[i])
         return _view_item(self._table, i, 0, self.session)

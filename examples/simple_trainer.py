@@ -425,6 +425,13 @@ class Config:
     difix_epoch_scale: float = 0.5
     # Orbit angle cap for the cycle's small rounds (each faithful round widens the angle)
     difix_epoch_max_angle: float = 8.0
+    # Cycle Difix starts once step >= this fraction of the (moving) training end: renders of
+    # the early, blob-like model are what Difix hallucinates on, and a rolling pool keeps
+    # those views for difix_online_views / difix_epoch_views epochs. 0 = from the first epoch
+    difix_cycle_start_frac: float = 0.0
+    # Streams: at most this share of training draws goes to pseudo views (None: uncapped -
+    # fresh pseudo views win the sampler's novelty weight, ~40% of a 2k drone run's steps)
+    difix_pseudo_share: Optional[float] = None
     # ACE step of the cycle: refit once this many keyframes changed (a refit takes minutes and
     # holds the GPU lease, so refitting after every new keyframe would starve Difix)
     stream_cycle_refit_min: int = 4
@@ -1013,6 +1020,7 @@ class Runner:
         self.parser = StreamParser(self.stream, cfg.result_dir)
         self.trainset = StreamTrainSet(self.stream, seed=cfg.seed, hard_mix=cfg.stream_hard_view_mix,
                                        hard_power=cfg.stream_hard_view_power,
+                                       pseudo_share=cfg.difix_pseudo_share,
                                        prefetch=0 if cfg.deterministic else 2)
         self.valset = StreamValSet(self.stream)
         self.stream_voxel = seed_voxel_size(self.parser.points, self.parser.scene_scale)
@@ -1401,6 +1409,9 @@ class Runner:
         cfg = self.cfg
         if self.difix.stop_reason:
             return "stopped"
+        start = int(cfg.difix_cycle_start_frac * self.stream_horizon.value)
+        if step < start:
+            return f"waiting (starts at step {start})"
         src = self._difix_sources()
         if src is None or len(src.c2ws) < 2:
             return "no sources"
