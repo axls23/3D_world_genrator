@@ -1,0 +1,18 @@
+{
+  "name": "ablate_convergence_2k",
+  "output": "experiments/results/ablate_convergence_2k",
+  "captures": ["demo/input/drone_demo.mp4"],
+  "flags": ["--stream-depth", "--no-early-stopping", "--max_steps", "2000",
+            "--trainer-arg", "stream_cycle_refit_min=1000000"],
+  "repeats": {"baseline": 2, "default": 1},
+  "variants": {
+    "baseline": {},
+    "settle_off": {"stream_settle": false},
+    "growth_fixed": {"strategy.growth": "fixed"},
+    "hard_off": {"stream_hard_view_mix": 0},
+    "all_off": {"stream_settle": false, "strategy.growth": "fixed", "stream_hard_view_mix": 0}
+  },
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "Ablation of the convergence branch (bf5b105) on the cached drone map (scale 1.042). all_off reproduces the pre-branch trainer on that map: expect ~23.25 dB if the cache reproduces the map."
+}
