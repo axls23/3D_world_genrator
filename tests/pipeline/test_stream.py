@@ -854,6 +854,20 @@ def test_map_cache_is_keyed_to_the_capture_file(tmp_path):
     assert StreamSession._map_cache(SimpleNamespace(cfg=fake.cfg, kind="camera")) is None
 
 
+def test_map_cache_relative_path_is_made_absolute(tmp_path, monkeypatch):
+    # The ACE sidecar runs in scripts/acezero: a relative cache dir handed to it as-is
+    # missed the cache and saved a new one under scripts/acezero
+    from types import SimpleNamespace
+
+    from hypersplat.stream.session import StreamConfig, StreamSession
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "cap.mp4").write_bytes(b"x")
+    fake = SimpleNamespace(cfg=StreamConfig(source="cap.mp4", map_cache="cache/cap"), kind="file")
+    d, _, _ = StreamSession._map_cache(fake)
+    assert d.is_absolute() and d == tmp_path / "cache" / "cap"
+
+
 def test_hard_view_sampling_prefers_underfit_views():
     from hypersplat.stream.training import StreamTrainSet
 

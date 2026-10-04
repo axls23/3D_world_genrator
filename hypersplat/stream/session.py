@@ -413,7 +413,8 @@ class StreamSession:
         A cache made from a different file (path, size or mtime) is not usable."""
         if not self.cfg.map_cache or self.kind != "file":
             return None
-        cache = Path(self.cfg.map_cache)
+        # Absolute: the ACE sidecar runs in scripts/acezero, where a relative path misses
+        cache = Path(self.cfg.map_cache).resolve()
         try:
             st = os.stat(self.cfg.source)
             key = {"source": str(Path(self.cfg.source).resolve()), "size": st.st_size, "mtime": int(st.st_mtime)}
