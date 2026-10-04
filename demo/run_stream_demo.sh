@@ -43,6 +43,13 @@ Options:
   --map-cache DIR     videos only: keep the first ACE map in DIR and reuse it when the same
                       file is run again (no bootstrap wait, same poses run to run)
   --no-difix          disable online Difix refinement
+  --difix-share F     cap on the Difix pseudo views' share of training draws (default 0.15;
+                      uncapped they took ~40% of the steps); none = no cap
+  --difix-start F     online Difix starts at this fraction of the run (default 0.5: the early
+                      blob renders are what Difix hallucinates on); 0 = from the start
+  --seed N            training random seed (default 42)
+  --deterministic     reproducible runs of a video file: deterministic kernels for training and
+                      ACE maps, file fully localized before step 0 (slower; ~0.2 dB lower)
   --no-view           no viewer / dashboard / browser
   --no-browser        start the dashboard but do not open a browser
   --viewer-port P     viser 3DGS viewer port (default 8080)
@@ -59,6 +66,7 @@ OUTPUT="demo/output/stream_demo"
 DEMO_VIDEO="demo/input/drone_demo.mp4"
 EXTRA=()
 DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 PHONE_FACING=back
+DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
 VIEWER_PORT=8080 DASH_PORT=8090 DASH_HOST=127.0.0.1
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,6 +85,10 @@ while [[ $# -gt 0 ]]; do
         --refine-poses)   EXTRA+=(--stream-pose-opt --stream-exposure-opt) ;;
         --map-cache)      EXTRA+=(--stream-map-cache "$2"); shift ;;
         --no-difix)       DIFIX=0 ;;
+        --difix-share)    DIFIX_SHARE="$2"; shift ;;
+        --difix-start)    DIFIX_START="$2"; shift ;;
+        --seed)           SEED="$2"; shift ;;
+        --deterministic)  EXTRA+=(--deterministic) ;;
         --no-view)        VIEW=0 ;;
         --no-browser)     BROWSER=0 ;;
         --viewer-port)    VIEWER_PORT="$2"; shift ;;
@@ -90,7 +102,11 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
-[[ $DIFIX -eq 1 ]] && EXTRA+=(--difix-online)
+EXTRA+=(--seed "$SEED")
+if [[ $DIFIX -eq 1 ]]; then
+    EXTRA+=(--difix-online --trainer-arg "difix_cycle_start_frac=$DIFIX_START")
+    [[ "$DIFIX_SHARE" == none ]] || EXTRA+=(--trainer-arg "difix_pseudo_share=$DIFIX_SHARE")
+fi
 
 fail() { echo "[stream-demo] ERROR: $*" >&2; exit 1; }
 warn() { echo "[stream-demo] WARNING: $*" >&2; }
