@@ -149,3 +149,23 @@ def test_rasterization_ut_depth_modes(render_mode: str):
 
     out[..., -1].mean().backward()
     assert means.grad is not None and means.grad[:, 2].abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+def test_rasterization_ut_params_reach_projection():
+    """ut_params is passed to the UT projection: lenient sigma-point validity keeps the large
+    Gaussians straddling the image border that the strict default culls."""
+    from gsplat.cuda._wrapper import UnscentedTransformParameters
+    from gsplat.rendering import rasterization
+
+    means, quats, scales, opacities, colors, viewmats, Ks = _ut_scene()
+    scales = torch.full_like(scales, 0.3)  # big enough that many sigma points leave the image
+    kw = dict(width=320, height=240, packed=False, with_ut=True, with_eval3d=True)
+    _, _, strict = rasterization(means, quats, scales, opacities, colors, viewmats, Ks, **kw)
+    lenient_params = UnscentedTransformParameters(require_all_sigma_points_valid=False)
+    _, alphas, lenient = rasterization(means, quats, scales, opacities, colors, viewmats, Ks,
+                                       ut_params=lenient_params, **kw)
+    n_strict = int((strict["radii"] > 0).all(-1).sum())
+    n_lenient = int((lenient["radii"] > 0).all(-1).sum())
+    assert n_lenient > n_strict
+    assert torch.isfinite(alphas).all()

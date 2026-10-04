@@ -1,0 +1,40 @@
+{
+  "name": "ab_3dgut_tune_drone_2k",
+  "output": "experiments/results/ab_3dgut_tune_drone_2k",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut",
+    "--trainer-arg",
+    "deterministic=True"
+  ],
+  "repeats": {
+    "default": 1
+  },
+  "variants": {
+    "baseline": {},
+    "ut_margin": {
+      "ut_margin": 0.5
+    },
+    "ut_alpha1": {
+      "ut_alpha": 1.0
+    },
+    "closed_loop": {
+      "stream_depth_conf_weight": true,
+      "stream_depth_render_align": 4
+    },
+    "noise_half": {
+      "strategy.noise-lr": 250000
+    }
+  },
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "3DGUT knobs on one cached map with deterministic=True (same seed, inline sampler, source localized before step 0), so n=1 per variant compares like for like; the noise floor is the det spread from ab_3dgut_det_drone_2k. ut_margin: sigma points may reach 50% (not 10%) beyond the image before a Gaussian is culled (the strict all-valid default culls large border Gaussians: popping); require_all stays on because lenient validity mixes behind-camera projections into the covariance. ut_alpha1: wider sigma-point spread (3DGRUT-style). closed_loop: variance-weighted depth + render-anchored realignment. noise_half: half the MCMC position noise."
+}

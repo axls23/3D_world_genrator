@@ -11,6 +11,7 @@ from .cuda._wrapper import (
     RollingShutterType,
     FThetaCameraDistortionParameters,
     FThetaPolynomialType,
+    UnscentedTransformParameters,
     fully_fused_projection,
     fully_fused_projection_2dgs,
     fully_fused_projection_with_ut,
@@ -67,6 +68,8 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    # unscented transform (with_ut projection and the eval3d rasterizer); None: defaults
+    ut_params: Optional[UnscentedTransformParameters] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -380,6 +383,8 @@ def rasterization(
         # Silently change C from local #Cameras to global #Cameras.
         C = len(viewmats)
 
+    if ut_params is None:
+        ut_params = UnscentedTransformParameters()
     if with_ut:
         proj_results = fully_fused_projection_with_ut(
             means,
@@ -396,6 +401,7 @@ def rasterization(
             radius_clip=radius_clip,
             calc_compensations=(rasterize_mode == "antialiased"),
             camera_model=camera_model,
+            ut_params=ut_params,
             radial_coeffs=radial_coeffs,
             tangential_coeffs=tangential_coeffs,
             thin_prism_coeffs=thin_prism_coeffs,
@@ -711,6 +717,7 @@ def rasterization(
                     flatten_ids,
                     backgrounds=backgrounds_chunk,
                     camera_model=camera_model,
+                    ut_params=ut_params,
                     radial_coeffs=radial_coeffs,
                     tangential_coeffs=tangential_coeffs,
                     thin_prism_coeffs=thin_prism_coeffs,
@@ -758,6 +765,7 @@ def rasterization(
                 flatten_ids,
                 backgrounds=backgrounds,
                 camera_model=camera_model,
+                ut_params=ut_params,
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
                 thin_prism_coeffs=thin_prism_coeffs,

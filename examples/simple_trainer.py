@@ -277,6 +277,16 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+    # Unscented transform sigma points (with_ut; gsplat UnscentedTransformParameters). With
+    # ut_require_all_valid a Gaussian is culled when any sigma point falls outside the image
+    # plus ut_margin (fraction of its size): large / near Gaussians at the border pop in and
+    # out. False keeps it if any point is valid, but then invalid (even behind-camera)
+    # projections still enter its covariance
+    ut_alpha: float = 0.1
+    ut_beta: float = 2.0
+    ut_kappa: float = 0.0
+    ut_margin: float = 0.1
+    ut_require_all_valid: bool = True
 
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
@@ -663,6 +673,11 @@ class Runner:
         set_random_seed(cfg.seed + local_rank)
         if cfg.deterministic:
             enable_determinism()
+        from gsplat.cuda._wrapper import UnscentedTransformParameters
+        self.ut_params = UnscentedTransformParameters(
+            alpha=cfg.ut_alpha, beta=cfg.ut_beta, kappa=cfg.ut_kappa,
+            in_image_margin_factor=cfg.ut_margin, require_all_sigma_points_valid=cfg.ut_require_all_valid,
+        )
 
         self.cfg = cfg
         if cfg.sh_degree_interval is None:  # not resolved by the CLI entry point
@@ -1815,6 +1830,7 @@ class Runner:
             camera_model=self.cfg.camera_model,
             with_ut=self.cfg.with_ut,
             with_eval3d=self.cfg.with_eval3d,
+            ut_params=self.ut_params,
             **kwargs,
         )
         if masks is not None:
