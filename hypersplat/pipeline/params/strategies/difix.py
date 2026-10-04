@@ -193,12 +193,23 @@ def _trust_of_round(mean_change: float) -> float:
                  MIN_VIEW_TRUST, 1.0)
 
 
+def judged(entry: dict) -> Tuple[Optional[float], int, Optional[int]]:
+    """(mean change PSNR, views, kept views) a difix.rounds entry is judged on. Online Difix
+    pools small rounds (``judge`` "pooled": the pooled_* values; "pooling": too few views
+    yet, nothing to judge); a plain round is judged on its own values."""
+    j = entry.get("judge")
+    if j == "pooling":
+        return None, 0, None
+    if j == "pooled":
+        return entry.get("pooled_mean_change_psnr"), int(entry.get("pooled_n_views") or 0), entry.get("pooled_n_kept")
+    return entry.get("mean_change_psnr"), int(entry.get("n_views") or 0), entry.get("n_kept")
+
+
 def _hallucinating(last: dict) -> Optional[str]:
     """Why the last round says Difix is hallucinating at its angle, or None."""
-    mean = last.get("mean_change_psnr")
+    mean, n, kept = judged(last)
     if mean is not None and mean < HALLUCINATION_FLOOR:
         return f"mean change PSNR {mean:.1f} dB < {HALLUCINATION_FLOOR:.0f} dB floor"
-    n, kept = last.get("n_views") or 0, last.get("n_kept")
     if n and kept is not None and kept < MIN_KEPT_FRACTION * n:
         return f"only {kept}/{n} pseudo views passed the hallucination threshold"
     return None
@@ -227,7 +238,7 @@ def derive_max_angle(profile, config) -> Decision:
                         f"first round, camera spread unknown: {START_ANGLE:.0f} deg is validated faithful")
     last = rounds[-1]
     prev = float(last.get("max_angle") or START_ANGLE)
-    mean = last.get("mean_change_psnr")
+    mean = judged(last)[0]
     if mean is None:
         return Decision(prev, "hold", "last round has no change PSNR (Difix off?)")
     halluc = _hallucinating(last)
@@ -255,7 +266,9 @@ def derive_num_views(profile, config) -> Optional[Decision]:
 
 def derive_pseudo_weight(profile, config) -> Decision:
     rounds = _rounds(profile)
-    mean = rounds[-1].get("mean_change_psnr") if rounds else None
+    # The latest judged round (online Difix pools small rounds and leaves mean None while a
+    # pool refills: the weight holds instead of snapping back to the base)
+    mean = next((judged(r)[0] for r in reversed(rounds) if judged(r)[0] is not None), None)
     if mean is None:
         return Decision(BASE_PSEUDO_WEIGHT, "no-round-yet",
                         "no Difix change PSNR measured yet; base weight")

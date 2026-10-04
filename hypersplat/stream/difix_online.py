@@ -55,18 +55,36 @@ class DifixSources:
 
 class OnlineDifix:
     def __init__(self, model_id: str = "nvidia/difix_ref", device: str = "cuda", profile=None,
-                 debug_dir: Optional[str] = None):
+                 debug_dir: Optional[str] = None, seed: Optional[int] = 0, deterministic: bool = True,
+                 pool_views: int = 8):
+        """seed: base of a private per-view generator (None: torch's global RNG, which also
+        shifts the trainer's MCMC / sampling stream by however many draws Difix made).
+        deterministic: encode with the VAE posterior mean (no sampling noise at all).
+        pool_views: judge hallucination / steer angle and weight on the change PSNRs of the
+        last rounds holding at least this many views, not on one round alone. The stream cycle
+        runs 2-view rounds: one bad pair stopped Difix for the rest of the run and the orbit
+        angle random-walked on 2-view means. 0 = per round (the batch loop's rule)."""
         from hypersplat.pipeline.params import SceneProfile
 
         self.model_id = model_id
         self.device = device
         self.profile = profile if profile is not None else SceneProfile()
         self.debug_dir = Path(debug_dir) if debug_dir else None
+        self.seed = seed
+        self.deterministic = bool(deterministic)
+        self.pool_views = int(pool_views)
+        self._recent: List[Tuple[List[float], int, int, float]] = []  # (changes, kept, n, angle) per round
         self.fixer = None
         self.rounds = 0
         self.stop_reason: Optional[str] = None
         self.scale_idx = 0      # index into SCALES that last fit in VRAM
         self._round: Optional[dict] = None   # in-progress chunked round (begin/step/finish_round)
+
+    def view_seed(self, loop: int, k: int) -> Optional[int]:
+        """Seed of view k of round ``loop`` (None without a base seed)."""
+        if self.seed is None:
+            return None
+        return (int(self.seed) * 1_000_003 + loop * 1_009 + k) % (2 ** 63)
 
     # ------------------------------------------------------------------ model residency
     def _fixer_on_gpu(self):
@@ -75,8 +93,11 @@ class OnlineDifix:
         torch.cuda.empty_cache()
         if self.fixer is None:
             from hypersplat.beta.difix.augment import DifixFixer  # resolves the shared HF cache
-            logger.info(f"[Difix-online] Loading {self.model_id}")
+            logger.info(f"[Difix-online] Loading {self.model_id} (seed {self.seed}, "
+                        f"{'posterior-mean' if self.deterministic else 'sampled'} latents, "
+                        f"control pooled over {self.pool_views or 1} views)")
             self.fixer = DifixFixer(self.model_id, self.device)
+            self.fixer.deterministic = self.deterministic
         else:
             self.fixer.to(self.device)
         return self.fixer
@@ -165,7 +186,8 @@ class OnlineDifix:
                 t = time.time()
                 while True:
                     try:
-                        fixed = fixer(render, ref, scale=SCALES[self.scale_idx])
+                        fixed = fixer(render, ref, scale=SCALES[self.scale_idx],
+                                      seed=self.view_seed(self.rounds, len(r["fixed"])))
                         break
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
@@ -226,6 +248,8 @@ class OnlineDifix:
                                     weight=float(w), conf=0.0, src_kid=int(src.ids[s])))
             sources.append(int(s))
         stats = round_stats(loop, angle, angles, changes, threshold, len(views))
+        if self.pool_views > 0:
+            stats = self._pooled(stats, changes, len(views), len(poses), angle)
         n = max(len(poses), 1)
         stats.update({"step": int(step), "step_begin": r["step0"], "difix_scale": SCALES[self.scale_idx],
                       "wall_s": round(time.time() - r["t0"], 1), "chunks": r["chunks"],
@@ -249,6 +273,27 @@ class OnlineDifix:
                     f"park {stats['park_ms']} ms), {stats['wall_s']:.0f} s wall"
                     + (f"; stopping: {reason}" if reason else ""))
         return views, sources, stats
+
+    def _pooled(self, stats: dict, changes: List[float], kept: int, n: int, angle: float) -> dict:
+        """The round's stats plus pooled_* change PSNR / views / kept over the last rounds
+        holding >= pool_views views; strategies.difix.judged() decides on those. The pool
+        restarts when the orbit angle moves, since change PSNR depends on it. While it holds
+        fewer than pool_views views it judges nothing (judge "pooling": no stop, angle and
+        weight hold)."""
+        import math
+
+        if self._recent and abs(self._recent[-1][3] - angle) > 1e-6:
+            self._recent.clear()
+        self._recent.append((list(changes), int(kept), int(n), float(angle)))
+        while len(self._recent) > 1 and sum(r[2] for r in self._recent[1:]) >= self.pool_views:
+            self._recent.pop(0)
+        xs = [float(c) for r in self._recent for c in r[0] if c is not None and math.isfinite(float(c))]
+        n_pool = sum(r[2] for r in self._recent)
+        out = dict(stats)
+        out.update(judge="pooled" if n_pool >= self.pool_views else "pooling", pooled_rounds=len(self._recent),
+                   pooled_mean_change_psnr=round(sum(xs) / len(xs), 3) if xs else None,
+                   pooled_n_views=n_pool, pooled_n_kept=sum(r[1] for r in self._recent))
+        return out
 
     def _save_debug(self, loop: int, renders, fixed, n: int = 4):
         """Small before|after strip of the first views (the only thing a round writes)."""

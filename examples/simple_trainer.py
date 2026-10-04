@@ -433,6 +433,13 @@ class Config:
     difix_final_tail_steps: int = 750
     # Start Difix at scale 0.75 when less than this much VRAM is free (MB; OOM steps down anyway)
     difix_low_vram_mb: float = 3500.0
+    # Reproducible Difix (hypersplat/stream/difix_online.OnlineDifix): per-view private seed
+    # (None: torch's global RNG, shared with MCMC), VAE posterior mean instead of a sample, and
+    # hallucination stop / orbit angle / pseudo weight judged on >= difix_pool_views pooled
+    # views (0: on each round alone - one 2-view cycle round could stop Difix for the run)
+    difix_seed: Optional[int] = 0
+    difix_deterministic: bool = True
+    difix_pool_views: int = 8
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -734,7 +741,9 @@ class Runner:
             from hypersplat.stream.difix_online import OnlineDifix
             self.difix = OnlineDifix(cfg.difix_model_id, self.device,
                                      profile=SceneProfile.from_env() or SceneProfile(),
-                                     debug_dir=f"{cfg.result_dir}/difix_online")
+                                     debug_dir=f"{cfg.result_dir}/difix_online",
+                                     seed=cfg.difix_seed, deterministic=cfg.difix_deterministic,
+                                     pool_views=cfg.difix_pool_views)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -1284,7 +1293,10 @@ class Runner:
         with torch.no_grad():
             means = self.splats["means"][torch.sigmoid(self.splats["opacities"]) > 0.3]
             if len(means) > n:
-                means = means[torch.randperm(len(means), device=means.device)[:n]]
+                # Private generator: drawing from the global RNG here would shift the trainer's
+                # MCMC / sampling stream whenever (and however often) a Difix round runs
+                g = torch.Generator(device=means.device).manual_seed(len(means))
+                means = means[torch.randperm(len(means), device=means.device, generator=g)[:n]]
             return means.cpu().numpy().astype(np.float64)
 
     def _difix_sources(self):

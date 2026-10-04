@@ -302,20 +302,32 @@ class DifixFixer:
         self.device = device
         return self
 
+    @property
+    def deterministic(self) -> bool:
+        return getattr(self.pipe, "latent_sample_mode", "sample") == "argmax"
+
+    @deterministic.setter
+    def deterministic(self, on: bool):
+        """True: encode with the VAE posterior mean instead of a sample (no RNG noise)."""
+        self.pipe.latent_sample_mode = "argmax" if on else "sample"
+
     @torch.no_grad()
-    def __call__(self, image: np.ndarray, ref: Optional[np.ndarray] = None, scale: float = 1.0) -> np.ndarray:
+    def __call__(self, image: np.ndarray, ref: Optional[np.ndarray] = None, scale: float = 1.0,
+                 seed: Optional[int] = None) -> np.ndarray:
         """ref: a real photo near the pseudo pose (difix_ref only); anchors the fix to the
         actual scene instead of letting the model hallucinate structure from artifacts.
         scale < 1 runs Difix on a downscaled copy (activation memory ~ pixels) and resizes the
-        result back; used to fit small GPUs."""
+        result back; used to fit small GPUs. seed: a private generator for the call's noise, so
+        Difix neither varies run to run nor draws from (and shifts) the trainer's global RNG."""
         H, W = image.shape[:2]
         # SD latents need multiples of 8
         H8, W8 = max(8, int(H * scale) // 8 * 8), max(8, int(W * scale) // 8 * 8)
         pil = Image.fromarray(image).resize((W8, H8), Image.BICUBIC)
         ref_pil = Image.fromarray(ref).resize((W8, H8), Image.BICUBIC) if ref is not None else None
+        generator = torch.Generator(device=self.device).manual_seed(int(seed)) if seed is not None else None
         out = self.pipe(
             prompt_embeds=self.prompt_embeds, image=pil, ref_image=ref_pil, num_inference_steps=1,
-            timesteps=[199], guidance_scale=0.0, height=H8, width=W8,
+            timesteps=[199], guidance_scale=0.0, height=H8, width=W8, generator=generator,
         ).images[0]
         return np.asarray(out.resize((W, H), Image.BICUBIC))
 

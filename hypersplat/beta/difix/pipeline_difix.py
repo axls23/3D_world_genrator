@@ -643,14 +643,17 @@ class DifixPipeline(
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
-            elif isinstance(generator, list):
+            # "sample" draws from the VAE posterior (the run-to-run noise of a Difix output);
+            # "argmax" takes its mean - deterministic, no RNG consumed
+            mode = getattr(self, "latent_sample_mode", "sample")
+            if isinstance(generator, list):
                 init_latents = [
-                    retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                    retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode=mode)
                     for i in range(batch_size)
                 ]
                 init_latents = torch.cat(init_latents, dim=0)
             else:
-                init_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+                init_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode=mode)
 
             init_latents = self.vae.config.scaling_factor * init_latents
 

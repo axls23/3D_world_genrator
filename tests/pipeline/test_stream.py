@@ -437,7 +437,7 @@ def test_online_difix_round_weights_stats_and_stop(monkeypatch):
         def to(self, device):
             return self
 
-        def __call__(self, image, ref=None, scale=1.0):
+        def __call__(self, image, ref=None, scale=1.0, seed=None):
             rng = np.random.default_rng(0)
             return np.clip(image + rng.normal(0, self.noise, image.shape), 0, 255).astype(np.uint8)
 
@@ -470,7 +470,7 @@ def test_online_difix_steps_down_scale_on_oom():
         def to(self, device):
             return self
 
-        def __call__(self, image, ref=None, scale=1.0):
+        def __call__(self, image, ref=None, scale=1.0, seed=None):
             self.scales.append(scale)
             if scale > 0.75:
                 raise torch.cuda.OutOfMemoryError("fake OOM")
@@ -509,7 +509,7 @@ def test_online_difix_chunked_round_matches_blocking_round():
             self.device_moves.append(device)
             return self
 
-        def __call__(self, image, ref=None, scale=1.0):
+        def __call__(self, image, ref=None, scale=1.0, seed=None):
             _time.sleep(0.02)
             return np.clip(image.astype(np.int16) + 2, 0, 255).astype(np.uint8)
 
