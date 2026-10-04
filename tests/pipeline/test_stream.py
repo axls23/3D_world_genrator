@@ -584,6 +584,23 @@ def test_session_bootstrap_retry_after_source_end_uses_all_frames(session):
     assert session.failed and "boom again" in session.failed
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_session_ace_deterministic_reaches_bootstrap_and_refit(session, deterministic):
+    session.cfg.ace_deterministic = deterministic
+    for i in range(3):
+        _add(session, i)
+    session.file_size = session.file_size or (160, 120)
+    session._start_bootstrap()
+    boot_args = [c for c in session.sidecar.calls if c[0] == "bootstrap"][-1][1][1]
+    session._on_event("map", _map_rows([k.ace_path for k in session.store.frames()], 900.0))
+    session._maybe_refit(force=True)
+    refit_args = [c for c in session.sidecar.calls if c[0] == "refit"][-1][1][3]
+    for args in (boot_args, refit_args):
+        assert ("--deterministic" in args) == deterministic
+        if deterministic:
+            assert args[args.index("--deterministic") + 1] == "True"
+
+
 # ============================================================================ dashboard / stop
 def test_stop_file_ignores_stale_and_honours_new(tmp_path):
     from hypersplat.stream.training import StopFile

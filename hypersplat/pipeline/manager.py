@@ -213,6 +213,10 @@ class PipelineConfig:
         self.STREAM_EXPOSURE_OPT = getattr(args, 'stream_exposure_opt', False)
         # Online Difix: refine inside training instead of the STEP 3 retrain loop
         self.DIFIX_ONLINE = getattr(args, 'difix_online', False)
+        # Reproducible runs: trainer seed, deterministic kernels / inline view sampling, and
+        # deterministic ACE map training (bootstrap, refits) for stream runs
+        self.SEED = getattr(args, 'seed', None)
+        self.DETERMINISTIC = getattr(args, 'deterministic', False)
 
         # [ROBUSTNESS] Flag Validation. gsplat's UT projection is not differentiable, so UT
         # trains only with the world-space (eval3d) rasterizer, and neither passes gradients
@@ -972,6 +976,10 @@ class IntelligentPipeline:
 
         if self.config.DIFIX_ONLINE:
             cmd.append("--difix_online")
+        if self.config.SEED is not None:
+            cmd.extend(["--seed", str(self.config.SEED)])
+        if self.config.DETERMINISTIC:
+            cmd.append("--deterministic")
         if self.config.STREAM and self.config.STREAM_VIEWER_PORT:
             cmd.remove("--disable_viewer")
             cmd.extend(["--port", str(self.config.STREAM_VIEWER_PORT)])
@@ -1641,6 +1649,10 @@ def main():
                              "reconstructed once gains flatten (default 22)")
     parser.add_argument("--difix-online", dest="difix_online", action="store_true",
                         help="Run Difix rounds inside training (replaces the STEP 3 retrain loop)")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Reproducible training: deterministic kernels and inline view sampling; "
+                             "stream runs also localize a file fully before step 0 and train ACE "
+                             "maps deterministically. Slower; measured ~0.17 dB lower on drone 2k")
     parser.add_argument("--streaming_check_interval", type=int, default=1000,
                         help="Interval to check for new poses in streaming mode (default: 1000)")
 
@@ -1674,7 +1686,8 @@ def main():
     parser.add_argument("--skip-ace", action="store_true", help="Skip ACE-Zero pose estimation (use existing)")
     
     # Reproducibility
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (this process and the trainer; trainer default 42)")
 
     # JOGS-style Pose Optimization
     parser.add_argument("--pose-opt", dest="pose_opt", action="store_true", default=True,

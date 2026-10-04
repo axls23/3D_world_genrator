@@ -126,8 +126,9 @@ class Config:
     # Reproducible runs: deterministic torch/cuDNN/cuBLAS kernels, the stream sampler draws
     # inline instead of on a prefetch thread, and a file source is fully localized before
     # step 0, so seeds, depth maps and new views arrive at the same steps in every run (live
-    # sources cannot be pinned). Remaining spread: float atomics in the rasterizer backward
-    # and the ACE sidecar's RANSAC.
+    # sources cannot be pinned); ACE maps (bootstrap, refits) train with deterministic kernels
+    # too. Remaining spread: float atomics in the rasterizer backward and the ACE sidecar's
+    # RANSAC.
     deterministic: bool = False
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
@@ -981,7 +982,7 @@ class Runner:
             map_cache=cfg.stream_map_cache,
             record_stop_file=os.path.join(cfg.result_dir, "STOP_RECORDING"),
             record_seconds=cfg.stream_record_seconds, record_keyframes=cfg.stream_record_keyframes,
-            depth=cfg.stream_depth,
+            depth=cfg.stream_depth, ace_deterministic=cfg.deterministic,
         )
         self.depth_estimator = None
         if cfg.stream_depth:

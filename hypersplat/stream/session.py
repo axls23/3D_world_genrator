@@ -91,6 +91,9 @@ class StreamConfig:
     # capture instead of re-bootstrapping (A/B runs on one map; ~65-90 s saved per run).
     # Separate bootstraps of one capture differed by 0.55 dB, more than any knob tested.
     map_cache: Optional[str] = None
+    # Train ACE maps (bootstrap and refits) with deterministic cuDNN kernels: the autotuner
+    # picks algorithms by timing, so a map built while 3DGS shares the GPU varies run to run
+    ace_deterministic: bool = False
 
 
 def normalization_transform(c2ws: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -420,6 +423,10 @@ class StreamSession:
                   and all(meta.get(k) == v for k, v in key.items()) and not getattr(self, "_cache_failed", False))
         return cache, {**meta, **key}, usable
 
+    def _ace_extra_args(self) -> List[str]:
+        """Options shared by the bootstrap (ace_zero_hybrid.py) and refits (train_ace.py)."""
+        return ["--deterministic", "True"] if self.cfg.ace_deterministic else []
+
     def _start_bootstrap(self):
         frames = [kf.ace_path for kf in self.store.frames() if kf.ace_path][: self._bootstrap_target]
         self._bootstrap_attempted = len(frames)
@@ -444,7 +451,8 @@ class StreamSession:
                     f"(avg motion {self.gate.avg_motion or 0:.1f}, "
                     f"{self.ace_values['hybrid_train_iterations']} iterations, "
                     f"cooldown {self.ace_values['cooldown_iterations']})")
-        self.sidecar.bootstrap(frames, build_ace_args(self.ace_values, hybrid=True), cache_dir=cache_dir)
+        args = build_ace_args(self.ace_values, hybrid=True) + self._ace_extra_args()
+        self.sidecar.bootstrap(frames, args, cache_dir=cache_dir)
 
     def _maybe_refit(self, force: bool = False):
         """Caller holds _cond."""
@@ -466,6 +474,7 @@ class StreamSession:
                 "--num_data_workers", str(v["num_data_workers"]), "--pose_refinement", "mlp",
                 "--pose_refinement_wait", "0", "--refine_calibration", "False",
                 "--aug_rotation", str(v["aug_rotation"]), "--repro_loss_soft_clamp", str(v["repro_loss_soft_clamp"])]
+        args += self._ace_extra_args()
         logger.info(f"[Stream] Refitting ACE map on {len(frames)} keyframes "
                     f"({self._new_failed} unregistered, {self._new_registered} new registered)")
         self._job = "refit"
