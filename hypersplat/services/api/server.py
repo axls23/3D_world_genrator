@@ -45,7 +45,12 @@ from typing import List, Optional, Dict, Set
 from pydantic import BaseModel
 
 from hypersplat.pipeline import log_parsing
-from hypersplat.pipeline.wrapper import build_pipeline_args, validate_pipeline_config
+from hypersplat.pipeline.wrapper import (
+    PipelineMode,
+    build_mode_command,
+    build_pipeline_args,
+    validate_pipeline_config,
+)
 
 # Suppress noisy /api/status polling logs
 import logging
@@ -124,19 +129,35 @@ def get_python_executable() -> str:
 
 
 def build_pipeline_command(video_path: str, config: dict, output_dir: Path = OUTPUT_DIR) -> List[str]:
-    """Build the manager command for a job config (without --skip-ace).
+    """Build the command for a job config's mode (without --skip-ace).
 
-    Flags come from the shared builder in hypersplat.pipeline.wrapper, which
-    only emits values the client actually sent (not None); everything else
-    reaches the manager as "auto".
+    Dispatches through the shared entry point in hypersplat.pipeline.wrapper,
+    which only emits values the client actually sent (not None); everything
+    else reaches the manager as "auto". Simple mode trains on the job's
+    ``colmap_input`` dataset instead of the video.
     """
-    pipeline_script = SCRIPTS_DIR / "automated_intelligent_pipeline.py"
-    return [
-        get_python_executable(), "-u", str(pipeline_script),
-        video_path,
-        "--output_dir", str(output_dir),
-        *build_pipeline_args(config),
-    ]
+    mode = config.get("mode") or PipelineMode.LEVEL_2_ACE_ZERO
+    input_path = config.get("colmap_input") if mode == PipelineMode.LEVEL_1_SIMPLE else video_path
+    return build_mode_command(mode, get_python_executable(), GSPLAT_ROOT,
+                              input_path, output_dir, config)
+
+
+# Entry points the UI offers; served by /api/info so the buttons follow the backend.
+PIPELINE_MODES = {
+    PipelineMode.LEVEL_2_ACE_ZERO: {
+        "label": "ACE-Zero", "level": 2, "input": "video", "recommended": True,
+        "description": "Video → AI camera poses → 3DGS. Unset params are tuned per scene.",
+    },
+    PipelineMode.LEVEL_1_SIMPLE: {
+        "label": "Simple", "level": 1, "input": "colmap", "recommended": False,
+        "description": "Train directly on an existing COLMAP dataset (no video, no pose step).",
+    },
+    PipelineMode.LEVEL_3_CHUNKED: {
+        "label": "Chunked", "level": 3, "input": "video", "recommended": False,
+        "description": "Video → COLMAP-forced run. Experimental: chunking is not implemented yet, "
+                       "so it currently runs as a single pass.",
+    },
+}
 
 
 class AppState:
@@ -168,6 +189,7 @@ class AppState:
             "status": "queued",
             "video_path": video_path,
             "filename": Path(video_path).name,
+            "mode": config.get("mode") or PipelineMode.LEVEL_2_ACE_ZERO,
             "config": config,
             "progress": 0,
             "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -255,7 +277,15 @@ class AppState:
         sparse_dir = expected_ace_output / "sparse" / "0"
         has_existing_poses = (sparse_dir / "images.bin").exists() or (sparse_dir / "images.txt").exists()
         
-        if skip_ace_requested is True or (skip_ace_requested is None and has_existing_poses):
+        if config.get("stream"):
+            msg = "[System] Streaming pipeline: poses come from the ACE sidecar as frames arrive."
+            job["logs"].append(msg)
+            await self.broadcast_log(job, msg)
+        elif job["mode"] == PipelineMode.LEVEL_1_SIMPLE:
+            msg = f"[System] Level 1: training directly on {config.get('colmap_input')}."
+            job["logs"].append(msg)
+            await self.broadcast_log(job, msg)
+        elif skip_ace_requested is True or (skip_ace_requested is None and has_existing_poses):
             cmd.append("--skip-ace")
             msg = "[System] Skipping Step 1 (Using existing camera poses from file)."
             job["logs"].append(msg)
@@ -364,6 +394,7 @@ class AppState:
             "status": job["status"],
             "progress": job["progress"],
             "filename": job["filename"],
+            "mode": job["mode"],
             "created_at": job["created_at"],
             "started_at": job["started_at"],
             "completed_at": job["completed_at"],
@@ -419,6 +450,7 @@ class AppState:
                 "status": job["status"],
                 "progress": job["progress"],
                 "filename": job["filename"],
+                "mode": job["mode"],
                 "created_at": job["created_at"]
             })
             
@@ -480,6 +512,16 @@ async def upload_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def current_video() -> Optional[str]:
+    """This session's upload, else the most recent video in the uploads dir."""
+    if not state.current_video_path and UPLOADS_DIR.exists():
+        files = sorted(UPLOADS_DIR.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)
+        video_files = [f for f in files if f.suffix.lower() in ['.mp4', '.mov', '.avi']]
+        if video_files:
+            state.current_video_path = str(video_files[0])
+    return state.current_video_path
+
+
 class TrainRequest(BaseModel):
     """Training request parameters.
 
@@ -517,32 +559,61 @@ class TrainRequest(BaseModel):
     pose_opt: Optional[bool] = None
     app_opt: bool = False
 
+    # Pipeline stages (manager flags; unset = manager default)
+    difix: bool = False
+    refine_loops: Optional[int] = None
+    streaming: bool = False
+    prune: Optional[bool] = None
+    seed: Optional[int] = None
+
+    # Streaming pipeline: reconstruct from a live/recorded source instead of an upload.
+    # Video path, camera index ("0"), /dev/videoN, rtsp/http URL or flight://host:port.
+    stream_source: Optional[str] = None
+    stream_pace: Optional[str] = None          # auto | realtime | fast
+    stream_budget_mb: Optional[float] = None
+    stream_flight_port: Optional[int] = None
+    difix_online: bool = False                 # Difix inside training (no STEP 3 retrains)
+
 
 @app.post("/api/jobs/submit")
 async def submit_job(request: TrainRequest = TrainRequest()):
     """Submit a training job to the queue"""
-    video_path = request.video_path or state.current_video_path
-    
-    if not video_path:
-        uploads_dir = UPLOADS_DIR
-        if uploads_dir.exists():
-            files = sorted(uploads_dir.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)
-            video_files = [f for f in files if f.suffix.lower() in ['.mp4', '.mov', '.avi']]
-            if video_files:
-                video_path = str(video_files[0])
-                state.current_video_path = video_path
+    config = request.dict()
+    try:
+        validate_pipeline_config(config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if request.mode == PipelineMode.LEVEL_1_SIMPLE:
+        # Level 1 trains on an existing COLMAP dataset; no video involved.
+        if not request.colmap_input or not Path(request.colmap_input).is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail="Simple mode needs colmap_input: a directory with a COLMAP dataset."
+            )
+        job_id = state.enqueue_job(request.colmap_input, config)
+        await state.broadcast_queue_update()
+        return {"job_id": job_id, "status": "queued", "message": "Job successfully enqueued."}
+
+    if request.stream_source:
+        from hypersplat.stream.source import parse_source
+        try:
+            parse_source(request.stream_source)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        config["stream"] = True
+        job_id = state.enqueue_job(request.stream_source, config)
+        await state.broadcast_queue_update()
+        return {"job_id": job_id, "status": "queued", "message": "Stream job enqueued."}
+
+    video_path = request.video_path or current_video()
 
     if not video_path:
         raise HTTPException(
             status_code=400, 
             detail="No video uploaded. Please upload a video first."
         )
-        
-    config = request.dict()
-    try:
-        validate_pipeline_config(config)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
     job_id = state.enqueue_job(video_path, config)
     
     # Broadcast queue update to all global WebSocket clients
@@ -572,6 +643,16 @@ async def stop_training():
     raise HTTPException(status_code=400, detail="No active training job to stop")
 
 
+@app.post("/api/stream/stop")
+async def stop_stream():
+    """End a live stream run gracefully: the trainer sees <result_dir>/STOP at its next sync
+    and finishes with the usual final checkpoint, PLY and evaluation (unlike /api/stop)."""
+    stop_file = OUTPUT_DIR / "results" / "stream_3dgs" / "STOP"
+    stop_file.parent.mkdir(parents=True, exist_ok=True)
+    stop_file.touch()
+    return {"message": f"Stop requested ({stop_file})"}
+
+
 @app.get("/api/status")
 async def get_status():
     """Get current active training status and logs (Backward Compatibility)"""
@@ -580,7 +661,7 @@ async def get_status():
         return {
             "status": "training_running" if job["status"] in ["running", "processing"] else job["status"],
             "progress": job["progress"],
-            "mode": job["config"].get("mode", "ace_zero"),
+            "mode": job["mode"],
             "logs": job["logs"][-50:],
             "training_viewer_url": job.get("training_viewer_url"),
             "output_dir": str(OUTPUT_DIR)
@@ -605,6 +686,7 @@ async def get_jobs_queue():
             "status": job["status"],
             "progress": job["progress"],
             "filename": job["filename"],
+            "mode": job["mode"],
             "created_at": job["created_at"]
         })
     return {"jobs": queue_data}
@@ -622,6 +704,7 @@ async def get_job_details(job_id: str):
         "status": job["status"],
         "progress": job["progress"],
         "filename": job["filename"],
+        "mode": job["mode"],
         "config": job["config"],
         "created_at": job["created_at"],
         "started_at": job["started_at"],
@@ -856,13 +939,10 @@ async def get_info():
     has_existing_poses = (sparse_dir / "images.bin").exists() or (sparse_dir / "images.txt").exists()
     return {
         "server_version": "2.1.0",
-        "pipeline_modes": {
-            "ace_zero": "Level 2 ACE-Zero (AI Poses → 3DGS) - RECOMMENDED",
-            "simple": "Level 1 Simple Training (pre-processed data)",
-            "chunked": "Level 3 Chunked Pipeline (COLMAP-based)"
-        },
+        "pipeline_modes": PIPELINE_MODES,
         "quality_modes": ["fast", "balanced", "quality"],
-        "default_mode": "ace_zero",
+        "default_mode": PipelineMode.LEVEL_2_ACE_ZERO,
+        "current_video": Path(current_video()).name if current_video() else None,
         "output_dir": str(OUTPUT_DIR),
         "gsplat_root": str(GSPLAT_ROOT),
         "uploads_dir": str(UPLOADS_DIR),
@@ -921,6 +1001,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "status": job["status"],
                 "progress": job["progress"],
                 "filename": job["filename"],
+                "mode": job["mode"],
                 "created_at": job["created_at"]
             })
             
@@ -952,6 +1033,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "status": job["status"],
                         "progress": job["progress"],
                         "filename": job["filename"],
+                        "mode": job["mode"],
                         "created_at": job["created_at"],
                         "started_at": job["started_at"],
                         "completed_at": job["completed_at"],

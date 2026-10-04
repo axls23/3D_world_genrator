@@ -1,0 +1,17 @@
+{
+  "name": "ab_3dgs_drone",
+  "output": "experiments/results/ab_3dgs_drone",
+  "captures": ["demo/input/drone_demo.mp4"],
+  "flags": ["--stream-depth", "--no-early-stopping"],
+  "repeats": {"baseline": 3, "default": 1},
+  "variants": {
+    "baseline": {},
+    "ssim_hi": {"ssim_lambda": 0.3},
+    "reg_lo": {"opacity_reg": 0.01, "scale_reg": 0.01},
+    "cap_lo": {"strategy.cap-max": 150000},
+    "sh_slow": {"sh_degree_interval": 700},
+    "depth_hi": {"stream_depth_lambda": 0.15},
+    "init_small": {"init_scale": 1.0}
+  },
+  "keep_checkpoints": false
+}

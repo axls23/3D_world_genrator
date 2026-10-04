@@ -62,7 +62,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     vec4 *__restrict__ v_quats,        // [B, N, 4]
     vec3 *__restrict__ v_scales,       // [B, N, 3]
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
-    scalar_t *__restrict__ v_opacities // [B, C, N] or [nnz]
+    scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
+    const scalar_t *__restrict__ v_render_depths // [B, C, image_height, image_width, 2] optional
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -76,6 +77,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     last_ids += iid * image_height * image_width;
     v_render_colors += iid * image_height * image_width * CDIM;
     v_render_alphas += iid * image_height * image_width;
+    const bool with_depths = v_render_depths != nullptr;
+    if (with_depths) {
+        v_render_depths += iid * image_height * image_width * 2;
+    }
     if (backgrounds != nullptr) {
         backgrounds += iid * CDIM;
     }
@@ -159,6 +164,11 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     }
     const vec3 ray_d = ray.ray_dir;
     const vec3 ray_o = ray.ray_org;
+    // Ray-hit depth z = z(ray_o) + t * dot(ray_d, z_axis), as in the forward pass
+    const scalar_t *vm = viewmats0 + iid * 16;
+    const vec3 z_axis = {vm[8], vm[9], vm[10]};
+    const float z_org = glm::dot(z_axis, ray_o) + vm[11];
+    const float z_dir = glm::dot(z_axis, ray_d);
 
     // keep not rasterizing threads around for reading data
     bool done = (i < image_height && j < image_width) && ray.valid_flag;
@@ -201,6 +211,13 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         v_render_c[k] = v_render_colors[pix_id * CDIM + k];
     }
     const float v_render_a = v_render_alphas[pix_id];
+    // depth moments (sum w*z, sum w*z^2): their grads and the back-to-front buffer
+    float v_render_d[2] = {0.f, 0.f};
+    float buffer_d[2] = {0.f, 0.f};
+    if (with_depths) {
+        v_render_d[0] = v_render_depths[pix_id * 2];
+        v_render_d[1] = v_render_depths[pix_id * 2 + 1];
+    }
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -332,14 +349,37 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
-                if (opac * vis <= 0.999f) {
+                // grads of gro and of the unnormalized ray direction grd
+                vec3 v_gro = {0.f, 0.f, 0.f};
+                vec3 v_grd = {0.f, 0.f, 0.f};
+                float z = 0.f;
+                if (with_depths) {
+                    // z = z_org + t * z_dir, t = -<gro, grd> / <grd, grd>
+                    const float gg = glm::dot(grd, grd);
+                    const float t_hit = -glm::dot(gro, grd) / gg;
+                    z = z_org + t_hit * z_dir;
+                    // the moments blend like two more channels (zero background)
+                    v_alpha += (z * T - buffer_d[0] * ra) * v_render_d[0] +
+                               (z * z * T - buffer_d[1] * ra) * v_render_d[1];
+                    // z itself moves with the Gaussian (not clamped with alpha)
+                    const float v_t =
+                        fac * (v_render_d[0] + 2.f * z * v_render_d[1]) * z_dir;
+                    v_gro += (-v_t / gg) * grd;
+                    v_grd += (-v_t / gg) * (gro + 2.f * t_hit * grd);
+                }
+
+                const bool unclamped = opac * vis <= 0.999f;
+                if (unclamped) {
                     const float v_vis = opac * v_alpha;
                     float v_gradDist = -0.5f * vis * v_vis;
                     vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
                     vec3 v_grd_n = - glm::cross(v_gcrod, gro);
-                    vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                    vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
-                    mat3 v_Mt = glm::outerProduct(v_grd, ray_d) + 
+                    v_gro += glm::cross(v_gcrod, grd_n);
+                    v_grd += safe_normalize_bw(grd, v_grd_n);
+                    v_opacity_local = vis * v_alpha;
+                }
+                if (unclamped || with_depths) {
+                    mat3 v_Mt = glm::outerProduct(v_grd, ray_d) +
                         glm::outerProduct(v_gro, o_minus_mu);
                     vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
@@ -347,12 +387,15 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                     quat_scale_to_preci_half_vjp(
                         quat, scale, R, glm::transpose(v_Mt), v_quat_local, v_scale_local
                     );
-                    v_opacity_local = vis * v_alpha;
                 }
 
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     buffer[k] += rgbs_batch[t * CDIM + k] * fac;
+                }
+                if (with_depths) {
+                    buffer_d[0] += z * fac;
+                    buffer_d[1] += z * z * fac;
                 }
             }
             warpSum<CDIM>(v_rgb_local, warp);
@@ -433,7 +476,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
-    at::Tensor v_opacities   // [..., C, N] or [nnz]
+    at::Tensor v_opacities,  // [..., C, N] or [nnz]
+    const at::optional<at::Tensor> v_render_depths // [..., C, image_height, image_width, 2]
 ) {
     bool packed = opacities.dim() == 1;
     assert (packed == false); // only support non-packed for now
@@ -525,7 +569,10 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             reinterpret_cast<vec4 *>(v_quats.data_ptr<float>()),
             reinterpret_cast<vec3 *>(v_scales.data_ptr<float>()),
             v_colors.data_ptr<float>(),
-            v_opacities.data_ptr<float>()
+            v_opacities.data_ptr<float>(),
+            v_render_depths.has_value()
+                ? v_render_depths.value().data_ptr<float>()
+                : nullptr
         );
 }
 
@@ -564,7 +611,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         at::Tensor v_quats,                                                    \
         at::Tensor v_scales,                                                   \
         at::Tensor v_colors,                                                   \
-        at::Tensor v_opacities                                                 \
+        at::Tensor v_opacities,                                                \
+        const at::optional<at::Tensor> v_render_depths                         \
     );
 
 __INS__(1)

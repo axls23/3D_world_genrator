@@ -1,0 +1,25 @@
+{
+  "name": "ab_3dgut_handheld_2k",
+  "output": "experiments/results/ab_3dgut_handheld_2k",
+  "captures": [
+    "demo/input/ab_captures/stegna_street.mp4"
+  ],
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut"
+  ],
+  "repeats": {
+    "baseline": 1,
+    "default": 1
+  },
+  "variants": {
+    "baseline": {}
+  },
+  "keep_checkpoints": false,
+  "notes": "Single 3DGUT (unscented transform) run on the hand-held street walk; same settings as ab_3dgs_multiscene_2k otherwise. --with_ut implies eval3d and, for streams, drops pose_opt (UT has no pose gradients)."
+}

@@ -96,3 +96,56 @@ def test_rasterization(
     )
     torch.testing.assert_close(renders, _renders, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(alphas, _alphas, rtol=1e-4, atol=1e-4)
+
+
+def _ut_scene(n: int = 2000):
+    torch.manual_seed(0)
+    means = torch.randn(n, 3, device=device) * 0.6 + torch.tensor([0.0, 0.0, 4.0], device=device)
+    quats = torch.nn.functional.normalize(torch.randn(n, 4, device=device), dim=-1)
+    scales = torch.full((n, 3), 0.03, device=device)
+    opacities = torch.full((n,), 0.7, device=device)
+    colors = torch.rand(n, 3, device=device)
+    viewmats = torch.eye(4, device=device)[None]
+    Ks = torch.tensor([[300.0, 0, 160], [0, 300.0, 120], [0, 0, 1]], device=device)[None]
+    return means, quats, scales, opacities, colors, viewmats, Ks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.parametrize("render_mode", ["RGB+ED", "RGB+D", "ED", "D"])
+def test_rasterization_ut_depth_modes(render_mode: str):
+    """UT + eval3d renders depth modes (the eval3d kernel is 3-channel only) and a loss on
+    rendered depth reaches the means (the UT projection itself is not differentiable)."""
+    from gsplat.rendering import rasterization
+
+    means, quats, scales, opacities, colors, viewmats, Ks = _ut_scene()
+    means.requires_grad_(True)
+    kw = dict(width=320, height=240, packed=False, with_ut=True, with_eval3d=True)
+    out, alphas, _ = rasterization(
+        means, quats, scales, opacities, colors, viewmats, Ks, render_mode=render_mode, **kw
+    )
+    n_ch = 4 if render_mode.startswith("RGB") else 1
+    assert out.shape == (1, 240, 320, n_ch)
+    # One pass with all channels == channel-chunked passes
+    chunked, _, _ = rasterization(
+        means, quats, scales, opacities, colors, viewmats, Ks, render_mode=render_mode,
+        channel_chunk=1, **kw
+    )
+    torch.testing.assert_close(out, chunked)
+    if n_ch == 4:
+        rgb, rgb_alphas, _ = rasterization(
+            means, quats, scales, opacities, colors, viewmats, Ks, render_mode="RGB", **kw
+        )
+        torch.testing.assert_close(out[..., :3], rgb)
+        torch.testing.assert_close(alphas, rgb_alphas)
+
+    # Same depth as the (differentiable) standard rasterizer
+    ref, ref_alphas, _ = rasterization(
+        means, quats, scales, opacities, colors, viewmats, Ks, render_mode=render_mode,
+        width=320, height=240, packed=False,
+    )
+    if render_mode.endswith("ED"):
+        m = (alphas[..., 0] > 0.5) & (ref_alphas[..., 0] > 0.5)
+        assert (out[..., -1][m] - ref[..., -1][m]).abs().median() < 0.05
+
+    out[..., -1].mean().backward()
+    assert means.grad is not None and means.grad[:, 2].abs().sum() > 0

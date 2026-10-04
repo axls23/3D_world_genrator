@@ -449,6 +449,18 @@ def rasterization(
         batch_ids, camera_ids, gaussian_ids = None, None, None
         image_ids = None
 
+    # Under eval3d the kernel renders depth itself: z where each pixel ray peaks inside a
+    # Gaussian (3DGRT hit distance), differentiable, with its second moment for variance
+    kernel_depth = with_eval3d and render_mode in ("D", "ED", "RGB+D", "RGB+ED")
+    if with_ut and not with_eval3d and render_mode in ("D", "ED", "RGB+D", "RGB+ED"):
+        # The UT projection is not differentiable, so its depths carry no gradient and a
+        # loss on rendered depth would never move the Gaussians. Recompute each mean's
+        # camera-space depth in torch: the same value, but differentiable.
+        depths = (
+            torch.einsum("...cj,...nj->...cn", viewmats[..., 2, :3], means)
+            + viewmats[..., 2, 3:4]
+        )  # [..., C, N]
+
     if compensations is not None:
         opacities = opacities * compensations
 
@@ -611,7 +623,13 @@ def rasterization(
             colors = reshape_view(C, colors, N_world)
 
     # Rasterize to pixels
-    if render_mode in ["RGB+D", "RGB+ED"]:
+    if kernel_depth:
+        if render_mode in ["D", "ED"]:
+            # depth only: one dummy color channel
+            colors = torch.zeros(opacities.shape + (1,), device=opacities.device)
+            if backgrounds is not None:
+                backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
+    elif render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
         if backgrounds is not None:
             backgrounds = torch.cat(
@@ -669,6 +687,7 @@ def rasterization(
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
+        depth_moments = None
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -677,7 +696,7 @@ def rasterization(
                 else None
             )
             if with_eval3d:
-                render_colors_, render_alphas_ = rasterize_to_pixels_eval3d(
+                out = rasterize_to_pixels_eval3d(
                     means,
                     quats,
                     scales,
@@ -698,7 +717,11 @@ def rasterization(
                     ftheta_coeffs=ftheta_coeffs,
                     rolling_shutter=rolling_shutter,
                     viewmats_rs=viewmats_rs,
+                    return_depths=kernel_depth and i == 0,
                 )
+                render_colors_, render_alphas_ = out[:2]
+                if kernel_depth and i == 0:
+                    depth_moments = out[2]
             else:
                 render_colors_, render_alphas_ = rasterize_to_pixels(
                     means2d,
@@ -720,7 +743,7 @@ def rasterization(
         render_alphas = render_alphas[0]  # discard the rest
     else:
         if with_eval3d:
-            render_colors, render_alphas = rasterize_to_pixels_eval3d(
+            out = rasterize_to_pixels_eval3d(
                 means,
                 quats,
                 scales,
@@ -741,7 +764,10 @@ def rasterization(
                 ftheta_coeffs=ftheta_coeffs,
                 rolling_shutter=rolling_shutter,
                 viewmats_rs=viewmats_rs,
+                return_depths=kernel_depth,
             )
+            render_colors, render_alphas = out[:2]
+            depth_moments = out[2] if kernel_depth else None
         else:
             render_colors, render_alphas = rasterize_to_pixels(
                 means2d,
@@ -757,6 +783,17 @@ def rasterization(
                 packed=packed,
                 absgrad=absgrad,
             )
+    if kernel_depth:
+        # accumulated depth sum w*z as the depth channel; the second moment gives the
+        # per-pixel depth variance E[z^2] - E[z]^2 (a confidence signal for depth losses)
+        acc = render_alphas.clamp(min=1e-10)
+        meta["render_depth_var"] = (
+            depth_moments[..., 1:2] / acc - (depth_moments[..., :1] / acc) ** 2
+        ).clamp(min=0.0)
+        if render_mode in ["D", "ED"]:
+            render_colors = depth_moments[..., :1]
+        else:
+            render_colors = torch.cat([render_colors, depth_moments[..., :1]], dim=-1)
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(

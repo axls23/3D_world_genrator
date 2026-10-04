@@ -700,7 +700,8 @@ def rasterize_to_pixels_eval3d(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
-) -> Tuple[Tensor, Tensor]:
+    return_depths: bool = False,
+) -> Tuple[Tensor, ...]:
     """Rasterizes Gaussians to pixels.
 
     Similar to `rasterize_to_pixels()`, but compute the Gaussian responses in the
@@ -712,6 +713,10 @@ def rasterize_to_pixels_eval3d(
 
         - **Rendered colors**. [..., C, image_height, image_width, channels]
         - **Rendered alphas**. [..., C, image_height, image_width, 1]
+        - **Rendered depth moments** (only with `return_depths`).
+          [..., C, image_height, image_width, 2]: sum_i w_i z_i and sum_i w_i z_i^2,
+          z_i the camera-space depth where the pixel ray peaks inside Gaussian i
+          (differentiable w.r.t. means, quats, scales and opacities)
     """
     batch_dims = means.shape[:-2]
     num_batch_dims = len(batch_dims)
@@ -817,7 +822,7 @@ def rasterize_to_pixels_eval3d(
         tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    render_colors, render_alphas = _RasterizeToPixelsEval3D.apply(
+    render_colors, render_alphas, render_depths = _RasterizeToPixelsEval3D.apply(
         means.contiguous(),
         quats.contiguous(),
         scales.contiguous(),
@@ -842,10 +847,13 @@ def rasterize_to_pixels_eval3d(
         # rolling shutter
         rolling_shutter,
         viewmats_rs.contiguous() if viewmats_rs is not None else None,
+        return_depths,
     )
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
+    if return_depths:
+        return render_colors, render_alphas, render_depths
     return render_colors, render_alphas
 
 
@@ -1408,7 +1416,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         # rolling shutter
         rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
-    ) -> Tuple[Tensor, Tensor]:
+        with_depths: bool = False,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         ut_params = ut_params.to_cpp()
         rs_type = rolling_shutter.to_cpp()
         camera_model_type = _make_lazy_cuda_obj(
@@ -1420,7 +1429,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             else FThetaCameraDistortionParameters.to_cpp_default()
         )
 
-        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
+        render_colors, render_alphas, last_ids, render_depths = _make_lazy_cuda_func(
             "rasterize_to_pixels_from_world_3dgs_fwd"
         )(
             means,
@@ -1445,6 +1454,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             ftheta_coeffs,
             isect_offsets,
             flatten_ids,
+            with_depths,
         )
 
         ctx.save_for_backward(
@@ -1473,14 +1483,16 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ctx.camera_model_type = camera_model_type
         ctx.tile_size = tile_size
         ctx.ftheta_coeffs = ftheta_coeffs
+        ctx.with_depths = with_depths
 
-        return render_colors, render_alphas
+        return render_colors, render_alphas, render_depths
 
     @staticmethod
     def backward(
         ctx,
         v_render_colors: Tensor,  # [..., C, H, W, 3]
         v_render_alphas: Tensor,  # [..., C, H, W, 1]
+        v_render_depths: Tensor,  # [..., C, H, W, 2] (or [..., 0] without depths)
     ):
         (
             means,
@@ -1538,6 +1550,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            v_render_depths.contiguous() if ctx.with_depths else None,
         )
 
         if ctx.needs_input_grad[5]:  # backgrounds
@@ -1557,6 +1570,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
+            None,
             None,
             None,
             None,

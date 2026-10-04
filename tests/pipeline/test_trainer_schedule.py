@@ -13,6 +13,7 @@ if str(EXAMPLES) not in sys.path:
 
 from trainer_schedule import (  # noqa: E402
     PlateauDetector,
+    WorldConvergence,
     early_stop_defaults,
     floater_prune_mask,
     resolve_trainer_schedule,
@@ -124,3 +125,121 @@ def test_floater_mask_without_isolation():
     iso, opac, log_scales = _gaussians(1000)
     mask = floater_prune_mask(None, opac, log_scales)
     assert mask.sum().item() <= 20
+
+
+def test_stream_horizon_extends_uncapped_and_matches_static_when_idle():
+    from trainer_schedule import StreamHorizon
+
+    h = StreamHorizon(30_000, 25_000)
+    assert h.extend == 10_000 and h.refine_stop_iter == 25_000
+    assert h.lr_factor(15_000, 0.1) == pytest.approx(0.1 ** 0.5)  # ExponentialLR when idle
+    assert not h.on_new_views(100)  # still inside the initial budget
+    for step in range(0, 200_000, 50):  # views keep arriving: never capped
+        h.on_new_views(step)
+    assert h.value == 199_950 + 10_000 and h.refine_stop_iter == h.value - 5_000
+    h.finish(200_000)
+    assert h.value == 200_000 and not h.on_new_views(200_000)
+
+
+def test_stream_horizon_optional_cap():
+    from trainer_schedule import StreamHorizon
+
+    h = StreamHorizon(7_000, 5_833, extend=2_000, cap=12_000)
+    h.on_new_views(11_000)
+    assert h.value == 12_000
+
+
+# ---------------------------------------------------------------- WorldConvergence
+def _run_world(conv, psnrs, *, start=500, every=500, quiet_from=0, gs=100_000, loss=0.05,
+               map_idle=True, wait=None):
+    """Feed one probe per psnr value; step of the first True (or None)."""
+    for i, p in enumerate(psnrs):
+        step = start + i * every
+        if conv.update(step, psnr=p, loss_ema=loss, num_gs=gs, views_quiet_steps=step - quiet_from,
+                       map_idle=map_idle, extra_wait=wait):
+            return step
+    return None
+
+
+def test_world_converges_on_plateau_after_confirmation():
+    conv = WorldConvergence(min_steps=2000, window=3, confirm=2, quiet_steps=1000)
+    psnrs = [18, 20, 21.5, 21.9, 22.0, 22.05, 22.08, 22.09, 22.1, 22.1]
+    step = _run_world(conv, psnrs)
+    assert step is not None and step >= 2000
+    assert conv.status["converged"] and "converged" in conv.status["reason"]
+    # needs `confirm` consecutive passing probes, not just one
+    assert conv.streak == 2
+
+
+def test_world_waits_while_quality_still_rising():
+    conv = WorldConvergence(min_steps=0, window=3, confirm=2, quiet_steps=0, target_psnr=40)
+    assert _run_world(conv, [15 + i for i in range(12)]) is None
+    assert "quality improving" in conv.status["reason"]
+
+
+def test_world_modest_target_accepts_small_gains():
+    # +0.3 dB per window: above min_gain (not a plateau) but under loose_gain above target
+    kw = dict(min_steps=0, window=3, confirm=2, quiet_steps=0, min_gain=0.15, loose_gain=0.5)
+    psnrs = [23 + 0.1 * i for i in range(10)]
+    assert _run_world(WorldConvergence(target_psnr=22.0, **kw), psnrs) is not None
+    assert _run_world(WorldConvergence(target_psnr=30.0, **kw), psnrs) is None
+
+
+def test_world_blocked_by_coverage_growth_and_waits():
+    flat = [25.0] * 12
+    kw = dict(min_steps=0, window=3, confirm=2, quiet_steps=1500)
+    # new views keep arriving (quiet counter never reaches quiet_steps)
+    conv = WorldConvergence(**kw)
+    for i, p in enumerate(flat):
+        step = 500 + 500 * i
+        assert not conv.update(step, psnr=p, loss_ema=0.05, num_gs=1000, views_quiet_steps=100,
+                               map_idle=True)
+    assert "new views" in conv.status["reason"]
+    assert _run_world(WorldConvergence(**kw), flat, map_idle=False) is None
+    assert _run_world(WorldConvergence(**kw), flat, wait="first Difix round") is None
+    # Gaussian count still growing 10% per probe
+    conv = WorldConvergence(**kw)
+    for i, p in enumerate(flat):
+        step = 500 + 500 * i
+        assert not conv.update(step, psnr=p, loss_ema=0.05, num_gs=int(1000 * 1.1 ** i),
+                               views_quiet_steps=step, map_idle=True)
+    assert "model growing" in conv.status["reason"]
+
+
+def test_world_data_change_restarts_windows():
+    conv = WorldConvergence(min_steps=0, window=3, confirm=2, quiet_steps=0)
+    for i in range(4):
+        conv.update(500 * (i + 1), psnr=25.0, loss_ema=0.05, num_gs=1000, views_quiet_steps=5000,
+                    map_idle=True)
+    assert conv.streak == 1
+    conv.on_data_change(2000)
+    assert conv.streak == 0 and not conv.history
+    assert not conv.update(2500, psnr=25.0, loss_ema=0.05, num_gs=1000, views_quiet_steps=500,
+                           map_idle=True)
+    assert "measuring" in conv.status["reason"]
+
+
+def test_world_falls_back_to_loss_without_held_out_views():
+    kw = dict(min_steps=0, window=3, confirm=2, quiet_steps=0)
+    conv = WorldConvergence(**kw)
+    losses = [0.2, 0.1, 0.06, 0.05, 0.0499, 0.0498, 0.0498, 0.0497, 0.0497]
+    hit = None
+    for i, l in enumerate(losses):
+        if conv.update(500 * (i + 1), psnr=None, loss_ema=l, num_gs=1000, views_quiet_steps=10_000,
+                       map_idle=True):
+            hit = i
+            break
+    assert hit is not None and hit >= 5
+    assert "no held-out views" in conv.status["quality"]
+
+
+def test_world_growth_ignored_when_disabled():
+    # MCMC-style: Gaussians grow 10 % per probe toward the cap while quality is flat
+    conv = WorldConvergence(min_steps=0, window=3, confirm=2, quiet_steps=0, growth_tol=None)
+    hit = None
+    for i in range(12):
+        if conv.update(500 * (i + 1), psnr=23.3, loss_ema=0.05, num_gs=int(1000 * 1.1 ** i),
+                       views_quiet_steps=10_000, map_idle=True):
+            hit = i
+            break
+    assert hit == 4  # window of 3 probes + 2 confirmations

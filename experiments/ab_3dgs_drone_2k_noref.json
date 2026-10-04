@@ -1,0 +1,43 @@
+{
+  "name": "ab_3dgs_drone_2k_noref",
+  "output": "experiments/results/ab_3dgs_drone_2k_noref",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000"
+  ],
+  "repeats": {
+    "baseline": 3,
+    "default": 1
+  },
+  "variants": {
+    "baseline": {},
+    "ssim_hi": {
+      "ssim_lambda": 0.3
+    },
+    "reg_lo": {
+      "opacity_reg": 0.01,
+      "scale_reg": 0.01
+    },
+    "cap_lo": {
+      "strategy.cap-max": 150000
+    },
+    "sh_slow": {
+      "sh_degree_interval": 200
+    },
+    "depth_hi": {
+      "stream_depth_lambda": 0.15
+    },
+    "init_small": {
+      "init_scale": 1.0
+    }
+  },
+  "keep_checkpoints": false,
+  "notes": "ACE held fixed (no cycle refits) so every variant trains on the same first-map poses; a background refit overlapped >50% of a 2k-step run and its timing varies per run"
+}

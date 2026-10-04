@@ -53,7 +53,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     scalar_t
         *__restrict__ render_colors,      // [B, C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [B, C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [B, C, image_height, image_width]
+    int32_t *__restrict__ last_ids,       // [B, C, image_height, image_width]
+    scalar_t *__restrict__ render_depths  // [B, C, image_height, image_width, 2] optional
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -69,6 +70,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     render_colors += iid * image_height * image_width * CDIM;
     render_alphas += iid * image_height * image_width;
     last_ids += iid * image_height * image_width;
+    if (render_depths != nullptr) {
+        render_depths += iid * image_height * image_width * 2;
+    }
     if (backgrounds != nullptr) {
         backgrounds += iid * CDIM;
     }
@@ -144,6 +148,14 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     }
     const vec3 ray_d = ray.ray_dir;
     const vec3 ray_o = ray.ray_org;
+    // Ray-hit depth: camera-space z of the point where the ray peaks inside a Gaussian,
+    // z = z(ray_o) + t * dot(ray_d, z_axis), with z_axis the viewmat's 3rd row (exact
+    // for any global-shutter camera model; rolling shutter measures z in the start pose)
+    const bool with_depths = render_depths != nullptr;
+    const scalar_t *vm = viewmats0 + iid * 16;
+    const vec3 z_axis = {vm[8], vm[9], vm[10]};
+    const float z_org = glm::dot(z_axis, ray_o) + vm[11];
+    const float z_dir = glm::dot(z_axis, ray_d);
 
     // return if out of bounds
     // keep not rasterizing threads around for reading data
@@ -157,6 +169,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
         for (uint32_t k = 0; k < CDIM; ++k) {
             render_colors[pix_id * CDIM + k] =
                 backgrounds == nullptr ? 0.0f : backgrounds[k];
+        }
+        if (with_depths) {
+            render_depths[pix_id * 2] = 0.0f;
+            render_depths[pix_id * 2 + 1] = 0.0f;
         }
         return;
     }
@@ -194,6 +210,7 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     uint32_t tr = block.thread_rank();
 
     float pix_out[CDIM] = {0.f};
+    float pix_depth[2] = {0.f, 0.f}; // sum w*z, sum w*z^2
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -247,7 +264,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
             const mat3 iscl_rot = iscl_rot_batch[t];
 
             const vec3 gro = iscl_rot * (ray_o - xyz);
-            const vec3 grd = safe_normalize(iscl_rot * ray_d);
+            const vec3 gd = iscl_rot * ray_d;
+            const vec3 grd = safe_normalize(gd);
             const vec3 gcrod = glm::cross(grd, gro);
             const float grayDist = glm::dot(gcrod, gcrod);
             const float power = -0.5f * grayDist;
@@ -270,6 +288,13 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
             for (uint32_t k = 0; k < CDIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
+            if (with_depths) {
+                // ray parameter of the response peak (3DGRT hit distance)
+                const float t_hit = -glm::dot(gro, gd) / glm::dot(gd, gd);
+                const float z = z_org + t_hit * z_dir;
+                pix_depth[0] += z * vis;
+                pix_depth[1] += z * z * vis;
+            }
             cur_idx = batch_start + t;
 
             T = next_T;
@@ -291,6 +316,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
         }
         // index in bin of last gaussian in this pixel
         last_ids[pix_id] = static_cast<int32_t>(cur_idx);
+        if (with_depths) {
+            render_depths[pix_id * 2] = pix_depth[0];
+            render_depths[pix_id * 2 + 1] = pix_depth[1];
+        }
     }
 }
 
@@ -324,9 +353,10 @@ void launch_rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // outputs
-    at::Tensor renders, // [..., C, image_height, image_width, channels]
-    at::Tensor alphas,  // [..., C, image_height, image_width]
-    at::Tensor last_ids // [..., C, image_height, image_width]
+    at::Tensor renders,  // [..., C, image_height, image_width, channels]
+    at::Tensor alphas,   // [..., C, image_height, image_width]
+    at::Tensor last_ids, // [..., C, image_height, image_width]
+    at::optional<at::Tensor> render_depths // [..., C, image_height, image_width, 2]
 ) {
     // Note: quats need to be normalized before passing in.
 
@@ -408,7 +438,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            render_depths.has_value() ? render_depths.value().data_ptr<float>()
+                                      : nullptr
         );
 }
 
@@ -441,8 +473,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         const at::Tensor renders,                                              \
         const at::Tensor alphas,                                               \
-        const at::Tensor last_ids                                               \
-    );                                                                        
+        const at::Tensor last_ids,                                             \
+        at::optional<at::Tensor> render_depths                                 \
+    );                                                                      
 
 __INS__(1)
 __INS__(2)

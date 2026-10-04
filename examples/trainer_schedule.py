@@ -1,4 +1,5 @@
-"""Schedule-relative trainer constants, plateau early stopping and floater thresholds.
+"""Schedule-relative trainer constants, plateau / world-convergence early stopping and
+floater thresholds.
 
 Kept free of CUDA / gsplat imports so it can be unit tested on CPU
 (tests/pipeline/test_trainer_schedule.py).
@@ -70,6 +71,57 @@ def early_stop_defaults(
     return patience, min_steps
 
 
+class StreamHorizon:
+    """Dynamic training length for stream runs.
+
+    A live source has no frame count, so a fixed ``max_steps`` would cut training off while
+    new views keep arriving. ``initial`` (cfg.max_steps) is only the first budget: every
+    newly registered view pushes the end to at least ``step + extend``, so training runs
+    until ``extend`` steps after the last new view (or a STOP). ``cap`` is an optional hard
+    ceiling (None: uncapped). ``finish(end)`` pins the end (file source done + tail steps).
+
+    Densification keeps running while the horizon moves: it stops ``refine_gap`` steps before
+    the current end (the static schedule's gap, at most extend / 2), never earlier than the
+    static ``refine_stop``. Unextended, both match the static schedule exactly.
+    """
+
+    def __init__(self, initial: int, refine_stop: int, extend: Optional[int] = None,
+                 cap: Optional[int] = None):
+        self.initial = int(initial)
+        self.value = self.initial
+        self.extend = int(extend) if extend is not None else max(1000, self.initial // 3)
+        self.cap = cap
+        self.refine_stop0 = int(refine_stop)
+        self.refine_gap = min(max(self.initial - self.refine_stop0, 0), self.extend // 2)
+        self.finished = False
+
+    def on_new_views(self, step: int) -> bool:
+        """New views registered at ``step``; True if the end moved."""
+        if self.finished:
+            return False
+        target = step + self.extend
+        if self.cap is not None:
+            target = min(target, int(self.cap))
+        if target <= self.value:
+            return False
+        self.value = target
+        return True
+
+    def finish(self, end: int):
+        self.value = int(end)
+        self.finished = True
+
+    @property
+    def refine_stop_iter(self) -> int:
+        if self.value == self.initial:
+            return self.refine_stop0
+        return max(self.refine_stop0, self.value - self.refine_gap)
+
+    def lr_factor(self, step: int, final: float) -> float:
+        """Exponential decay to ``final`` at the current end (ExponentialLR when unextended)."""
+        return final ** min(step / max(self.value, 1), 1.0)
+
+
 class PlateauDetector:
     """Loss-plateau test on an EMA of the training loss.
 
@@ -100,6 +152,103 @@ class PlateauDetector:
             self.best_step = step
             return False
         return step >= self.min_steps and step - self.best_step >= self.patience
+
+
+class WorldConvergence:
+    """Early stop for stream runs: stop once the world is adequately reconstructed.
+
+    A stream has no fixed length and its data keeps changing (new keyframes, online Difix
+    pseudo views), so a plain loss plateau is meaningless. Instead ``update`` is fed a probe
+    every few hundred steps and the run is converged when *all* of these hold for
+    ``confirm`` consecutive probes:
+
+      coverage   no newly registered views for ``quiet_steps`` and the ACE map is idle
+                 (nothing pending, no refit running): the camera has shown what there is
+      quality    held-out PSNR gained < ``min_gain`` dB over the last ``window`` probes, or
+                 it is above ``target_psnr`` and gains < ``loose_gain`` dB (a modest world is
+                 good enough); without held-out views, the EMA training loss improved
+                 < ``loss_rel_gain`` relative over the window
+      growth     the Gaussian count changed < ``growth_tol`` (relative) over the window;
+                 None skips it - MCMC grows to its cap on a schedule whatever the scene needs
+                 (new geometry already shows up as new views in the coverage test)
+
+    and at least ``min_steps`` steps were trained. ``on_data_change`` (new views registered)
+    restarts the quality / growth windows, since the target just moved. Difix rounds do not:
+    held-out PSNR is measured on real frames, and rounds recur too often for a window to fit
+    between them (the trainer waits for the first round instead, via ``extra_wait``).
+    """
+
+    def __init__(self, min_steps: int = 3000, window: int = 3, confirm: int = 2,
+                 quiet_steps: int = 1500, target_psnr: float = 22.0, min_gain: float = 0.15,
+                 loose_gain: float = 0.5, loss_rel_gain: float = 0.01,
+                 growth_tol: Optional[float] = 0.02):
+        self.min_steps = min_steps
+        self.window = max(1, window)
+        self.confirm = max(1, confirm)
+        self.quiet_steps = quiet_steps
+        self.target_psnr = target_psnr
+        self.min_gain = min_gain
+        self.loose_gain = loose_gain
+        self.loss_rel_gain = loss_rel_gain
+        self.growth_tol = growth_tol
+        self.history: list = []          # (step, psnr or None, loss_ema, num_gs) since last change
+        self.last_change = 0
+        self.streak = 0
+        self.status: dict = {"converged": False, "reason": "warming up"}
+
+    def on_data_change(self, step: int):
+        self.history.clear()
+        self.last_change = step
+        self.streak = 0
+
+    def _quality(self) -> tuple:
+        """(ok, human summary) over the last ``window`` + 1 probes."""
+        h = self.history[-(self.window + 1):]
+        psnrs = [x[1] for x in h if x[1] is not None]
+        if len(psnrs) == len(h):  # held-out views throughout the window
+            best_now, best_then = max(psnrs), max(psnrs[:1])
+            gain = best_now - best_then
+            ok = gain < self.min_gain or (psnrs[-1] >= self.target_psnr and gain < self.loose_gain)
+            return ok, f"PSNR {psnrs[-1]:.2f} dB ({gain:+.2f} over {self.window} probes)"
+        l0, l1 = h[0][2], h[-1][2]
+        rel = (l0 - l1) / max(abs(l0), 1e-8)
+        return rel < self.loss_rel_gain, f"loss {l1:.4f} ({-rel:+.1%}, no held-out views)"
+
+    def update(self, step: int, *, psnr: Optional[float], loss_ema: Optional[float], num_gs: int,
+               views_quiet_steps: int, map_idle: bool, extra_wait: Optional[str] = None) -> bool:
+        """Record a probe; True when the world is converged (stop training)."""
+        if loss_ema is None or not (loss_ema == loss_ema):
+            return False
+        self.history.append((step, psnr, float(loss_ema), int(num_gs)))
+        coverage = views_quiet_steps >= self.quiet_steps and map_idle
+        cov_txt = ("coverage settled" if coverage else
+                   "map busy" if not map_idle else
+                   f"new views {views_quiet_steps}/{self.quiet_steps} steps ago")
+        if len(self.history) <= self.window:
+            self.streak = 0
+            self.status = {"converged": False, "reason": f"measuring ({len(self.history)}/"
+                           f"{self.window + 1} probes); {cov_txt}"}
+            return False
+        quality, q_txt = self._quality()
+        g0, g1 = self.history[-(self.window + 1)][3], self.history[-1][3]
+        growth = abs(g1 - g0) / max(g0, 1)
+        grown = self.growth_tol is None or growth < self.growth_tol
+        all_ok = coverage and quality and grown and step >= self.min_steps and not extra_wait
+        self.streak = self.streak + 1 if all_ok else 0
+        converged = self.streak >= self.confirm
+        waiting = [t for ok, t in ((coverage, cov_txt), (quality, "quality improving"),
+                                   (grown, f"model growing {growth:.1%}"),
+                                   (step >= self.min_steps, f"min {self.min_steps} steps"),
+                                   (not extra_wait, extra_wait)) if not ok]
+        self.status = {
+            "converged": converged, "psnr": psnr, "quality": q_txt, "growth": round(growth, 4),
+            "coverage": coverage, "streak": self.streak,
+            "reason": (f"converged: {q_txt}, {cov_txt}"
+                       + (f", model stable ({growth:.1%})" if self.growth_tol is not None else "") if converged else
+                       f"converging {self.streak}/{self.confirm}: {q_txt}" if all_ok else
+                       "waiting: " + ", ".join(waiting) + f"; {q_txt}"),
+        }
+        return converged
 
 
 def _robust_score(x: torch.Tensor, lo_q: float = 0.5, hi_q: float = 0.99, sample: int = 100_000) -> torch.Tensor:

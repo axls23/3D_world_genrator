@@ -204,6 +204,12 @@ def _hallucinating(last: dict) -> Optional[str]:
     return None
 
 
+def round_hallucinating(round_entry: dict) -> Optional[str]:
+    """Why a difix.rounds entry says Difix is hallucinating at its angle, or None. Online Difix
+    (hypersplat/stream/difix_online.py) stops injecting on this, like REFINE_LOOPS does."""
+    return _hallucinating(round_entry)
+
+
 # ----------------------------------------------------------------------------
 # Strategies
 # ----------------------------------------------------------------------------

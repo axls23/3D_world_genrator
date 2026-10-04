@@ -138,3 +138,7 @@ results
 # Run outputs & logs
 demo/output/
 pipeline_log.txt
+# Local env, capture media and A/B logs
+.venv_3dgrut/
+demo/input/
+experiments/*.log

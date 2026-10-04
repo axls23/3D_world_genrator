@@ -145,6 +145,25 @@ def _plan(profile, config):
     return cap, f, estimate_peak_mb(cap, width, height, f), free, budget, why
 
 
+# Streams: keyframes are gated on image change, so a camera held in place (or a subject moving
+# in front of it) yields hundreds of near-duplicate views - a short capture's worth of content,
+# not hundreds of images. 1M Gaussians there were mostly near-transparent MCMC noise, trained at
+# ~5 it/s and starved the ACE sidecar sharing the GPU (localize 1.7 s instead of ~35 ms).
+STREAM_CAP = SHORT_CAPTURE_CAP
+STREAM_GPU_RESERVE_MB = 2500   # ACE sidecar (~0.7 GB) + online Difix on the GPU (~1.8 GB)
+
+
+def stream_cap_max(free_mb, max_side: int, difix: bool = True) -> int:
+    """Gaussian cap for a stream run: STREAM_CAP, lowered to what fits next to ACE (+ Difix)."""
+    if not free_mb or free_mb <= 0:
+        return STREAM_CAP
+    reserve = STREAM_GPU_RESERVE_MB if difix else STREAM_GPU_RESERVE_MB - 1800
+    budget = (free_mb - reserve) * (1.0 - SAFETY_MARGIN)
+    pixels = max_side * (max_side * 9 // 16)
+    fit = (budget - MB_PER_PIXEL * pixels - FIXED_OVERHEAD_MB) / MB_PER_GAUSSIAN
+    return max(_round_cap(min(fit, STREAM_CAP)), ABS_MIN_CAP)
+
+
 def _plan_reason(plan):
     cap, f, est, free, budget, why = plan
     return (f"free {free:.0f} MB (budget {budget:.0f} MB after {SAFETY_MARGIN:.0%} margin), "

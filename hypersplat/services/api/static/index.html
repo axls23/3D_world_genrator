@@ -81,6 +81,59 @@
 
                 <!-- Dashboard Tab -->
                 <div id="tab-dashboard" class="tab-section">
+                    <!-- Entry Point: one button per pipeline mode (from /api/info) -->
+                    <div class="panel entry-panel">
+                        <div class="panel-header">
+                            <div class="title">
+                                <i class="fa-solid fa-route"></i> Entry Point
+                            </div>
+                            <div class="controls">
+                                <span class="badge" id="auto-count" title="Params left unset are tuned per scene by the manager">All params auto</span>
+                            </div>
+                        </div>
+                        <div class="panel-body entry-body">
+                            <div class="mode-switch" id="mode-switch" role="radiogroup" aria-label="Pipeline mode">
+                                <!-- filled by script.js -->
+                            </div>
+                            <p class="mode-description" id="mode-description"></p>
+
+                            <div class="entry-input" id="video-input-row">
+                                <i class="fa-solid fa-file-video"></i>
+                                <span id="video-name" class="muted">No video selected</span>
+                                <button id="choose-video-btn" class="btn btn-sm btn-outline">
+                                    <i class="fa-solid fa-cloud-arrow-up"></i> Choose Video
+                                </button>
+                            </div>
+                            <div class="entry-input hidden" id="colmap-input-row">
+                                <i class="fa-solid fa-folder-open"></i>
+                                <input type="text" id="colmap-input" placeholder="/path/to/colmap_dataset (images/ + sparse/0)">
+                            </div>
+
+                            <div class="stage-toggles" id="stage-toggles">
+                                <button type="button" class="stage-btn" data-stage="difix" aria-pressed="false"
+                                    title="Closed-loop Difix refinement (--difix)">
+                                    <i class="fa-solid fa-wand-magic-sparkles"></i> Difix Refine
+                                </button>
+                                <button type="button" class="stage-btn" data-stage="use_zero123" aria-pressed="false"
+                                    title="GeNVS novel-view augmentation (--genvs)">
+                                    <i class="fa-solid fa-camera-rotate"></i> Novel Views
+                                </button>
+                                <button type="button" class="stage-btn" data-stage="streaming" aria-pressed="false"
+                                    title="Start 3DGS while poses are still being estimated (--streaming)">
+                                    <i class="fa-solid fa-forward"></i> Streaming
+                                </button>
+                                <button type="button" class="stage-btn tri" data-stage="skip_ace" data-state="auto"
+                                    title="Pose step: auto reuses existing poses when present">
+                                    <i class="fa-solid fa-location-crosshairs"></i> Poses: <b>Auto</b>
+                                </button>
+                                <button type="button" class="stage-btn tri" data-stage="prune" data-state="auto"
+                                    title="Floater pruning on the exported PLY (--prune / --no-prune)">
+                                    <i class="fa-solid fa-scissors"></i> Prune: <b>Auto</b>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Status Cards -->
                     <div class="kpi-grid">
                         <div class="kpi-card" id="status-card">
@@ -109,13 +162,14 @@
                                 <i class="fa-solid fa-microchip icon"></i>
                             </div>
                             <div class="value" id="mode-value">ACE-Zero</div>
-                            <div class="subtext">Level 2 Pipeline</div>
+                            <div class="subtext" id="mode-subtext">Level 2 Pipeline</div>
                         </div>
 
                         <div class="kpi-card action-card">
                             <button id="train-btn" class="btn btn-primary full-width" disabled>
-                                <i class="fa-solid fa-bolt"></i> Start Training
+                                <i class="fa-solid fa-bolt"></i> <span id="train-btn-label">Generate 3D Scene</span>
                             </button>
+                            <span class="action-hint" id="train-hint">Choose a video to start</span>
                             <button id="stop-btn" class="btn btn-danger full-width hidden">
                                 <i class="fa-solid fa-stop"></i> Stop
                             </button>
@@ -135,7 +189,7 @@
                         <div class="panel-body">
                             <div class="queue-list" id="queue-list">
                                 <div class="queue-empty">
-                                    <p>No enqueued jobs. Submit a training config under the Settings tab to get started.</p>
+                                    <p>No enqueued jobs. Pick an entry point above and start a run.</p>
                                 </div>
                             </div>
                         </div>
@@ -251,73 +305,103 @@
                             </div>
                         </div>
                         <div class="panel-body settings-grid">
-                            <div class="form-group">
-                                <label>Mode</label>
-                                <select id="mode-select">
-                                    <option value="ace_zero">ACE-Zero (Default)</option>
-                                    <option value="simple">Simple</option>
-                                    <option value="chunked">Chunked</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label>Quality</label>
-                                <select id="quality-mode">
+                            <p class="settings-note full-width">
+                                <i class="fa-solid fa-circle-info"></i>
+                                Leave a field on <b>Auto</b> (empty) to let the manager derive it from the video, poses and GPU.
+                                Anything you fill in is pinned and passed through as-is. Greyed-out fields don't apply to the selected entry point.
+                            </p>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="quality-mode">Pose Quality</label>
+                                <select id="quality-mode" data-key="quality_mode">
+                                    <option value="">Auto</option>
                                     <option value="fast">Fast</option>
-                                    <option value="balanced" selected>Balanced</option>
+                                    <option value="balanced">Balanced</option>
                                     <option value="quality">Quality</option>
                                 </select>
                             </div>
                             <div class="form-group">
-                                <label>Steps</label>
-                                <input type="number" id="max-steps" value="7000">
+                                <label for="max-steps">Steps</label>
+                                <input type="number" id="max-steps" data-key="max_steps" data-type="int" min="1" placeholder="auto">
                             </div>
-                            <div class="form-group row-group">
-                                <div class="col">
-                                    <label>FPS</label>
-                                    <input type="number" id="fps" value="2.0" step="0.5">
-                                </div>
-                                <div class="col">
-                                    <label>Downsample (Data Factor)</label>
-                                    <input type="number" id="data-factor" value="2" min="1" max="8">
-                                </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="fps">Extraction FPS</label>
+                                <input type="number" id="fps" data-key="fps" data-type="float" step="0.5" min="0.1" placeholder="auto">
                             </div>
                             <div class="form-group">
-                                <label>Depth Model</label>
-                                <select id="depth-model">
-                                    <option value="depth_anything">Depth Anything (Default)</option>
+                                <label for="data-factor">Downsample (Data Factor)</label>
+                                <input type="number" id="data-factor" data-key="data_factor" data-type="int" min="1" max="8" placeholder="auto">
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="depth-model">Depth Model</label>
+                                <select id="depth-model" data-key="depth_model">
+                                    <option value="">Auto</option>
+                                    <option value="depth_anything">Depth Anything</option>
                                     <option value="zoedepth">ZoeDepth</option>
+                                    <option value="midas">MiDaS</option>
                                 </select>
                             </div>
-                            <div class="form-group">
-                                <label>SH Degree</label>
-                                <input type="number" id="sh-degree" value="3" min="0" max="4">
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="cap-max">Max Gaussians</label>
+                                <input type="number" id="cap-max" data-key="cap_max" data-type="int" min="1" placeholder="auto">
                             </div>
-                            <div class="form-group">
-                                <label>Means LR</label>
-                                <input type="number" id="means-lr" value="0.00016" step="0.00001">
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="sh-degree">SH Degree</label>
+                                <input type="number" id="sh-degree" data-key="sh_degree" data-type="int" min="0" max="4" placeholder="auto">
                             </div>
-                            <div class="form-group">
-                                <label>SSIM Weight</label>
-                                <input type="number" id="ssim-lambda" value="0.2" step="0.1">
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="means-lr">Means LR</label>
+                                <input type="number" id="means-lr" data-key="means_lr" data-type="float" step="0.00001" placeholder="auto">
                             </div>
-                            <div class="form-group full-width">
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="ssim-lambda">SSIM Weight</label>
+                                <input type="number" id="ssim-lambda" data-key="ssim_lambda" data-type="float" step="0.05" placeholder="auto">
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="refine-loops">Difix Refine Loops</label>
+                                <input type="number" id="refine-loops" data-key="refine_loops" data-type="int" min="1" placeholder="auto">
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="genvs-views">Novel Views</label>
+                                <input type="number" id="genvs-views" data-key="genvs_views" data-type="int" min="1" placeholder="auto">
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="seed">Seed</label>
+                                <input type="number" id="seed" data-key="seed" data-type="int" placeholder="random">
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="pose-opt">Pose Optimization</label>
+                                <select id="pose-opt" data-key="pose_opt" data-type="bool">
+                                    <option value="">Auto</option>
+                                    <option value="true">On</option>
+                                    <option value="false">Off</option>
+                                </select>
+                            </div>
+                            <div class="form-group" data-modes="ace_zero chunked">
+                                <label for="early-stopping">Early Stopping</label>
+                                <select id="early-stopping" data-key="early_stopping" data-type="bool">
+                                    <option value="">Auto</option>
+                                    <option value="true">On</option>
+                                    <option value="false">Off</option>
+                                </select>
+                            </div>
+                            <div class="form-group full-width" data-modes="ace_zero chunked">
                                 <label class="checkbox-label">
-                                    <input type="checkbox" id="random-bkgd"> Random Background (Anti-transparency)
+                                    <input type="checkbox" id="random-bkgd" data-key="random_bkgd"> Random Background (Anti-transparency)
+                                </label>
+                            </div>
+                            <div class="form-group full-width" data-modes="ace_zero chunked">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="app-opt" data-key="app_opt"> Appearance Optimization
                                 </label>
                             </div>
                             <div class="form-group full-width">
                                 <label class="checkbox-label">
-                                    <input type="checkbox" id="pose-opt" checked> Pose Optimization
+                                    <input type="checkbox" id="with-ut" data-key="with_ut"> 3DGUT (Unscented Transform)
                                 </label>
                             </div>
                             <div class="form-group full-width">
                                 <label class="checkbox-label">
-                                    <input type="checkbox" id="app-opt"> Appearance Optimization
-                                </label>
-                            </div>
-                            <div class="form-group full-width" style="border-top: 1px solid var(--border-color); padding-top: 12px; margin-top: 4px;">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="skip-ace"> Skip Step 1 (Use Existing Poses)
+                                    <input type="checkbox" id="with-eval3d" data-key="with_eval3d"> 3D Evaluation
                                 </label>
                             </div>
                         </div>

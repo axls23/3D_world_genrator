@@ -234,3 +234,48 @@ def test_server_explicit_request_passes_values(server):
 
 def test_server_uses_shared_builder(server):
     assert server.build_pipeline_args is wrapper.build_pipeline_args
+
+
+# --- mode dispatch (shared by wrapper and server) --------------------------------------------
+
+def test_server_dispatches_simple_mode_to_trainer_on_colmap_input(server):
+    req = server.TrainRequest(mode="simple", colmap_input="/data/colmap")
+    cmd = server.build_pipeline_command("ignored.mp4", req.dict(), output_dir=Path("/tmp/out"))
+    assert cmd[2].endswith("simple_trainer.py")
+    assert _flag_value(cmd, "--data_dir") == "/data/colmap"
+    assert "ignored.mp4" not in cmd
+    assert _flag_value(cmd, "--max_steps") == "7000"  # simple_trainer fallback, not "auto"
+
+
+def test_server_dispatches_chunked_mode_with_use_colmap(server):
+    cmd = server.build_pipeline_command("video.mp4", server.TrainRequest(mode="chunked").dict(),
+                                        output_dir=Path("/tmp/out"))
+    assert cmd[2].endswith("automated_intelligent_pipeline.py")
+    assert "--use_colmap" in cmd
+    for flag in AUTO_FLAGS:
+        assert flag not in cmd, flag
+
+
+def test_server_ace_zero_is_default_and_has_no_use_colmap(server):
+    cmd = server.build_pipeline_command("video.mp4", server.TrainRequest().dict(),
+                                        output_dir=Path("/tmp/out"))
+    assert cmd[3] == "video.mp4" and "--use_colmap" not in cmd
+
+
+def test_server_passes_stage_toggles(server):
+    req = server.TrainRequest(difix=True, streaming=True, prune=False, refine_loops=2, seed=7)
+    cmd = server.build_pipeline_command("video.mp4", req.dict(), output_dir=Path("/tmp/out"))
+    assert "--difix" in cmd and "--streaming" in cmd and "--no-prune" in cmd
+    assert _flag_value(cmd, "--refine-loops") == "2"
+    assert _flag_value(cmd, "--seed") == "7"
+
+
+def test_unknown_mode_is_rejected():
+    with pytest.raises(ValueError):
+        validate_pipeline_config({"mode": "bogus"})
+    with pytest.raises(ValueError):
+        wrapper.build_mode_command("bogus", "python", Path("/r"), "v.mp4", Path("/o"), {})
+
+
+def test_server_info_lists_every_wrapper_mode(server):
+    assert set(server.PIPELINE_MODES) == set(wrapper.PipelineMode.ALL)

@@ -226,9 +226,10 @@ void launch_rasterize_to_pixels_from_world_3dgs_fwd_kernel(
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // outputs
-    at::Tensor renders, // [..., C, image_height, image_width, channels]
-    at::Tensor alphas,  // [..., C, image_height, image_width]
-    at::Tensor last_ids // [..., C, image_height, image_width]
+    at::Tensor renders,  // [..., C, image_height, image_width, channels]
+    at::Tensor alphas,   // [..., C, image_height, image_width]
+    at::Tensor last_ids, // [..., C, image_height, image_width]
+    at::optional<at::Tensor> render_depths // [..., C, image_height, image_width, 2]
 );
 
 template <uint32_t CDIM>
@@ -271,7 +272,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
-    at::Tensor v_opacities   // [..., C, N] or [nnz]
+    at::Tensor v_opacities,  // [..., C, N] or [nnz]
+    const at::optional<at::Tensor> v_render_depths // [..., C, image_height, image_width, 2]
 ) ;
 
 } // namespace gsplat

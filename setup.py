@@ -13,6 +13,7 @@ setup(
         "boto3",
         "numpy",
         "torch",
-        "opencv-python"
+        "opencv-python",
+        "pyarrow>=17",  # streaming pipeline: Arrow IPC to the ACE sidecar + Arrow Flight ingest
     ],
 )

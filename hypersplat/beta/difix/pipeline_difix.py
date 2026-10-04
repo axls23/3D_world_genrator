@@ -498,8 +498,9 @@ class DifixPipeline(
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
             negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-        if isinstance(self, LoraLoaderMixin) and USE_PEFT_BACKEND:
+        if self.text_encoder is not None and isinstance(self, LoraLoaderMixin) and USE_PEFT_BACKEND:
             # Retrieve the original scale by scaling back the LoRA layers
+            # (text_encoder is None when callers pass precomputed prompt_embeds, as upstream)
             unscale_lora_layers(self.text_encoder, lora_scale)
 
         return prompt_embeds, negative_prompt_embeds
@@ -1021,6 +1022,7 @@ class DifixPipeline(
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
         # 5. Prepare latent variables
+        n_target = image.shape[0]
         latents = self.prepare_latents(
             torch.cat([image, ref_image], dim=0) if ref_image is not None else image,
             batch_size,
@@ -1029,6 +1031,14 @@ class DifixPipeline(
             device,
             generator,
         )
+        skips = getattr(self.vae.encoder, "current_down_blocks", None)
+        if ref_image is not None and skips is not None:
+            # Only the target's VAE skip activations are used: the decoder output for the
+            # reference is discarded, yet its skips broadcast the whole full-resolution
+            # decoder to batch 2 (and are held through the UNet). Keep the target's only:
+            # same output, about half the VAE activation memory.
+            self.vae.encoder.current_down_blocks = [a[:n_target].clone() for a in skips]
+            del skips
 
         if ref_image is not None:
             prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)

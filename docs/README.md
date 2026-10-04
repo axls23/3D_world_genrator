@@ -9,6 +9,7 @@ gsplat project documentation.
 | [Pipeline Guide](getting-started/pipeline.md) | ACE-Zero → 3DGS workflow |
 | [Demo Server](getting-started/demo-server.md) | Web interface usage |
 | [3DGUT Features](getting-started/3dgut.md) | Distortion & rolling shutter |
+| [Streaming](getting-started/streaming.md) | Video / live camera → 3DGS, online Difix, Arrow Flight |
 
 ## Reference
 

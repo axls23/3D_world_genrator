@@ -1,7 +1,18 @@
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Hugging Face models (Difix, ~5 GB) go to the data drive's shared cache, not ~/.cache on the
+# root disk. Must precede any import that pulls in huggingface_hub.
+_SHARED_HF_CACHE = Path(__file__).resolve().parents[2] / "hf_cache"
+if _SHARED_HF_CACHE.is_dir():
+    os.environ.setdefault("HF_HOME", str(_SHARED_HF_CACHE))
+# Growable CUDA segments: online Difix and densification allocate/free large blocks; without
+# this, fragmentation left >1 GB reserved-but-unusable on a 6 GB GPU. Before torch loads CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import itertools
 import json
 import math
 import os
@@ -34,6 +45,8 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 from trainer_schedule import (
     PlateauDetector,
+    StreamHorizon,
+    WorldConvergence,
     early_stop_defaults,
     floater_prune_mask,
     resolve_trainer_schedule,
@@ -264,6 +277,123 @@ class Config:
     streaming: bool = False
     # How often to check for new poses (in training steps)
     streaming_check_interval: int = 500
+
+    # Streaming pipeline (hypersplat/stream): frames -> keyframes -> ACE sidecar -> this trainer,
+    # all in memory. Replaces --data_dir. Video file (just-in-time), camera index / /dev/videoN,
+    # rtsp/http URL (live) or flight://host:port (external camera pushing over Arrow Flight).
+    stream_source: Optional[str] = None
+    # auto: files as fast as training consumes them, live sources in real time. "realtime" on
+    # a file rehearses the live path (frames are skipped when training is busy).
+    stream_pace: Literal["auto", "realtime", "fast"] = "auto"
+    # Train-resolution long side of streamed frames
+    stream_max_side: int = 960
+    # Memory budget for encoded keyframes + ACE copies + pseudo views, and keyframe cap
+    stream_budget_mb: float = 256.0
+    stream_max_keyframes: int = 400
+    # Keyframes collected before the first ACE map is built
+    stream_bootstrap_frames: int = 24
+    # Cap on the first ACE map's LR cooldown (None: the ACE preset); shorter = map sooner,
+    # background refits recover the accuracy
+    stream_bootstrap_cooldown: Optional[int] = None
+    # Keyframe gate novelty threshold (mean abs gray difference, 0-255)
+    stream_min_motion: float = 8.0
+    # Steps between pulls of new seed points (new keyframes/poses are picked up every step)
+    stream_sync_every: int = 50
+    # File sources: steps to keep training once every keyframe is localized (None: to the
+    # dynamic end below)
+    stream_tail_steps: Optional[int] = None
+    # Stream runs have no fixed length (a live source's frame count is unbounded): max_steps
+    # is only the initial budget, and every newly registered view moves the end to at least
+    # step + stream_extend_steps (None: max_steps // 3), with LR decay and densification
+    # following it. A live run ends that many steps after its last new view, or on STOP.
+    stream_extend_steps: Optional[int] = None
+    # Optional hard ceiling on the dynamic length (None: uncapped)
+    stream_max_steps_cap: Optional[int] = None
+    # Stop recording (camera released, training continues on the keyframes collected) after
+    # this many seconds / keyframes; also on <result_dir>/STOP_RECORDING or the dashboard button
+    stream_record_seconds: Optional[float] = None
+    stream_record_keyframes: Optional[int] = None
+    # Stream early stop (with early_stopping): end training once the world is adequately
+    # reconstructed instead of running to max_steps - coverage settled (no new views for
+    # quiet_steps, ACE map idle), held-out PSNR plateaued (or >= target_psnr and gaining
+    # little) and the Gaussian count stable, confirmed on consecutive probes. See
+    # trainer_schedule.WorldConvergence.
+    stream_converge_every: int = 500
+    stream_converge_min_steps: int = 3000
+    stream_converge_quiet_steps: int = 1500
+    stream_converge_target_psnr: float = 22.0
+    stream_converge_min_gain: float = 0.15
+    stream_converge_probe_views: int = 6
+    # Dense depth for streams (hypersplat/stream/depth.py): Depth Anything V2 on each
+    # registered keyframe, aligned to its ACE points, used to seed Gaussians densely and as a
+    # log-depth loss. Keyframes per sync step, seed pixel stride, loss weight.
+    stream_depth: bool = False
+    stream_depth_model: str = "depth-anything/Depth-Anything-V2-Small-hf"
+    stream_depth_per_sync: int = 3
+    stream_depth_seed_stride: int = 8
+    # Dense seeding stops at this fraction of an MCMC cap (depth then only feeds the loss):
+    # at the cap every seed would evict a live Gaussian, and MCMC fills the rest where the
+    # images need detail
+    stream_depth_seed_cap_frac: float = 0.8
+    stream_depth_lambda: float = 0.05
+    # Closed depth loop (with_eval3d: the rasterizer renders ray-hit depth and its variance).
+    # A rendered pixel is "confident" when its depth std is below stream_depth_conf_tau x its
+    # depth. conf_weight: weight the depth loss per pixel by 1 / (1 + (std / (tau z))^2)
+    # (floored at 0.1). render_align: keyframes per cycle whose monocular depth is re-fitted
+    # to confident render pixels as well as ACE's points (round-robin; 0 = off)
+    stream_depth_conf_tau: float = 0.05
+    stream_depth_conf_weight: bool = False
+    stream_depth_render_align: int = 0
+    # Per-keyframe corrections for streams (hypersplat/stream/training.StreamViewAdjust):
+    # pose deltas (pose_opt_lr / pose_opt_reg / pose_warmup_steps / JOGS phases apply) and an
+    # exposure gain + bias per keyframe (camera auto-exposure). Slots follow keyframe ids, so
+    # they survive the stream's evictions and reset when an ACE refit moves a keyframe.
+    stream_pose_opt: bool = False
+    stream_exposure_opt: bool = False
+    stream_exposure_lr: float = 1e-3
+    # Weight of the penalty on the mean exposure over keyframes (keeps renders neutral)
+    stream_exposure_reg: float = 1e-2
+    # Also serve live views/stats over Arrow Flight on this port (flight:// sources always do)
+    stream_flight_port: Optional[int] = None
+    # Live dashboard (viser viewer left, camera feed right) on this port; host 0.0.0.0 exposes
+    # the camera feed on the network
+    stream_dashboard_port: Optional[int] = None
+    stream_dashboard_host: str = "127.0.0.1"
+
+    # Online Difix: repair pseudo views from the live model during training (instead of the
+    # post-training render -> Difix -> retrain loop). Works for datasets and streams.
+    difix_online: bool = False
+    # Steps of the rounds (None: 40/60/80% of max_steps for datasets; every
+    # difix_online_every steps from difix_online_start for streams)
+    difix_online_steps: Optional[List[int]] = None
+    difix_online_start: int = 1500
+    difix_online_every: int = 2000
+    difix_model_id: str = "nvidia/difix_ref"
+    # Streams: a round is spread over chunks (render + Difix for up to difix_chunk_s seconds,
+    # one chunk every difix_chunk_every steps) so training and the viewer keep moving, with at
+    # most difix_online_views pseudo views per round. With the world early stop, streams run
+    # one early round (difix_online_start) and a final polish round once the world has
+    # converged, then train difix_final_tail_steps on it before ending.
+    difix_online_views: int = 16
+    # Stream cycle: after every epoch (one pass over the current train keyframes, at least
+    # stream_epoch_min_steps steps) run [cheap Difix: difix_epoch_views views at
+    # difix_epoch_scale into a rolling pool of difix_online_views] -> [depth: re-align maps of
+    # keyframes ACE re-localized] -> [ACE: background refit if anything changed]. Replaces the
+    # step-scheduled Difix rounds and the final polish round.
+    stream_cycle: bool = True
+    stream_epoch_min_steps: int = 100
+    difix_epoch_views: int = 2
+    difix_epoch_scale: float = 0.5
+    # Orbit angle cap for the cycle's small rounds (each faithful round widens the angle)
+    difix_epoch_max_angle: float = 8.0
+    # ACE step of the cycle: refit once this many keyframes changed (a refit takes minutes and
+    # holds the GPU lease, so refitting after every new keyframe would starve Difix)
+    stream_cycle_refit_min: int = 4
+    difix_chunk_s: float = 3.0
+    difix_chunk_every: int = 50
+    difix_final_tail_steps: int = 750
+    # Start Difix at scale 0.75 when less than this much VRAM is free (MB; OOM steps down anyway)
+    difix_low_vram_mb: float = 3500.0
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -509,26 +639,38 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss or cfg.genvs_ckpt is not None,
-        )
-        if cfg.use_mask:
-            print("[SimpleTrainer] Using masks for training.")
-            self.trainset = MaskedDataset(self.trainset, cfg.mask_dir)
-            
-        self.valset = Dataset(self.parser, split="val")
-        if cfg.use_mask:
-            self.valset = MaskedDataset(self.valset, cfg.mask_dir)
+        self.stream = None
+        if cfg.stream_source:
+            self._start_stream()
+        else:
+            # Load data: Training data should contain initial points and colors.
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+            )
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss or cfg.genvs_ckpt is not None,
+            )
+            if cfg.use_mask:
+                print("[SimpleTrainer] Using masks for training.")
+                self.trainset = MaskedDataset(self.trainset, cfg.mask_dir)
+
+            self.valset = Dataset(self.parser, split="val")
+            if cfg.use_mask:
+                self.valset = MaskedDataset(self.valset, cfg.mask_dir)
+        self.base_trainset = self.trainset
+        self.difix = None
+        if cfg.difix_online:
+            from hypersplat.pipeline.params import SceneProfile
+            from hypersplat.stream.difix_online import OnlineDifix
+            self.difix = OnlineDifix(cfg.difix_model_id, self.device,
+                                     profile=SceneProfile.from_env() or SceneProfile(),
+                                     debug_dir=f"{cfg.result_dir}/difix_online")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -594,6 +736,27 @@ class Runner:
             ]
             if world_size > 1:
                 self.pose_adjust = DDP(self.pose_adjust)
+
+        self.view_adjust = None
+        if self.stream is not None and (cfg.stream_pose_opt or cfg.stream_exposure_opt):
+            from hypersplat.stream.training import StreamViewAdjust
+            capacity = cfg.stream_max_keyframes + 32
+            pose_module = None
+            if cfg.stream_pose_opt:
+                pose_module = CameraOptModule(capacity)
+                pose_module.zero_init()
+            self.view_adjust = StreamViewAdjust(capacity, pose_module, exposure=cfg.stream_exposure_opt).to(self.device)
+            if pose_module is not None:
+                opt = torch.optim.Adam(pose_module.parameters(), lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
+                                       weight_decay=cfg.pose_opt_reg)
+                self.view_adjust.pose_optimizers = [opt]
+                self.pose_optimizers.append(opt)   # warmup / JOGS phases / checkpoint as usual
+            if self.view_adjust.exposure is not None:
+                opt = torch.optim.Adam(self.view_adjust.exposure.parameters(), lr=cfg.stream_exposure_lr)
+                self.view_adjust.exposure_optimizers = [opt]
+                self.stream_exposure_optimizers = [opt]
+            print(f"[Stream] Per-keyframe corrections: pose={cfg.stream_pose_opt} "
+                  f"exposure={cfg.stream_exposure_opt} ({capacity} slots)")
 
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
@@ -676,6 +839,8 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+            if getattr(self, "dashboard", None) is not None:
+                self.dashboard.viewer_port = cfg.port
 
         # Streaming mode initialization
         self.streaming_manager = None
@@ -708,6 +873,510 @@ class Runner:
             self.loss_history = []
             self.adaptive_mode = "deterministic"
             print("[GeNVS] Adaptive Interpolation Active (Mode: Deterministic)")
+
+    # ------------------------------------------------------------------ streaming
+    def _start_stream(self):
+        """Stream source instead of a COLMAP dataset (hypersplat/stream)."""
+        import logging
+        from hypersplat.pipeline.params import SceneProfile
+        from hypersplat.stream.session import StreamConfig, StreamSession
+        from hypersplat.stream.training import (StopFile, StreamParser, StreamTrainSet,
+                                                StreamValSet, seed_voxel_size)
+
+        cfg = self.cfg
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+        # Per-image modules are sized once at start; a stream's image set keeps changing
+        per_image = [k for k in ("pose_opt", "app_opt", "use_bilateral_grid", "use_mask", "depth_loss")
+                     if getattr(cfg, k)]
+        if per_image:
+            print(f"[Stream] Disabled for streams (per-image state of a changing image set): {per_image}")
+            for k in per_image:
+                setattr(cfg, k, False)
+        scfg = StreamConfig(
+            source=cfg.stream_source, pace=cfg.stream_pace, max_side=cfg.stream_max_side,
+            budget_mb=cfg.stream_budget_mb, max_keyframes=cfg.stream_max_keyframes,
+            test_every=cfg.test_every, min_motion=cfg.stream_min_motion,
+            bootstrap_frames=cfg.stream_bootstrap_frames, flight_port=cfg.stream_flight_port,
+            bootstrap_cooldown=cfg.stream_bootstrap_cooldown,
+            record_stop_file=os.path.join(cfg.result_dir, "STOP_RECORDING"),
+            record_seconds=cfg.stream_record_seconds, record_keyframes=cfg.stream_record_keyframes,
+            depth=cfg.stream_depth,
+        )
+        self.depth_estimator = None
+        if cfg.stream_depth:
+            from hypersplat.stream.depth import DepthEstimator
+            self.depth_estimator = DepthEstimator(cfg.stream_depth_model, device=str(self.device)).load()
+        self.stream = StreamSession(scfg, profile=SceneProfile.from_env())
+        self.stream_stop_file = StopFile(cfg.result_dir)
+        self.stream.start()
+        self.dashboard = None
+        if cfg.stream_dashboard_port:
+            from hypersplat.stream.dashboard import Dashboard
+            self.dashboard = Dashboard(self.stream, cfg.stream_dashboard_port, cfg.stream_dashboard_host).start()
+            print(f"[Stream] Dashboard (3D viewer | camera): {self.dashboard.url}", flush=True)
+        print("[Stream] Waiting for the first ACE map...")
+        preview = None
+        if self.depth_estimator is not None and self.dashboard is not None:
+            from hypersplat.stream.depth import DepthPreview
+            dash = self.dashboard
+            preview = DepthPreview(self.depth_estimator, self.stream.latest_frame,
+                                   lambda jpg: setattr(dash, "depth_preview", jpg)).start()
+        try:
+            map_ok = self.stream.wait_for_map(should_stop=self.stream_stop_file.requested)
+        finally:
+            if preview is not None:
+                preview.stop()   # the estimator belongs to the depth worker from here on
+                self.dashboard.depth_preview = None
+                print(f"[Depth] Preview showed {preview.frames} frames while the map was built")
+        if not map_ok:
+            reason = self.stream.failed or ("STOP requested" if self.stream_stop_file.requested() else "stopped")
+            self.stream.stop()
+            if self.dashboard is not None:
+                self.dashboard.stop()
+            raise RuntimeError(f"[Stream] No ACE map: {reason}")
+        self.parser = StreamParser(self.stream, cfg.result_dir)
+        self.trainset = StreamTrainSet(self.stream, seed=42)
+        self.valset = StreamValSet(self.stream)
+        self.stream_voxel = seed_voxel_size(self.parser.points, self.parser.scene_scale)
+        self.stream_horizon = StreamHorizon(cfg.max_steps, getattr(cfg.strategy, "refine_stop_iter", cfg.max_steps),
+                                            cfg.stream_extend_steps, cfg.stream_max_steps_cap)
+        self._views_seen = self.stream.views_registered
+        self._last_view_step = 0
+        self._loss_ema = None
+        self.world_conv = None
+        self._final_difix = None   # None | "running" | "done" (world early stop polish round)
+        self._epoch, self._epoch_draws, self._epoch_start = 0, 0, 0
+        self._pseudo_pool = []
+        self._stop_at = None
+        if cfg.early_stopping:
+            self.world_conv = WorldConvergence(
+                min_steps=cfg.stream_converge_min_steps, quiet_steps=cfg.stream_converge_quiet_steps,
+                target_psnr=cfg.stream_converge_target_psnr, min_gain=cfg.stream_converge_min_gain,
+                growth_tol=None if isinstance(cfg.strategy, MCMCStrategy) else 0.02)
+            print(f"[WorldStop] On: stop when the world is reconstructed (probe every "
+                  f"{cfg.stream_converge_every} steps, target {cfg.stream_converge_target_psnr} dB, "
+                  f"min {cfg.stream_converge_min_steps} steps); max_steps is only a ceiling")
+        self._horizon_logged = cfg.max_steps
+        self._stream_failed_logged = False
+        print(f"[Stream] Map ready: {len(self.parser.points)} seed points, scene scale "
+              f"{self.parser.scene_scale:.3f}, seed voxel {self.stream_voxel:.4f}")
+
+    def _stream_sync(self, step: int) -> bool:
+        """Grow the model into newly seen space; True when the stream run should end."""
+        from hypersplat.stream.training import inject_gaussians
+
+        cfg = self.cfg
+        s = self.stream
+        if self.view_adjust is not None:
+            self.view_adjust.slots.release_missing({kf.kid for kf in s.store.frames()})
+        xyz, rgb = s.take_seeds()
+        if self.depth_estimator is not None:
+            dxyz, drgb = self._stream_depth(step)
+            cap = cfg.strategy.cap_max if isinstance(cfg.strategy, MCMCStrategy) else None
+            if cap is not None and len(self.splats["means"]) >= cfg.stream_depth_seed_cap_frac * cap:
+                dxyz = dxyz[:0]
+            if len(dxyz):
+                xyz, rgb = np.concatenate([xyz, dxyz]), np.concatenate([rgb, drgb])
+        if len(xyz):
+            cap = cfg.strategy.cap_max if isinstance(cfg.strategy, MCMCStrategy) else None
+            added, recycled = inject_gaussians(self.splats, self.optimizers, self.strategy_state, xyz, rgb,
+                                               self.stream_voxel, cfg.init_opa, cfg.init_scale, cap)
+            if added or recycled:
+                print(f"\n[Stream] step {step}: +{added} Gaussians ({recycled} recycled) from new "
+                      f"keyframes; {len(self.splats['means'])} total")
+        # New views move the end of training (a live source has no frame count to size it by)
+        h = self.stream_horizon
+        seen = s.views_registered
+        if seen > self._views_seen:
+            self._last_view_step = step
+            if self.world_conv is not None:
+                self.world_conv.on_data_change(step)
+        if seen > self._views_seen and h.on_new_views(step):
+            if h.value - self._horizon_logged >= h.extend:
+                print(f"\n[Stream] step {step}: {seen} views registered so far; training extended to "
+                      f"{h.value} steps (densify until {h.refine_stop_iter})")
+                self._horizon_logged = h.value
+        self._views_seen = seen
+        if self._stop_at is not None and step >= self._stop_at:
+            print(f"\n[WorldStop] Ending at step {step} after the final Difix round")
+            return True
+        if (self.world_conv is not None and self._final_difix is None and step > 0
+                and step % cfg.stream_converge_every == 0):
+            if self._world_probe(step):
+                return True
+        if self.dashboard is not None:
+            self.dashboard.update_training(step=step, max_steps=h.value, num_gs=len(self.splats["means"]),
+                                           loss=getattr(self, "_last_loss", None),
+                                           difix_rounds=self.difix.rounds if self.difix else None)
+        if self.world_rank == 0 and cfg.tb_every > 0 and step % max(cfg.tb_every, cfg.stream_sync_every) == 0:
+            st = s.stats()
+            for key in ("keyframes", "registered", "unregistered", "pseudo", "store_mb", "map_version",
+                        "frames_dropped"):
+                self.writer.add_scalar(f"stream/{key}", st[key] or 0, step)
+        if s.failed and not self._stream_failed_logged:
+            print(f"\n[Stream] {s.failed}; training continues on the views collected so far")
+            self._stream_failed_logged = True
+        if self.stream_stop_file.requested():
+            print(f"\n[Stream] STOP requested at step {step}")
+            return True
+        if s.finished and not h.finished and cfg.stream_tail_steps is not None:
+            h.finish(step + cfg.stream_tail_steps)
+            print(f"\n[Stream] Source fully localized at step {step}; {cfg.stream_tail_steps} more steps")
+        if hasattr(cfg.strategy, "refine_stop_iter"):
+            cfg.strategy.refine_stop_iter = h.refine_stop_iter
+        return False
+
+    def _stream_depth(self, step: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Dense depth for up to stream_depth_per_sync newly registered keyframes; returns
+        their seed points (normalized xyz, rgb) from the valid depth pixels."""
+        from hypersplat.stream.depth import dense_depth, unproject
+        from hypersplat.stream.source import decode_jpeg
+
+        cfg = self.cfg
+        s = self.stream
+        pts, cols = [], []
+        for kf, pix, z in s.take_depth_jobs(cfg.stream_depth_per_sync):
+            rgb = decode_jpeg(kf.jpeg.to_pybytes())
+            t0 = time.time()
+            disp = self.depth_estimator.predict(rgb)
+            res = dense_depth(disp, rgb, pix, z)
+            ms = (time.time() - t0) * 1000
+            if res.depth is None:
+                s.set_depth(kf.kid, None, {"ms": ms, "reason": res.align.reason}, disp=res.disp,
+                            version=kf.map_version)
+                continue
+            s.set_depth(kf.kid, res.depth, {"ms": ms, "rel_err": res.align.rel_err}, disp=res.disp,
+                        version=kf.map_version)
+            h, w = res.depth.shape
+            world, rgbs = unproject(res.depth, res.valid, s.intrinsics(w, h), np.linalg.inv(kf.w2c), rgb,
+                                    cfg.stream_depth_seed_stride)
+            pts.append(s.transform_points(world.astype(np.float64)).astype(np.float32))
+            cols.append(rgbs)
+        c = s.depth_counters
+        done = c["maps"] + c["rejected"]
+        if done and done // 10 > getattr(self, "_depth_logged", 0):
+            self._depth_logged = done // 10
+            err = f"{c['rel_err']:.1%}" if c["rel_err"] is not None else "-"
+            print(f"\n[Depth] step {step}: {c['maps']} maps, {c['rejected']} rejected"
+                  f"{' (' + c['last_reject'] + ')' if c['last_reject'] else ''}, held-out error vs ACE {err}, "
+                  f"{c['ms']:.0f} ms/keyframe (network {self.depth_estimator.ms:.0f} ms), backlog {s.depth_backlog}")
+        if not pts:
+            return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32)
+        return np.concatenate(pts), np.concatenate(cols)
+
+    def _world_probe(self, step: int) -> bool:
+        """Feed WorldConvergence one probe; True when training should end now."""
+        cfg = self.cfg
+        s = self.stream
+        st = s.stats()
+        wait = None
+        if not s.map_ready.is_set():
+            wait = "first map"
+        conv = self.world_conv
+        done = conv.update(step, psnr=self._probe_psnr(step), loss_ema=self._loss_ema,
+                           num_gs=len(self.splats["means"]), views_quiet_steps=step - self._last_view_step,
+                           map_idle=st["job"] is None and st["pending"] == 0, extra_wait=wait)
+        if self.dashboard is not None:
+            self.dashboard.update_training(world=conv.status["reason"])
+        if self.world_rank == 0 and cfg.tb_every > 0:
+            if conv.status.get("psnr") is not None:
+                self.writer.add_scalar("stream/probe_psnr", conv.status["psnr"], step)
+            self.writer.add_scalar("stream/converge_streak", conv.streak, step)
+        if not done:
+            return False
+        print(f"\n[WorldStop] World reconstructed at step {step} (of up to {self.stream_horizon.value}): "
+              f"{conv.status['reason']}")
+        if s.stop_recording("world reconstructed"):
+            print("[WorldStop] Recording stopped; camera released")
+        if (self.difix is not None and not self.difix.stop_reason and self._final_difix is None
+                and not cfg.stream_cycle):
+            # Polish once on the converged model, then a short tail on its pseudo views
+            if self.difix.round_pending:
+                return False   # the earlier round is still being fixed: next probe
+            self._final_difix = "running"
+            if self._difix_round(step) is None:   # ACE holds the GPU: retry on the next probe
+                self._final_difix = None
+                return False
+            print("[WorldStop] Final Difix round started (runs in chunks while training continues)")
+            return False
+        return True
+
+    @torch.no_grad()
+    def _probe_psnr(self, step: int) -> Optional[float]:
+        """Mean PSNR on up to stream_converge_probe_views held-out keyframes at full
+        resolution (a few ms per view); None without any. Half resolution hides the fine
+        detail that keeps improving late in training, so the plateau looked earlier than it was."""
+        cfg = self.cfg
+        self.valset.refresh()
+        n = len(self.valset)
+        if n == 0:
+            return None
+        k = min(n, max(1, cfg.stream_converge_probe_views))
+        vals = []
+        for i in np.linspace(0, n - 1, k).round().astype(int):
+            data = self.valset[int(i)]
+            pixels = torch.as_tensor(data["image"], device=self.device).float()[None].permute(0, 3, 1, 2) / 255.0
+            K = torch.as_tensor(data["K"], device=self.device).float()[None]
+            h, w = pixels.shape[2:]
+            colors, _, _ = self.rasterize_splats(
+                camtoworlds=torch.as_tensor(data["camtoworld"], device=self.device).float()[None],
+                Ks=K, width=w, height=h, sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
+                near_plane=cfg.near_plane, far_plane=cfg.far_plane)
+            colors = colors.clamp(0.0, 1.0).permute(0, 3, 1, 2)
+            mse = F.mse_loss(colors, pixels).clamp_min(1e-10)
+            vals.append(float(-10.0 * torch.log10(mse)))
+        return float(np.mean(vals))
+
+    # ------------------------------------------------------------------ online Difix
+    def _difix_schedule(self, max_steps: int) -> set:
+        cfg = self.cfg
+        if self.difix is None:
+            return set()
+        if cfg.difix_online_steps:
+            return set(cfg.difix_online_steps)
+        if self.stream is not None:
+            if cfg.stream_cycle:
+                return set()  # Difix runs in the per-epoch cycle
+            if getattr(self, "world_conv", None) is not None:
+                return {cfg.difix_online_start}  # + the final polish round on convergence
+            return set(range(cfg.difix_online_start, max_steps - cfg.difix_online_every // 2,
+                             cfg.difix_online_every))
+        return {int(max_steps * f) for f in (0.4, 0.6, 0.8)}
+
+    @torch.no_grad()
+    def _render_uint8(self, c2w: np.ndarray, K: np.ndarray, width: int, height: int, step: int) -> np.ndarray:
+        cfg = self.cfg
+        renders, _, _ = self.rasterize_splats(
+            camtoworlds=torch.as_tensor(c2w, dtype=torch.float32, device=self.device)[None],
+            Ks=torch.as_tensor(K, dtype=torch.float32, device=self.device)[None],
+            width=width, height=height,
+            sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
+            near_plane=cfg.near_plane, far_plane=cfg.far_plane,
+        )
+        return (renders[0, ..., :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+
+    def _scene_points(self, n: int = 20000) -> np.ndarray:
+        """Opaque Gaussian centres: the live geometry pseudo cameras orbit around."""
+        with torch.no_grad():
+            means = self.splats["means"][torch.sigmoid(self.splats["opacities"]) > 0.3]
+            if len(means) > n:
+                means = means[torch.randperm(len(means), device=means.device)[:n]]
+            return means.cpu().numpy().astype(np.float64)
+
+    def _difix_sources(self):
+        from hypersplat.stream.difix_online import DifixSources
+        from hypersplat.stream.schema import select_rows
+        from hypersplat.stream.source import decode_jpeg
+
+        if self.stream is not None:
+            _, table = self.stream.views()
+            table = select_rows(table, kind="real", split="train")
+            if table.num_rows < 2:
+                return None
+            c2ws = np.array(table.column("c2w").to_pylist()).reshape(-1, 4, 4)
+            return DifixSources(
+                c2ws=c2ws, K=np.array(table.column("K")[0].as_py()).reshape(3, 3),
+                width=int(table.column("width")[0].as_py()), height=int(table.column("height")[0].as_py()),
+                weights=np.array(table.column("weight").to_pylist(), dtype=np.float64),
+                points=self._scene_points(),
+                get_image=lambda i: decode_jpeg(table.column("jpeg")[i].as_py()),
+                ids=table.column("kid").to_pylist(),
+            )
+        from hypersplat.beta.difix.augment import confidence_weights, load_ace_confidence
+
+        ds = getattr(self.base_trainset, "dataset", self.base_trainset)
+        idx = np.asarray(ds.indices)
+        names = [Path(self.parser.image_names[i]).name for i in idx]
+        conf_w = confidence_weights(load_ace_confidence(Path(self.parser.data_dir)))
+        cam = self.parser.camera_ids[idx[0]]
+        width, height = self.parser.imsize_dict[cam]
+        return DifixSources(
+            c2ws=self.parser.camtoworlds[idx], K=self.parser.Ks_dict[cam].copy(), width=width, height=height,
+            weights=np.array([conf_w.get(n, 1.0) for n in names], dtype=np.float64),
+            points=self._scene_points(),
+            get_image=lambda i: ds[i]["image"].numpy().astype(np.uint8),
+            ids=list(range(len(idx))),
+        )
+
+    def _difix_round(self, step: int) -> Optional[bool]:
+        """Run one online Difix round; True if the batch DataLoader must be rebuilt, None if
+        deferred (a stream's ACE refit holds the GPU)."""
+        from hypersplat.stream.training import WithPseudo
+
+        if self.difix.stop_reason:
+            return False
+        src = self._difix_sources()
+        if src is None or len(src.c2ws) < 2:
+            return False
+        if self.stream is not None:
+            # Difix and an ACE refit together OOM a small GPU: take turns (per chunk)
+            if not self.stream.gpu_lease.try_acquire("difix"):
+                return None
+            try:
+                if self.difix.scale_idx == 0 and self.difix.rounds == 0:
+                    from hypersplat.stream.difix_online import SCALES
+                    free_mb = torch.cuda.mem_get_info()[0] / 2 ** 20
+                    if free_mb < self.cfg.difix_low_vram_mb:
+                        self.difix.scale_idx = SCALES.index(0.75)
+                        print(f"[Difix-online] {free_mb:.0f} MB VRAM free; starting at scale 0.75")
+                self.difix.begin_round(src, step, max_views=self.cfg.difix_online_views)
+            finally:
+                self.stream.release_gpu("difix")
+            self._difix_chunk(step)
+            return False
+        torch.cuda.empty_cache()
+        views, sources, _ = self.difix.run_round(
+            lambda c2w, K, w, h: self._render_uint8(c2w, K, w, h, step), src, step)
+        self.trainset = WithPseudo(self.base_trainset, views, [src.ids[s] for s in sources])
+        return True
+
+    def _stream_cycle(self, step: int):
+        """End of an epoch (one pass over the train keyframes): Difix -> depth -> ACE."""
+        cfg = self.cfg
+        s = self.stream
+        n_train = len(s.store.registered("train"))
+        if self._epoch_draws < max(n_train, 1) or step - self._epoch_start < cfg.stream_epoch_min_steps:
+            return
+        self._epoch += 1
+        self._epoch_draws, self._epoch_start = 0, step
+        t0 = time.time()
+        difix = self._difix_epoch(step) if self.difix is not None else "off"
+        t1 = time.time()
+        realigned = self._realign_depth() if self.depth_estimator is not None else None
+        if realigned is not None and cfg.stream_depth_render_align > 0 and cfg.with_eval3d:
+            realigned += self._render_align_depth(step)
+        t2 = time.time()
+        refit = s.request_refit(cfg.stream_cycle_refit_min)
+        msg = (f"[Cycle] epoch {self._epoch} @ step {step} ({n_train} keyframes): difix {difix} "
+               f"{(t1 - t0):.1f}s | depth {'-' if realigned is None else f're-aligned {realigned}'} "
+               f"{(t2 - t1) * 1000:.0f}ms | ace {'refit started' if refit else s.stats()['job'] or 'idle'}")
+        if self._epoch <= 3 or self._epoch % 10 == 0 or refit or (realigned or 0) > 0:
+            print("\n" + msg)
+        if self.dashboard is not None:
+            self.dashboard.update_training(epoch=self._epoch)
+        if self.world_rank == 0 and cfg.tb_every > 0:
+            self.writer.add_scalar("stream/epoch", self._epoch, step)
+            self.writer.add_scalar("stream/cycle_difix_s", t1 - t0, step)
+
+    def _difix_epoch(self, step: int) -> str:
+        """Cheap per-epoch Difix: a few views at reduced scale into a rolling pseudo pool."""
+        from hypersplat.stream.difix_online import SCALES, _RoundSkipped
+
+        cfg = self.cfg
+        if self.difix.stop_reason:
+            return "stopped"
+        src = self._difix_sources()
+        if src is None or len(src.c2ws) < 2:
+            return "no sources"
+        if not self.stream.gpu_lease.try_acquire("difix"):
+            return "skipped (ACE refit holds the GPU)"
+        try:
+            self.difix.scale_idx = max(self.difix.scale_idx, SCALES.index(cfg.difix_epoch_scale))
+            torch.cuda.empty_cache()
+            self.difix.begin_round(src, step, max_views=cfg.difix_epoch_views, max_angle=cfg.difix_epoch_max_angle)
+            self.difix.step_round(lambda c2w, K, w, h: self._render_uint8(c2w, K, w, h, step), budget_s=None)
+            views, _, _ = self.difix.finish_round(step)
+        except _RoundSkipped:
+            return "skipped (OOM)"
+        finally:
+            torch.cuda.empty_cache()
+            self.stream.release_gpu("difix")
+        self._pseudo_pool = (self._pseudo_pool + list(views))[-cfg.difix_online_views:]
+        self.stream.set_pseudo(self._pseudo_pool)
+        return f"+{len(views)} ({len(self._pseudo_pool)} pooled)"
+
+    def _realign_depth(self) -> int:
+        """Re-fit cached depth of keyframes ACE re-localized since their last alignment."""
+        from hypersplat.stream.depth import dense_depth
+
+        s = self.stream
+        n = 0
+        for kid, disp, pix, z, version in s.realign_jobs():
+            res = dense_depth(disp, None, pix, z, guide_radius=0)
+            s.set_depth(kid, res.depth, {"realign": True, "rel_err": res.align.rel_err if res.align.ok else None},
+                        version=version)
+            n += res.depth is not None
+        return n
+
+    @torch.no_grad()
+    def _render_align_depth(self, step: int) -> int:
+        """Closed depth loop: re-fit the monocular depth of a few train keyframes (round-robin)
+        to confident pixels of the current render as well as ACE's points; kept only when it
+        predicts held-out ACE points at least as well (hypersplat/stream/depth.align_disparity)."""
+        from hypersplat.stream.depth import dense_depth
+        from hypersplat.stream.schema import select_rows
+
+        cfg = self.cfg
+        s = self.stream
+        _, table = s.views()
+        table = select_rows(table, kind="real", split="train")
+        if table.num_rows == 0 or s.transform is None:
+            return 0
+        kids = table.column("kid").to_pylist()
+        rr = getattr(self, "_anchor_rr", 0) % len(kids)
+        order = kids[rr:] + kids[:rr]
+        jobs = s.anchor_jobs(order)[: cfg.stream_depth_render_align]
+        self._anchor_rr = rr + cfg.stream_depth_render_align
+        if not jobs:
+            return 0
+        row = {kid: i for i, kid in enumerate(kids)}
+        c2ws = np.array(table.column("c2w").to_pylist()).reshape(-1, 4, 4)
+        K0 = np.array(table.column("K")[0].as_py()).reshape(3, 3)
+        W0, H0 = int(table.column("width")[0].as_py()), int(table.column("height")[0].as_py())
+        to_ace = 1.0 / float(np.linalg.norm(s.transform[:3, 0]))  # trainer units -> ACE units
+        n = 0
+        for kid, disp, pix, z, version in jobs:
+            h, w = disp.shape
+            K = K0.copy()
+            K[0] *= w / W0
+            K[1] *= h / H0
+            renders, alphas, info = self.rasterize_splats(
+                camtoworlds=torch.as_tensor(c2ws[row[kid]], dtype=torch.float32, device=self.device)[None],
+                Ks=torch.as_tensor(K, dtype=torch.float32, device=self.device)[None],
+                width=w, height=h, sh_degree=cfg.sh_degree, near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane, render_mode="ED")
+            ed, a = renders[0, ..., 0], alphas[0, ..., 0]
+            std = info["render_depth_var"][0, ..., 0].sqrt()
+            conf = (a > 0.95) & (ed > 0) & (std < cfg.stream_depth_conf_tau * ed)
+            conf[1::2] = False  # every other row/column is plenty for a 2-parameter fit
+            conf[:, 1::2] = False
+            ys, xs = torch.nonzero(conf, as_tuple=True)
+            if len(ys) == 0:
+                continue
+            ys_n, xs_n = ys.cpu().numpy(), xs.cpu().numpy()
+            anchors = (disp[ys_n, xs_n], ed[ys, xs].cpu().numpy() * to_ace)
+            res = dense_depth(disp, None, pix, z, guide_radius=0, anchors=anchors)
+            if res.depth is not None and res.align.anchored:
+                s.set_depth(kid, res.depth, {"realign": True, "anchored": True, "rel_err": res.align.rel_err},
+                            version=version)
+                n += 1
+        return n
+
+    def _difix_chunk(self, step: int) -> bool:
+        """Advance the pending stream round by one chunk; True once its views are in training."""
+        from hypersplat.stream.difix_online import _RoundSkipped
+
+        if not self.stream.gpu_lease.try_acquire("difix"):
+            return False  # an ACE refit holds the GPU: next chunk slot
+        try:
+            torch.cuda.empty_cache()
+            done = self.difix.step_round(lambda c2w, K, w, h: self._render_uint8(c2w, K, w, h, step),
+                                         budget_s=self.cfg.difix_chunk_s)
+        except _RoundSkipped:
+            return False
+        finally:
+            torch.cuda.empty_cache()  # hand the blocks back before ACE takes the GPU
+            self.stream.release_gpu("difix")
+        if not done:
+            return False
+        views, _, _ = self.difix.finish_round(step)
+        self.stream.set_pseudo(views)  # the stream sampler sees them on its next draw
+        if self._final_difix == "running":
+            self._final_difix = "done"
+            self._stop_at = step + self.cfg.difix_final_tail_steps
+            print(f"\n[WorldStop] Final Difix round done at step {step}; "
+                  f"{self.cfg.difix_final_tail_steps} more steps on its pseudo views")
+        return True
 
     def step_genvs(self, step):
         """Generate a new view and inject it filter dataset."""
@@ -1157,11 +1826,20 @@ class Runner:
             print(f"Resumed from step {init_step}")
 
         # Initialize Schedulers (AFTER resume, so they attach to the correct optimizers)
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        # A stream keeps revealing new space late in the run: decay the position LR to 10%
+        # instead of 1% so Gaussians seeded then can still move into place
+        means_lr_final = 0.1 if self.stream is not None else 0.01
+        horizon = self.stream_horizon if self.stream is not None else None
+        if horizon is not None:
+            # Same decay, measured against the moving end of a stream run
+            means_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizers["means"], lambda s: horizon.lr_factor(s, means_lr_final)
+            )
+        else:
+            means_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["means"], gamma=means_lr_final ** (1.0 / max_steps)
+            )
+        schedulers = [means_scheduler]
         if cfg.pose_opt:
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
@@ -1200,22 +1878,33 @@ class Runner:
              # If user passes 4, and it works, good. If not, they should pass 0.
              # But default is 4.
              pass
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0),
-            pin_memory=True,
-        )
-        trainloader_iter = iter(trainloader)
+        def make_trainloader():
+            if self.stream is not None:
+                # Endless sampler over the live Arrow snapshot; workers would each hold a copy
+                return torch.utils.data.DataLoader(self.trainset, batch_size=cfg.batch_size,
+                                                   num_workers=0, pin_memory=True)
+            return torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0),
+                pin_memory=True,
+            )
 
-        # Early stopping: plateau of the EMA training loss. Disabled for streaming/GeNVS
-        # (data changes mid-run) and multi-GPU (ranks would have to agree on the stop step).
+        trainloader = make_trainloader()
+        trainloader_iter = iter(trainloader)
+        difix_steps = self._difix_schedule(max_steps)
+        if difix_steps:
+            print(f"[Difix-online] Rounds at steps {sorted(difix_steps)} ({cfg.difix_model_id})")
+
+        # Early stopping: plateau of the EMA training loss. Disabled when the data changes
+        # mid-run (streams, online Difix, GeNVS) and multi-GPU (ranks would have to agree).
         plateau = None
         if cfg.early_stopping:
-            if cfg.streaming or cfg.genvs_ckpt or world_size > 1:
-                print("[EarlyStop] Disabled (streaming / GeNVS / distributed run)")
+            if cfg.streaming or cfg.genvs_ckpt or world_size > 1 or self.stream is not None or self.difix:
+                print("[EarlyStop] Loss plateau disabled (stream / online Difix / GeNVS / distributed run)"
+                      + ("; streams use [WorldStop] instead" if self.stream is not None else ""))
             else:
                 plateau = PlateauDetector(
                     patience=cfg.early_stop_patience,
@@ -1223,15 +1912,29 @@ class Runner:
                     min_steps=cfg.early_stop_min_steps,
                 )
 
-        # Training loop.
+        # Training loop. A stream run has no fixed length: max_steps follows its horizon.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
+        if horizon is not None:
+            max_steps = horizon.value
+            pbar = tqdm.tqdm(itertools.count(init_step), total=max_steps - init_step)
+        else:
+            pbar = tqdm.tqdm(range(init_step, max_steps))
+        difix_deferred = False
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
+
+            stream_stop = False
+            if self.stream is not None and step % cfg.stream_sync_every == 0:
+                stream_stop = self._stream_sync(step)
+                if horizon.value != max_steps:
+                    max_steps = horizon.value
+                    difix_steps = self._difix_schedule(max_steps)
+                    pbar.total = max(max_steps - init_step, 1)
+                    pbar.refresh()
 
             # Streaming: check for new poses periodically
             if cfg.streaming and step > 0 and step % cfg.streaming_check_interval == 0:
@@ -1279,14 +1982,30 @@ class Runner:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
             if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                is_pseudo = data["is_pseudo"].to(device) if "is_pseudo" in data else None
+                if is_pseudo is None or not is_pseudo.any():
+                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                elif not is_pseudo.all():
+                    camtoworlds = torch.where(is_pseudo[:, None, None], camtoworlds,
+                                              self.pose_adjust(camtoworlds, image_ids))
+
+            view_slots = None
+            if self.view_adjust is not None and "kid" in data:
+                view_slots = self.view_adjust.slot_ids(data["kid"], camtoworlds, data.get("is_pseudo"))
+                camtoworlds = self.view_adjust.adjust_pose(camtoworlds, view_slots)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
             render_mode = "RGB"
-            if cfg.depth_loss or is_depth_only:
+            # Stream dense depth: supervise only views that have an aligned depth map
+            stream_depth_gt = None
+            if "depth" in data and cfg.stream_depth_lambda > 0 and step >= cfg.depth_warmup_steps:
+                gt = data["depth"].to(device)
+                if (gt > 0).float().mean() > 0.05:
+                    stream_depth_gt = gt
+            if cfg.depth_loss or is_depth_only or stream_depth_gt is not None:
                 render_mode = "RGB+ED"
 
             renders, alphas, info = self.rasterize_splats(
@@ -1305,6 +2024,8 @@ class Runner:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+            if view_slots is not None:
+                colors = self.view_adjust.adjust_colors(colors, view_slots)
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -1418,6 +2139,28 @@ class Runner:
                     loss += depthloss * effective_depth_lambda
                 else:
                     depthloss = torch.tensor(0.0, device=device)
+            if view_slots is not None and self.view_adjust.exposure is not None:
+                loss = loss + cfg.stream_exposure_reg * self.view_adjust.exposure_reg()
+            if stream_depth_gt is not None and depths is not None:
+                # Log-depth L1 against the ACE-aligned monocular depth, at its (half) resolution
+                pred = F.adaptive_avg_pool2d(depths.permute(0, 3, 1, 2), stream_depth_gt.shape[-2:])[:, 0]
+                valid = (stream_depth_gt > 0) & (pred > 1e-4)
+                if valid.any():
+                    err = (torch.log(pred[valid]) - torch.log(stream_depth_gt[valid])).abs()
+                    if cfg.stream_depth_conf_weight and "render_depth_var" in info:
+                        # Fuzzy render pixels (depth spread over several surfaces) trust the
+                        # monocular target less
+                        var = F.adaptive_avg_pool2d(info["render_depth_var"].permute(0, 3, 1, 2),
+                                                    stream_depth_gt.shape[-2:])[:, 0]
+                        rel_std = var.sqrt() / pred.clamp(min=1e-4)
+                        wgt = (1.0 / (1.0 + (rel_std / cfg.stream_depth_conf_tau) ** 2)).clamp(min=0.1)
+                        wgt = wgt.detach()[valid]
+                        sdl = (err * wgt).sum() / wgt.sum()
+                    else:
+                        sdl = err.mean()
+                    ramp = min(1.0, (step - cfg.depth_warmup_steps) / max(cfg.depth_ramp_steps, 1))
+                    loss = loss + cfg.stream_depth_lambda * ramp * torch.nan_to_num(sdl, nan=0.0, posinf=0.0)
+                    self._stream_depth_loss = float(sdl)
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -1523,6 +2266,10 @@ class Runner:
             )
 
             loss_val = loss.item()
+            self._last_loss = loss_val
+            if loss_val == loss_val and abs(loss_val) != float("inf"):
+                self._loss_ema = loss_val if getattr(self, "_loss_ema", None) is None else \
+                    0.99 * self._loss_ema + 0.01 * loss_val
             desc = f"loss={loss_val:.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
@@ -1534,12 +2281,14 @@ class Runner:
 
             # Early stop: this step becomes the final one (ckpt/ply/eval saved below as at max_steps)
             stop_now = plateau is not None and step < max_steps - 1 and plateau.update(step, loss_val)
-            if stop_now:
+            stop_now = stop_now or (stream_stop and step < max_steps - 1)
+            if stop_now and not stream_stop:
                 print(
                     f"\n[EarlyStop] Loss plateau at step {step}: EMA {plateau.ema:.5f}, no "
                     f"{cfg.early_stop_min_delta:.2%} improvement since step {plateau.best_step}"
                 )
-            is_final_step = step == max_steps - 1 or stop_now
+            # >=: a stream's end can be pinned at or before the current step (tail steps of 0)
+            is_final_step = step >= max_steps - 1 or stop_now
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -1602,6 +2351,9 @@ class Runner:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
+                if self.view_adjust is not None:
+                    data["stream_view_adjust"] = {"state": self.view_adjust.state_dict(),
+                                                  **self.view_adjust.extra_state()}
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
@@ -1708,7 +2460,7 @@ class Runner:
                     # Original behavior: step every iteration
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
+            for optimizer in self.app_optimizers + getattr(self, "stream_exposure_optimizers", []):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.bil_grid_optimizers:
@@ -1749,16 +2501,39 @@ class Runner:
                 if len(self.strategy_state["loss_history"]) > 10:
                     self.strategy_state["loss_history"] = self.strategy_state["loss_history"][-10:]
                 
+                # MCMC uses lr only to scale its position noise. A stream's means LR keeps a 10%
+                # floor so late seeds can move; the noise would keep 10x the usual end-of-run
+                # jitter with it (visible haze), so it decays to 1% as in a dataset run.
+                noise_lr = schedulers[0].get_last_lr()[0]
+                if horizon is not None:
+                    noise_lr *= horizon.lr_factor(step, 0.01) / horizon.lr_factor(step, means_lr_final)
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=schedulers[0].get_last_lr()[0],
+                    lr=noise_lr,
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # Online Difix: pseudo views from the live model replace the previous round's.
+            # A round deferred while an ACE refit holds the GPU is retried every step.
+            if self.stream is not None and cfg.stream_cycle and not is_final_step:
+                ps = data.get("is_pseudo")
+                self._epoch_draws += int((~ps).sum()) if isinstance(ps, torch.Tensor) else pixels.shape[0]
+                self._stream_cycle(step)
+            if (self.difix is not None and self.stream is not None and self.difix.round_pending
+                    and not is_final_step):
+                if step % cfg.difix_chunk_every == 0:
+                    self._difix_chunk(step)
+            elif (step in difix_steps or difix_deferred) and not is_final_step:
+                rebuild = self._difix_round(step)
+                difix_deferred = rebuild is None
+                if rebuild:
+                    trainloader = make_trainloader()
+                    trainloader_iter = iter(trainloader)
 
             # [GeNVS] Online Step
             if cfg.genvs_ckpt and (step % cfg.genvs_interval == 0) and step > 0:
@@ -1802,7 +2577,7 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-            if stop_now:
+            if is_final_step:
                 break
 
     @torch.no_grad()
@@ -1814,8 +2589,13 @@ class Runner:
         world_rank = self.world_rank
         world_size = self.world_size
 
+        if self.stream is not None:
+            self.valset.refresh()  # held-out keyframes as of now
+            if len(self.valset) == 0:
+                print("[Stream] No held-out keyframes yet; skipping evaluation")
+                return
         valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
+            self.valset, batch_size=1, shuffle=False, num_workers=0 if self.stream is not None else 1
         )
         ellipse_time = 0
         metrics = defaultdict(list)
@@ -1869,6 +2649,8 @@ class Runner:
             ellipse_time /= len(valloader)
 
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+            if getattr(self, "dashboard", None) is not None:
+                self.dashboard.update_training(psnr=round(stats["psnr"], 2))
             stats.update(
                 {
                     "ellipse_time": ellipse_time,
@@ -1908,7 +2690,12 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = self.parser.camtoworlds
+        if len(camtoworlds_all) > 12:
+            camtoworlds_all = camtoworlds_all[5:-5]
+        if len(camtoworlds_all) < 2:
+            print("Not enough cameras for a trajectory; skipping")
+            return
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
                 camtoworlds_all, 1
@@ -2226,6 +3013,10 @@ class Runner:
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    if cfg.stream_source:
+        import signal
+        # A plain SIGTERM would skip the cleanup of the ACE sidecar and the tmpfs work dir
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
         if world_rank == 0:
@@ -2262,7 +3053,15 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             return  # Exit after rendering
             
     else:
-        runner.train()
+        try:
+            runner.train()
+        finally:
+            if runner.stream is not None:
+                print(f"[Stream] Final: {runner.stream.stats()}")
+                runner.stream.stop()
+                if runner.dashboard is not None:
+                    runner.dashboard.update_training(done=True)
+                    runner.dashboard.stop()
         if cfg.save_object_ply:
             print("Saving object-only PLY...")
             runner._save_object_ply()
@@ -2347,7 +3146,14 @@ if __name__ == "__main__":
     if cfg.with_ut:
         assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
         
-    # [ROBUSTNESS] Handle gsplat backtrack limitation
+    # [ROBUSTNESS] Handle gsplat backtrack limitation: neither the UT projection nor the
+    # eval3d rasterizer passes gradients to camera poses
+    if cfg.with_ut and cfg.stream_source is not None:
+        # Streams drop per-image pose_opt anyway (changing image set): UT wins
+        cfg.pose_opt = False
+        if cfg.stream_pose_opt:
+            print("[Stream] UT has no pose gradients: disabling per-keyframe pose deltas")
+            cfg.stream_pose_opt = False
     if cfg.with_ut and cfg.pose_opt:
         print("\n" + "!" * 80)
         print("CONFLICT DETECTED: Unscented Transform (--with_ut) + Pose Optimization (--pose_opt)")

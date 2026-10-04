@@ -226,3 +226,4 @@ dependencies:
       - roma==1.4.1
       - timm==0.6.7
       - pycolmap==0.4.0
+      - pyarrow==17.0.0  # stream_sidecar.py: Arrow IPC with the 3DGS trainer (last py3.8 wheel)

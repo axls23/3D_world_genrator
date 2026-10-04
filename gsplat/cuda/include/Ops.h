@@ -493,7 +493,7 @@ projection_ut_3dgs_fused(
     const FThetaCameraDistortionParameters ftheta_coeffs // shared parameters for all cameras
 );
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 rasterize_to_pixels_from_world_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means,     // [..., N, 3]
@@ -522,7 +522,9 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     const FThetaCameraDistortionParameters ftheta_coeffs, // shared parameters for all cameras
     // intersections
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // also render ray-hit depth moments (sum w*z, sum w*z^2) -> 4th output
+    const bool with_depths
 );
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -560,7 +562,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor last_ids,        // [..., C, image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
-    const at::Tensor v_render_alphas  // [..., C, image_height, image_width, 1]
+    const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    const at::optional<at::Tensor> v_render_depths // [..., C, image_height, image_width, 2]
 );
 
 } // namespace gsplat

@@ -42,6 +42,7 @@ import torch
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+SHARED_HF_CACHE = REPO_ROOT.parent / "hf_cache"  # model weights live on the data drive
 sys.path.insert(0, str(REPO_ROOT / "examples"))
 
 from datasets.colmap import Parser  # noqa: E402
@@ -269,31 +270,47 @@ def render_view(splats, c2w: np.ndarray, K: np.ndarray, W: int, H: int, device: 
 
 
 class DifixFixer:
-    """Single-step Difix artifact remover, fp16 to fit ~3 GB of VRAM."""
+    """Single-step Difix artifact remover in fp16: UNet + VAE only on the GPU (~1.8 GB)."""
 
     def __init__(self, model_id: str = "nvidia/difix", device: str = "cuda"):
         from hypersplat.beta.difix.pipeline_difix import DifixPipeline
 
         self.device = device
-        pipe = DifixPipeline.from_pretrained(model_id, trust_remote_code=True, torch_dtype=torch.float16)
+        # Explicit cache_dir: HF_HOME is read when huggingface_hub is first imported, which
+        # may have happened before a caller set it (then ~5 GB lands on the root disk)
+        hub = os.environ.get("HF_HUB_CACHE") or (Path(os.environ["HF_HOME"]) / "hub" if "HF_HOME" in os.environ
+                                                 else SHARED_HF_CACHE / "hub" if SHARED_HF_CACHE.is_dir() else None)
+        pipe = DifixPipeline.from_pretrained(model_id, trust_remote_code=True, torch_dtype=torch.float16,
+                                             cache_dir=str(hub) if hub else None)
         pipe.set_progress_bar_config(disable=True)
-        # Keep every component on one device: the pipeline infers its execution device
-        # from its modules, so offloading the text encoder sends inputs to the CPU
-        pipe.to(device)
-        # Prompt is fixed: encode it once
+        # The prompt is fixed: encode it once on the CPU, then drop the CLIP text encoder
+        # (0.63 GB) - it never reaches the GPU. The pipeline takes prompt_embeds directly and
+        # infers its execution device from the remaining modules.
         with torch.no_grad():
             tokens = pipe.tokenizer(DIFIX_PROMPT, padding="max_length", max_length=pipe.tokenizer.model_max_length,
-                                    truncation=True, return_tensors="pt").input_ids.to(device)
-            self.prompt_embeds = pipe.text_encoder(tokens)[0]
+                                    truncation=True, return_tensors="pt").input_ids
+            self.prompt_embeds = pipe.text_encoder.float()(tokens)[0].to(torch.float16)
+        pipe.text_encoder = None
+        pipe.to(device)
+        self.prompt_embeds = self.prompt_embeds.to(device)
         self.pipe = pipe
 
+    def to(self, device: str) -> "DifixFixer":
+        """Move the model (e.g. park it on the CPU between online rounds to free VRAM)."""
+        self.pipe.to(device)
+        self.prompt_embeds = self.prompt_embeds.to(device)
+        self.device = device
+        return self
+
     @torch.no_grad()
-    def __call__(self, image: np.ndarray, ref: Optional[np.ndarray] = None) -> np.ndarray:
+    def __call__(self, image: np.ndarray, ref: Optional[np.ndarray] = None, scale: float = 1.0) -> np.ndarray:
         """ref: a real photo near the pseudo pose (difix_ref only); anchors the fix to the
-        actual scene instead of letting the model hallucinate structure from artifacts."""
+        actual scene instead of letting the model hallucinate structure from artifacts.
+        scale < 1 runs Difix on a downscaled copy (activation memory ~ pixels) and resizes the
+        result back; used to fit small GPUs."""
         H, W = image.shape[:2]
         # SD latents need multiples of 8
-        H8, W8 = (H // 8) * 8, (W // 8) * 8
+        H8, W8 = max(8, int(H * scale) // 8 * 8), max(8, int(W * scale) // 8 * 8)
         pil = Image.fromarray(image).resize((W8, H8), Image.BICUBIC)
         ref_pil = Image.fromarray(ref).resize((W8, H8), Image.BICUBIC) if ref is not None else None
         out = self.pipe(

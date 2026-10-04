@@ -100,3 +100,14 @@ def test_reasons_name_numbers(whatsapp_profile, make_config):
     reason = whatsapp_profile.get("decisions.CAP_MAX")["reason"]
     assert "free 5140 MB" in reason and "f=1" in reason
     assert "train imgs" in whatsapp_profile.get("decisions.TRAINING_MAX_STEPS")["reason"]
+
+
+def test_stream_cap_is_short_capture_sized_and_leaves_room_for_ace_difix():
+    from hypersplat.pipeline.params.strategies.training_budget import (ABS_MIN_CAP, STREAM_CAP,
+                                                                       stream_cap_max)
+
+    assert stream_cap_max(None, 960) == STREAM_CAP == 300_000
+    assert stream_cap_max(24_000, 960) == STREAM_CAP  # never the 1M trainer default
+    small = stream_cap_max(4_500, 960)
+    assert ABS_MIN_CAP <= small < STREAM_CAP  # 6 GB laptop GPU shared with ACE + Difix
+    assert stream_cap_max(4_500, 960, difix=False) > small

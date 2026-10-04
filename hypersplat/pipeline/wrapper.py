@@ -55,15 +55,29 @@ _VALUE_FLAGS = (
     ("difix_pseudo_weight", "--difix-pseudo-weight"),
     ("colmap_input", "--colmap-input"),
     ("seed", "--seed"),
+    ("stream_pace", "--stream-pace"),
+    ("stream_budget_mb", "--stream-budget-mb"),
+    ("stream_flight_port", "--stream-flight-port"),
+    ("stream_viewer_port", "--stream-viewer-port"),
+    ("stream_dashboard_port", "--stream-dashboard-port"),
+    ("stream_bootstrap_cooldown", "--stream-bootstrap-cooldown"),
+    ("stream_record_seconds", "--stream-record-seconds"),
+    ("stream_record_keyframes", "--stream-record-keyframes"),
+    ("stream_target_psnr", "--stream-target-psnr"),
 )
 
 # config key -> store_true flag, emitted only when the value is truthy.
 _BOOL_FLAGS = (
     ("with_ut", "--with_ut"),
+    ("stream_depth", "--stream-depth"),
+    ("stream_pose_opt", "--stream-pose-opt"),
+    ("stream_exposure_opt", "--stream-exposure-opt"),
     ("with_eval3d", "--with_eval3d"),
     ("random_bkgd", "--random_bkgd"),
     ("app_opt", "--app_opt"),
     ("difix", "--difix"),
+    ("difix_online", "--difix-online"),
+    ("stream", "--stream"),
 )
 
 # Early-stop values: (accepted config keys, flag). wrapper.py historically used
@@ -90,6 +104,9 @@ def validate_pipeline_config(config: Dict[str, Any]) -> None:
 
     Unset (None) values are fine: the manager resolves them automatically.
     """
+    mode = config.get("mode")
+    if mode is not None and mode not in PipelineMode.ALL:
+        raise ValueError(f"mode must be one of {PipelineMode.ALL}, got {mode!r}")
     for key in _POSITIVE_KEYS:
         value = config.get(key)
         if value is None:
@@ -178,6 +195,75 @@ class PipelineMode:
     LEVEL_1_SIMPLE = "simple"           # Direct training on existing data
     LEVEL_2_ACE_ZERO = "ace_zero"       # ACE-Zero poses → 3DGS (DEFAULT)
     LEVEL_3_CHUNKED = "chunked"         # Full chunked pipeline with COLMAP
+
+    ALL = (LEVEL_1_SIMPLE, LEVEL_2_ACE_ZERO, LEVEL_3_CHUNKED)
+
+
+# Level 1 calls simple_trainer.py directly, which has no dynamic strategies
+# (its own defaults are 30k steps at data_factor 4), so unset values fall back
+# to these instead of being left "auto".
+SIMPLE_MODE_FALLBACK = {"max_steps": 7000, "data_factor": 2}
+
+
+def build_simple_trainer_command(python_exe: str, root_dir: Path, data_dir: str,
+                                 output_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """Level 1: simple_trainer.py command for a pre-processed COLMAP dataset.
+
+    Unset max_steps/data_factor use SIMPLE_MODE_FALLBACK; unset
+    eval_steps/save_steps are derived from the effective max_steps.
+    """
+    trainer_script = Path(root_dir) / "examples" / "simple_trainer.py"
+    result_dir = Path(output_dir) / "results"
+    config = {**SIMPLE_MODE_FALLBACK, **{k: v for k, v in config.items() if v is not None}}
+    cmd = [
+        python_exe, "-u", str(trainer_script),
+        "mcmc",
+        "--data_dir", str(data_dir),
+        "--result_dir", str(result_dir),
+    ]
+    for key in ("max_steps", "data_factor"):
+        if config.get(key) is not None:
+            cmd.extend([f"--{key}", str(config[key])])
+    # The trainer's default eval/save steps (7k/30k) never fire for a
+    # shorter custom run, so derive them from max_steps when unset.
+    for key in ("eval_steps", "save_steps"):
+        steps = config.get(key)
+        if steps is None and config.get("max_steps") is not None:
+            steps = [config["max_steps"]]
+        if steps is not None:
+            cmd.extend([f"--{key}", *[str(s) for s in steps]])
+
+    for key in ("save_ply", "disable_viewer", "with_ut", "with_eval3d"):
+        if config.get(key):
+            cmd.append(f"--{key}")
+    return cmd
+
+
+def build_mode_command(mode: str, python_exe: str, root_dir: Path, input_path: str,
+                       output_dir: Path, config: Dict[str, Any]) -> List[str]:
+    """Full command for one pipeline mode -- the entry-point dispatcher shared by
+    TrainingManager and services/api/server.py.
+
+    ``input_path`` is the video for ace_zero/chunked and the COLMAP data dir
+    for simple. ``--skip-ace`` is left to the caller (it depends on disk state).
+    """
+    if mode == PipelineMode.LEVEL_1_SIMPLE:
+        return build_simple_trainer_command(python_exe, root_dir, input_path, output_dir, config)
+    if mode not in PipelineMode.ALL:
+        raise ValueError(f"Unknown pipeline mode {mode!r}; expected one of {PipelineMode.ALL}")
+
+    pipeline_script = Path(root_dir) / "scripts" / "pipeline" / "automated_intelligent_pipeline.py"
+    cmd = [
+        python_exe, "-u", str(pipeline_script),
+        input_path,
+        "--output_dir", str(output_dir),
+        *build_pipeline_args(config),
+    ]
+    if mode == PipelineMode.LEVEL_3_CHUNKED:
+        cmd.append("--use_colmap")  # Force COLMAP/chunked mode
+        if config.get("min_chunk_duration") is not None:
+            cmd.extend(["--min_chunk_duration", str(config["min_chunk_duration"])])
+    return cmd
 
 
 class TrainingManager:
@@ -334,13 +420,8 @@ class TrainingManager:
     
     def build_ace_zero_command(self, video_path: str) -> List[str]:
         """Pure: the Level 2 manager command for the current training_config."""
-        pipeline_script = self.scripts_dir / "automated_intelligent_pipeline.py"
-        return [
-            sys.executable, "-u", str(pipeline_script),
-            video_path,
-            "--output_dir", str(self.output_dir),
-            *build_pipeline_args(self.training_config),
-        ]
+        return build_mode_command(PipelineMode.LEVEL_2_ACE_ZERO, sys.executable, self.root_dir,
+                                  video_path, self.output_dir, self.training_config)
 
     def _trainer_has_native_early_stop(self, trainer_script: Path) -> bool:
         """Whether simple_trainer.py implements early stopping itself."""
@@ -349,48 +430,12 @@ class TrainingManager:
         except OSError:
             return False
 
-    # Level 1 calls simple_trainer.py directly, which has no dynamic
-    # strategies (its own defaults are 30k steps at data_factor 4), so unset
-    # values fall back to these instead of being left "auto".
-    SIMPLE_MODE_FALLBACK = {"max_steps": 7000, "data_factor": 2}
+    SIMPLE_MODE_FALLBACK = SIMPLE_MODE_FALLBACK
 
     def build_simple_command(self, data_dir: str) -> List[str]:
-        """Pure: the Level 1 simple_trainer command for the current training_config.
-
-        Unset max_steps/data_factor use SIMPLE_MODE_FALLBACK; unset
-        eval_steps/save_steps are derived from the effective max_steps.
-        """
-        trainer_script = self.root_dir / "examples" / "simple_trainer.py"
-        result_dir = self.output_dir / "results"
-        config = {**self.SIMPLE_MODE_FALLBACK,
-                  **{k: v for k, v in self.training_config.items() if v is not None}}
-        cmd = [
-            sys.executable, "-u", str(trainer_script),
-            "mcmc",
-            "--data_dir", str(data_dir),
-            "--result_dir", str(result_dir),
-        ]
-        for key in ("max_steps", "data_factor"):
-            if config.get(key) is not None:
-                cmd.extend([f"--{key}", str(config[key])])
-        # The trainer's default eval/save steps (7k/30k) never fire for a
-        # shorter custom run, so derive them from max_steps when unset.
-        for key in ("eval_steps", "save_steps"):
-            steps = config.get(key)
-            if steps is None and config.get("max_steps") is not None:
-                steps = [config["max_steps"]]
-            if steps is not None:
-                cmd.extend([f"--{key}", *[str(s) for s in steps]])
-
-        if config.get("save_ply"):
-            cmd.append("--save_ply")
-        if config.get("disable_viewer"):
-            cmd.append("--disable_viewer")
-        if config.get("with_ut"):
-            cmd.append("--with_ut")
-        if config.get("with_eval3d"):
-            cmd.append("--with_eval3d")
-        return cmd
+        """Pure: the Level 1 simple_trainer command for the current training_config."""
+        return build_mode_command(PipelineMode.LEVEL_1_SIMPLE, sys.executable, self.root_dir,
+                                  str(data_dir), self.output_dir, self.training_config)
 
     def _run_simple_training(self, video_path: str):
         """
@@ -430,21 +475,12 @@ class TrainingManager:
         """
         self.logs.append("=== LEVEL 3: CHUNKED PIPELINE ===")
         
-        pipeline_script = self.scripts_dir / "automated_intelligent_pipeline.py"
-        
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        
-        cmd = [
-            sys.executable, "-u", str(pipeline_script),
-            video_path,
-            "--output_dir", str(self.output_dir),
-            "--use_colmap",  # Force COLMAP/chunked mode
-            *build_pipeline_args(self.training_config),
-        ]
-        if self.training_config.get("min_chunk_duration") is not None:
-            cmd.extend(["--min_chunk_duration", str(self.training_config["min_chunk_duration"])])
-        
+
+        cmd = build_mode_command(PipelineMode.LEVEL_3_CHUNKED, sys.executable, self.root_dir,
+                                 video_path, self.output_dir, self.training_config)
+
         self.logs.append(f"Command: {' '.join(cmd)}")
         print(f"Starting chunked pipeline: {' '.join(cmd)}")
         

@@ -692,7 +692,7 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_2dgs(
 // 3DGS (from world)
 ////////////////////////////////////////////////////
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3dgs_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means,     // [..., N, 3]
     const at::Tensor quats,     // [..., N, 4]
@@ -719,7 +719,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
     const FThetaCameraDistortionParameters ftheta_coeffs, // shared parameters for all cameras
     // intersections
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // also render ray-hit depth moments (sum w*z, sum w*z^2) -> 4th output
+    const bool with_depths
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -741,7 +743,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
     uint32_t C = viewmats0.size(-3);     // number of cameras
     // uint32_t N = means.size(-2);         // number of gaussians
     uint32_t channels = colors.size(-1);
-    assert (channels == 3); // only support RGB for now
+    // Any instantiated channel count (the kernels are channel-generic): RGB+D / RGB+ED
+    // render in one pass instead of 3-channel chunks
 
     at::DimVector renders_shape(batch_dims);
     renders_shape.append({C, image_height, image_width, channels});
@@ -754,6 +757,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
     at::DimVector last_ids_shape(batch_dims);
     last_ids_shape.append({C, image_height, image_width});
     at::Tensor last_ids = at::empty(last_ids_shape, opt.dtype(at::kInt));
+
+    at::DimVector depths_shape(batch_dims);
+    depths_shape.append({C, image_height, image_width, with_depths ? 2 : 0});
+    at::Tensor depths = at::empty(depths_shape, opt);
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
@@ -782,7 +789,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
             flatten_ids,                                                       \
             renders,                                                           \
             alphas,                                                            \
-            last_ids                                                           \
+            last_ids,                                                          \
+            with_depths ? at::optional<at::Tensor>(depths) : at::nullopt       \
         );                                                                     \
         break;
 
@@ -814,7 +822,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
     }
 #undef __LAUNCH_KERNEL__
 
-    return std::make_tuple(renders, alphas, last_ids);
+    return std::make_tuple(renders, alphas, last_ids, depths);
 };
 
 
@@ -852,7 +860,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor last_ids,      // [..., C, image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
-    const at::Tensor v_render_alphas // [..., C, image_height, image_width, 1]
+    const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    const at::optional<at::Tensor> v_render_depths // [..., C, image_height, image_width, 2]
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -871,6 +880,9 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
+    }
+    if (v_render_depths.has_value()) {
+        CHECK_INPUT(v_render_depths.value());
     }
 
     uint32_t channels = colors.size(-1);
@@ -914,7 +926,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
             v_quats,                                                           \
             v_scales,                                                          \
             v_colors,                                                          \
-            v_opacities                                                        \
+            v_opacities,                                                       \
+            v_render_depths                                                    \
         );                                                                     \
         break;
 

@@ -16,6 +16,13 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 import shutil
+
+# Keep HF model downloads (Difix, ~5 GB) on the data drive, not ~/.cache on the root disk.
+# Must be set before diffusers/huggingface_hub are imported.
+_SHARED_HF_CACHE = Path(__file__).resolve().parents[3] / "hf_cache"
+if _SHARED_HF_CACHE.is_dir():
+    os.environ.setdefault("HF_HOME", str(_SHARED_HF_CACHE))
+
 import numpy as np
 import cv2
 import torch
@@ -25,6 +32,18 @@ import yaml
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+
+def find_newest_ckpt(ckpt_dir: Path, pattern: str = "ckpt_*_rank0.pt") -> Optional[Path]:
+    """Newest checkpoint by write time, then step.
+
+    Picking by step alone is wrong when a result dir is reused: a stale ckpt_6999 from a
+    longer earlier run would outrank this run's ckpt_4199.
+    """
+    ckpts = list(ckpt_dir.glob(pattern))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda p: (p.stat().st_mtime, int(p.stem.split("_")[1])))
 
 
 def resolve_path_relative_to_project(path_str: str, must_exist: bool = False, must_be_file: bool = False) -> Path:
@@ -160,19 +179,56 @@ class PipelineConfig:
             self.GENVS_AUTOREGRESSIVE = True
             self.GENVS_BACKEND = 'difix'
 
-        # [ROBUSTNESS] Flag Validation
-        if self.WITH_UT and self.POSE_OPT:
-            logger.warning("Unscented Transform (+UT) + Pose Opt is currently incompatible in gsplat.")
-            logger.warning("Disabling UT/Eval3D to prioritize Pose Optimization.")
-            self.WITH_UT = False
-            self.WITH_EVAL3D = False
-
-
         # Streaming mode: dynamically accept new poses during training
         # Removed redundant STREAMING reset that ignored unified_stream
 
         # How often to check for new poses (in training steps)
         self.STREAMING_INTERVAL = getattr(args, 'streaming_check_interval', 1000)
+
+        # Streaming pipeline (hypersplat/stream): the input is a source spec - video file,
+        # camera index, /dev/videoN, rtsp/http URL or flight://host:port - and frames flow
+        # through an in-memory keyframe store + ACE sidecar straight into training.
+        self.STREAM = getattr(args, 'stream', False)
+        self.STREAM_PACE = getattr(args, 'stream_pace', 'auto')
+        self.STREAM_BUDGET_MB = getattr(args, 'stream_budget_mb', 256.0)
+        self.STREAM_FLIGHT_PORT = getattr(args, 'stream_flight_port', None)
+        self.STREAM_VIEWER_PORT = getattr(args, 'stream_viewer_port', None)       # viser 3DGS viewer
+        self.STREAM_DASHBOARD_PORT = getattr(args, 'stream_dashboard_port', None) # viewer | camera page
+        self.STREAM_DASHBOARD_HOST = getattr(args, 'stream_dashboard_host', '127.0.0.1')
+        # Stop recording a live source after this long / this many keyframes (None: until the
+        # dashboard button or <result_dir>/STOP_RECORDING); training continues afterwards
+        self.STREAM_RECORD_SECONDS = getattr(args, 'stream_record_seconds', None)
+        self.STREAM_RECORD_KEYFRAMES = getattr(args, 'stream_record_keyframes', None)
+        # Stream early stop (with early stopping on): held-out PSNR counted as "good enough"
+        self.STREAM_TARGET_PSNR = getattr(args, 'stream_target_psnr', None)
+        # Dense depth for streams: Depth Anything V2 aligned to ACE points (seeding + loss)
+        self.STREAM_DEPTH = getattr(args, 'stream_depth', False)
+        # Per-keyframe pose deltas / exposure for streams (the generic pose_opt is per-image)
+        self.STREAM_POSE_OPT = getattr(args, 'stream_pose_opt', False)
+        self.STREAM_BOOTSTRAP_COOLDOWN = getattr(args, 'stream_bootstrap_cooldown', None)
+        # Raw trainer overrides (KEY=VALUE -> --KEY VALUE), appended last so they win
+        # (scripts/experiments/ab_test.py uses these to vary trainer hyperparameters)
+        self.TRAINER_ARGS = list(getattr(args, 'trainer_arg', None) or [])
+        self.STREAM_EXPOSURE_OPT = getattr(args, 'stream_exposure_opt', False)
+        # Online Difix: refine inside training instead of the STEP 3 retrain loop
+        self.DIFIX_ONLINE = getattr(args, 'difix_online', False)
+
+        # [ROBUSTNESS] Flag Validation. gsplat's UT projection is not differentiable, so UT
+        # trains only with the world-space (eval3d) rasterizer, and neither passes gradients
+        # to camera poses.
+        if self.WITH_UT:
+            self.WITH_EVAL3D = True
+            if self.STREAM:
+                # Streams drop per-image pose_opt anyway (changing image set): UT wins
+                self.POSE_OPT = False
+                if self.STREAM_POSE_OPT:
+                    logger.warning("UT has no pose gradients: disabling per-keyframe pose deltas.")
+                    self.STREAM_POSE_OPT = False
+            elif self.POSE_OPT:
+                logger.warning("Unscented Transform (+UT) + Pose Opt is currently incompatible in gsplat.")
+                logger.warning("Disabling UT/Eval3D to prioritize Pose Optimization.")
+                self.WITH_UT = False
+                self.WITH_EVAL3D = False
 
         # GeNVS Online Integration
         self.GENVS_INTERVAL = getattr(args, 'genvs_interval', 1000)
@@ -275,7 +331,9 @@ class IntelligentPipeline:
 
     def run(self, video_path: str) -> Dict:
         """Execute the optimized ACE-Zero -> 3DGS pipeline"""
-        
+        if self.config.STREAM:
+            return self.run_stream(video_path)
+
         # Resolve video path using helper function (must exist and be a file)
         video_path = resolve_path_relative_to_project(video_path, must_exist=True, must_be_file=True)
         
@@ -389,8 +447,11 @@ class IntelligentPipeline:
             self._apply_param_stage("pre_train")
             result_dir = self._run_training(ace_output)
             
-            # 2.2 Autoregressive Refinement (The "Dream" Loop)
-            if self.config.GENVS_AUTOREGRESSIVE:
+            # 2.2 Autoregressive Refinement (The "Dream" Loop). Online Difix already
+            # refined inside training, so the render -> Difix -> retrain loop is skipped.
+            if self.config.GENVS_AUTOREGRESSIVE and self.config.DIFIX_ONLINE:
+                logger.info("STEP 3 skipped: online Difix refined during training")
+            elif self.config.GENVS_AUTOREGRESSIVE:
                 result_dir = self._run_autoregressive_refinement(ace_output, result_dir)
             
             # 2.5. Floater Pruning (optional post-processing)
@@ -794,9 +855,8 @@ class IntelligentPipeline:
         from argparse import Namespace
         from hypersplat.beta.difix.augment import run as difix_augment
 
-        ckpts = sorted((result_dir / "ckpts").glob("ckpt_*_rank0.pt"),
-                       key=lambda p: int(p.stem.split("_")[1]))
-        if not ckpts:
+        ckpt = find_newest_ckpt(result_dir / "ckpts")
+        if ckpt is None:
             logger.warning(f"  [Difix] No checkpoint in {result_dir}/ckpts; skipping this loop")
             return data_dir
 
@@ -819,12 +879,12 @@ class IntelligentPipeline:
                     if "MIN_REGISTRATION_CONFIDENCE" in user_set else None)
         out_dir = iter_dir / "augmented_colmap"
         logger.info(f"  [Difix] Loop {loop_idx + 1}: {self.config.DIFIX_NUM_VIEWS} pseudo views up to "
-                    f"{max_angle:.1f} deg from {ckpts[-1].name} (seed {seed})")
+                    f"{max_angle:.1f} deg from {ckpt.name} (seed {seed})")
         profile = getattr(self, "profile", None)
         if profile is not None:
             profile.save()  # augment appends difix.rounds to the same file
         difix_augment(Namespace(
-            data_dir=str(base_dir), ckpt=str(ckpts[-1]), out_dir=str(out_dir),
+            data_dir=str(base_dir), ckpt=str(ckpt), out_dir=str(out_dir),
             num_views=self.config.DIFIX_NUM_VIEWS, max_angle=max_angle,
             pseudo_weight=self.config.DIFIX_PSEUDO_WEIGHT,
             min_conf=min_conf, weight_floor=None,
@@ -839,8 +899,8 @@ class IntelligentPipeline:
         torch.cuda.empty_cache()
         return out_dir
 
-    def _run_training(self, data_dir: Path, resume_ckpt: Optional[Path] = None,
-                      result_name: str = "acezero_3dgs") -> Path:
+    def _run_training(self, data_dir: Optional[Path], resume_ckpt: Optional[Path] = None,
+                      result_name: str = "acezero_3dgs", extra_args: Optional[list] = None) -> Path:
         """Step 2: MCMC 3DGS Training"""
         logger.info("\nSTEP 2: TRAINING (3DGS MCMC)")
         
@@ -853,7 +913,7 @@ class IntelligentPipeline:
 
         cmd = [
             sys.executable, "-u", str(trainer_script), "mcmc",
-            "--data_dir", str(data_dir),
+            *(["--data_dir", str(data_dir)] if data_dir is not None else []),
             "--result_dir", str(result_dir),
             "--max_steps", str(self.config.TRAINING_MAX_STEPS),
             "--data_factor", str(self.config.DATA_FACTOR),
@@ -909,6 +969,24 @@ class IntelligentPipeline:
              cmd.extend(["--genvs_ckpt", str(self.config.GENVS_CKPT)])
              cmd.extend(["--genvs_interval", str(self.config.GENVS_INTERVAL)])
 
+        if self.config.DIFIX_ONLINE:
+            cmd.append("--difix_online")
+        if self.config.STREAM and self.config.STREAM_VIEWER_PORT:
+            cmd.remove("--disable_viewer")
+            cmd.extend(["--port", str(self.config.STREAM_VIEWER_PORT)])
+        cmd.extend(extra_args or [])
+        for kv in self.config.TRAINER_ARGS:
+            key, sep, value = kv.partition("=")
+            if not sep or not key:
+                raise ValueError(f"--trainer-arg expects KEY=VALUE, got {kv!r}")
+            key = key.lstrip('-')
+            if value.lower() in ("true", "false"):
+                # tyro booleans are flags: --key / --no-key
+                flag = key.replace("_", "-")
+                cmd.append(f"--{flag}" if value.lower() == "true" else f"--no-{flag}")
+            else:
+                cmd.extend([f"--{key}", value])
+
         if resume_ckpt and resume_ckpt.exists():
             cmd.extend(["--ckpt", str(resume_ckpt)])
             logger.info(f"  [Resume] Continuing from checkpoint: {resume_ckpt.name}")
@@ -932,6 +1010,88 @@ class IntelligentPipeline:
             raise RuntimeError(f"Training process exited with error code {exit_code}.")
 
         return result_dir
+
+    def run_stream(self, source: str) -> Dict:
+        """Streaming pipeline: source -> keyframes -> ACE sidecar -> live 3DGS training.
+
+        Poses come from the trainer's ACE sidecar as frames arrive, so there is no separate
+        STEP 1 and no batch refinement loop; online Difix (if enabled) runs inside training.
+        A file source is reconstructed just in time and ends on its own; a live source has no
+        fixed length: max_steps is the initial budget, every new view extends it (the trainer's
+        --stream_extend_steps), and the run ends that long after the last new view or when
+        <result_dir>/STOP is created.
+        """
+        from hypersplat.pipeline.params import PROFILE_ENV, PROFILE_FILENAME, SceneProfile
+        from hypersplat.stream.source import parse_source
+
+        kind, target = parse_source(source)
+        if kind == "file":
+            source = str(target)
+        start_time = time.time()
+        logger.info("=" * 70)
+        logger.info("STREAMING PIPELINE: frames -> ACE sidecar -> live 3DGS")
+        logger.info("=" * 70)
+        logger.info(f"Source: {source} ({kind})")
+        logger.info(f"Output: {self.config.OUTPUT_BASE}")
+        self.config.create_directories()
+        self.profile = SceneProfile.load(self.config.OUTPUT_BASE / PROFILE_FILENAME)
+        self.profile.discard("train", "difix", "decisions", "stream")
+        os.environ[PROFILE_ENV] = str(self.profile.path)
+        if kind == "file":
+            self._record_video_signals(Path(source))
+        self._record_gpu_signals()
+        # The pre_train budget stage needs a frame count a stream doesn't have: without this the
+        # trainer's 1M default applies (near-duplicate keyframes, GPU shared with ACE/Difix)
+        if "CAP_MAX" not in self.config.USER_SET:
+            from hypersplat.pipeline.params.strategies.training_budget import stream_cap_max
+            self.config.CAP_MAX = stream_cap_max(self.profile.get("gpu.free_mb"), 960,
+                                                 difix=bool(self.config.DIFIX_ONLINE))
+            logger.info(f"[Config] Stream Gaussian cap: {self.config.CAP_MAX}")
+
+        # Live sources have no natural end: 10k steps unless one was given. It is a hard
+        # ceiling (--stream_max_steps_cap below): new views extend training only up to it, and
+        # the world early stop usually ends sooner
+        if "TRAINING_MAX_STEPS" not in self.config.USER_SET and kind != "file":
+            self.config.TRAINING_MAX_STEPS = 10000
+        steps = self.config.TRAINING_MAX_STEPS
+        if "TRAINING_EVAL_STEPS" not in self.config.USER_SET:
+            self.config.TRAINING_EVAL_STEPS = [steps]
+        if "TRAINING_SAVE_STEPS" not in self.config.USER_SET:
+            self.config.TRAINING_SAVE_STEPS = [steps]
+        extra = ["--stream_source", source, "--stream_pace", self.config.STREAM_PACE,
+                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB), "--ply_steps", str(steps),
+                 "--stream_max_steps_cap", str(steps)]
+        if self.config.STREAM_FLIGHT_PORT:
+            extra += ["--stream_flight_port", str(self.config.STREAM_FLIGHT_PORT)]
+        if self.config.STREAM_DASHBOARD_PORT:
+            extra += ["--stream_dashboard_port", str(self.config.STREAM_DASHBOARD_PORT),
+                      "--stream_dashboard_host", self.config.STREAM_DASHBOARD_HOST]
+        if self.config.STREAM_RECORD_SECONDS:
+            extra += ["--stream_record_seconds", str(self.config.STREAM_RECORD_SECONDS)]
+        if self.config.STREAM_RECORD_KEYFRAMES:
+            extra += ["--stream_record_keyframes", str(self.config.STREAM_RECORD_KEYFRAMES)]
+        if self.config.STREAM_DEPTH:
+            extra += ["--stream_depth"]
+        if self.config.STREAM_POSE_OPT:
+            extra += ["--stream_pose_opt"]
+        if self.config.STREAM_BOOTSTRAP_COOLDOWN:
+            extra += ["--stream_bootstrap_cooldown", str(self.config.STREAM_BOOTSTRAP_COOLDOWN)]
+        if self.config.STREAM_EXPOSURE_OPT:
+            extra += ["--stream_exposure_opt"]
+        if self.config.STREAM_TARGET_PSNR:
+            extra += ["--stream_converge_target_psnr", str(self.config.STREAM_TARGET_PSNR)]
+        if self.config.EARLY_STOPPING:
+            logger.info("[Stream] Early stop: training ends once the world is reconstructed "
+                        f"(max_steps {steps} is only a ceiling; --no-early-stopping to disable)")
+        result_dir = self._run_training(None, result_name="stream_3dgs", extra_args=extra)
+
+        if self.config.PRUNE:
+            self._run_floater_pruning(result_dir)
+        cloud_result = self._upload_to_cloud(result_dir) if self.config.CLOUD_SYNC else None
+        elapsed = time.time() - start_time
+        self._print_success(elapsed, result_dir)
+        return {"status": "success", "elapsed": elapsed, "output": str(result_dir),
+                "cloud_sync": cloud_result}
 
     def _run_autoregressive_refinement(self, ace_output: Path, initial_result_dir: Path) -> Path:
         """Step 3: Autoregressive Refinement (The 'Dream' Loop)"""
@@ -1155,8 +1315,7 @@ class IntelligentPipeline:
         logger.info("  Sampling 3D latent space (Rendering)...")
         trainer_script = Path(__file__).resolve().parent.parent.parent / "examples" / "simple_trainer.py"
         ckpt_dir = initial_result_dir / "ckpts"
-        ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: int(p.stem.split('_')[1]))
-        latest_ckpt = ckpts[-1]
+        latest_ckpt = find_newest_ckpt(ckpt_dir, "*.pt")
         
         cmd_render = [
             sys.executable, str(trainer_script), "mcmc",
@@ -1401,7 +1560,7 @@ def main():
     parser = argparse.ArgumentParser(description="Condensed Intelligent 3DPipeline")
     
     # Core
-    parser.add_argument("video_path", help="Input video file")
+    parser.add_argument("video_path", help="Input video file (with --stream: any stream source spec)")
     parser.add_argument("--output_dir", default="data/output_3dgs", help="Output root")
     parser.add_argument("--fps", type=float, default=None, help="Extraction FPS (default: auto, fallback 10)")
     parser.add_argument("--data_factor", type=int, default=None, help="Downsample factor (default: auto, fallback 2)")
@@ -1435,6 +1594,43 @@ def main():
                         help="Enable streaming mode: start 3DGS training while ACE-Zero is running")
     parser.add_argument("--unified_stream", action="store_true",
                         help="Alias for --streaming --quality-mode fast")
+    parser.add_argument("--stream", action="store_true",
+                        help="Streaming pipeline: video_path is a source spec (video file, camera "
+                             "index, /dev/videoN, rtsp/http URL or flight://host:port); frames are "
+                             "posed by an ACE sidecar and trained on as they arrive, in memory")
+    parser.add_argument("--stream-pace", dest="stream_pace", choices=["auto", "realtime", "fast"],
+                        default="auto", help="auto: files as fast as training consumes, cameras live")
+    parser.add_argument("--stream-budget-mb", dest="stream_budget_mb", type=float, default=256.0,
+                        help="Memory budget of the keyframe store (encoded frames + pseudo views)")
+    parser.add_argument("--stream-flight-port", dest="stream_flight_port", type=int, default=None,
+                        help="Also serve live views/stats over Arrow Flight on this port")
+    parser.add_argument("--stream-viewer-port", dest="stream_viewer_port", type=int, default=None,
+                        help="Open the viser 3DGS viewer on this port while a stream trains")
+    parser.add_argument("--stream-dashboard-port", dest="stream_dashboard_port", type=int, default=None,
+                        help="Serve the live dashboard (3D viewer left, camera feed right) on this port")
+    parser.add_argument("--stream-dashboard-host", dest="stream_dashboard_host", default="127.0.0.1",
+                        help="Dashboard bind address (0.0.0.0 exposes the camera feed on the network)")
+    parser.add_argument("--stream-record-seconds", dest="stream_record_seconds", type=float, default=None,
+                        help="Stop recording a live source after this many seconds (training continues)")
+    parser.add_argument("--stream-record-keyframes", dest="stream_record_keyframes", type=int, default=None,
+                        help="Stop recording a live source after this many keyframes (training continues)")
+    parser.add_argument("--stream-depth", dest="stream_depth", action="store_true",
+                        help="Dense depth per keyframe (Depth Anything V2 Small aligned to ACE points): "
+                             "denser seeding and a depth loss")
+    parser.add_argument("--trainer-arg", dest="trainer_arg", action="append", metavar="KEY=VALUE",
+                        help="Pass a trainer option through (e.g. ssim_lambda=0.3, strategy.cap-max=200000); "
+                             "repeatable, applied last so it overrides the pipeline's value")
+    parser.add_argument("--stream-bootstrap-cooldown", dest="stream_bootstrap_cooldown", type=int, default=None,
+                        help="Cap the first ACE map's cooldown iterations (sooner first map)")
+    parser.add_argument("--stream-pose-opt", dest="stream_pose_opt", action="store_true",
+                        help="Refine each keyframe's ACE pose during stream training")
+    parser.add_argument("--stream-exposure-opt", dest="stream_exposure_opt", action="store_true",
+                        help="Learn a per-keyframe exposure gain/bias (camera auto-exposure)")
+    parser.add_argument("--stream-target-psnr", dest="stream_target_psnr", type=float, default=None,
+                        help="Stream early stop: held-out PSNR (dB) that counts as adequately "
+                             "reconstructed once gains flatten (default 22)")
+    parser.add_argument("--difix-online", dest="difix_online", action="store_true",
+                        help="Run Difix rounds inside training (replaces the STEP 3 retrain loop)")
     parser.add_argument("--streaming_check_interval", type=int, default=1000,
                         help="Interval to check for new poses in streaming mode (default: 1000)")
 

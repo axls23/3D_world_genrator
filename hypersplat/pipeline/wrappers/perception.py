@@ -36,6 +36,35 @@ logger = logging.getLogger(__name__)
 # And project root is .parent.parent.parent.parent
 ACEZERO_ROOT = Path(__file__).parent.parent.parent.parent / "scripts" / "acezero"
 
+DEFAULT_ACEZERO_ENV = Path(__file__).resolve().parents[4] / ".conda_envs" / "ace0"
+
+
+def acezero_python_env(acezero_root: Path) -> Tuple[str, Dict[str, str]]:
+    """Interpreter + environment for native ACE-Zero subprocesses (also the streaming sidecar).
+
+    Resolution: $HYPERSPLAT_ACEZERO_PYTHON, then the sibling `.conda_envs/ace0`
+    env, then the current interpreter.
+    """
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+    python = os.environ.get("HYPERSPLAT_ACEZERO_PYTHON")
+    if not python:
+        candidate = DEFAULT_ACEZERO_ENV / "bin" / "python"
+        python = str(candidate) if candidate.exists() else sys.executable
+
+    if python != sys.executable:
+        # Point PATH at the env so ace_zero_hybrid's own child calls (sys.executable)
+        # and any tools stay inside it.
+        env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+        # dsacstar in ace0 was compiled with the system GCC and needs symbols
+        # (__cxa_call_terminate) missing from conda's older libstdc++.
+        system_libstdcxx = "/usr/lib64/libstdc++.so.6"
+        if os.path.exists(system_libstdcxx) and "LD_PRELOAD" not in env:
+            env["LD_PRELOAD"] = system_libstdcxx
+    return python, env
+
+
 class ACEZeroPoseEstimator:
     """Wrapper for ACE-Zero pose estimation."""
     
@@ -786,7 +815,7 @@ print('Done! VRAM freed for ACE training.')
 
     # ACE-Zero lives in its own conda env (python 3.8, torch 2.0, compiled dsacstar);
     # the 3DGS side (.venv_3dgrut) does not have those deps.
-    DEFAULT_ACEZERO_ENV = Path(__file__).resolve().parents[4] / ".conda_envs" / "ace0"
+    DEFAULT_ACEZERO_ENV = DEFAULT_ACEZERO_ENV
 
     def _acezero_python(self) -> Tuple[str, Dict[str, str]]:
         """Interpreter + environment for native ACE-Zero subprocesses.
@@ -794,24 +823,7 @@ print('Done! VRAM freed for ACE training.')
         Resolution: $HYPERSPLAT_ACEZERO_PYTHON, then the sibling `.conda_envs/ace0`
         env, then the current interpreter.
         """
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(self.acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
-
-        python = os.environ.get("HYPERSPLAT_ACEZERO_PYTHON")
-        if not python:
-            candidate = self.DEFAULT_ACEZERO_ENV / "bin" / "python"
-            python = str(candidate) if candidate.exists() else sys.executable
-
-        if python != sys.executable:
-            # Point PATH at the env so ace_zero_hybrid's own child calls (sys.executable)
-            # and any tools stay inside it.
-            env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
-            # dsacstar in ace0 was compiled with the system GCC and needs symbols
-            # (__cxa_call_terminate) missing from conda's older libstdc++.
-            system_libstdcxx = "/usr/lib64/libstdc++.so.6"
-            if os.path.exists(system_libstdcxx) and "LD_PRELOAD" not in env:
-                env["LD_PRELOAD"] = system_libstdcxx
-        return python, env
+        return acezero_python_env(self.acezero_root)
 
     def _check_native_dependencies(self) -> bool:
         """Fail fast if the ACE-Zero interpreter can't import a required module."""

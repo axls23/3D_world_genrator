@@ -1,0 +1,33 @@
+{
+  "name": "ab_3dgut_depth_drone_2k",
+  "output": "experiments/results/ab_3dgut_depth_drone_2k",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut"
+  ],
+  "repeats": {
+    "baseline": 2,
+    "closed_loop": 2,
+    "conf_only": 0
+  },
+  "variants": {
+    "baseline": {},
+    "closed_loop": {
+      "stream_depth_conf_weight": true,
+      "stream_depth_render_align": 4
+    },
+    "conf_only": {
+      "stream_depth_conf_weight": true
+    }
+  },
+  "keep_checkpoints": false,
+  "notes": "3DGUT with in-kernel ray-hit depth (Phase 2) vs + closed Depth Anything loop (Phase 3: variance-weighted depth loss, render-anchored re-alignment). Compare against ab_3dgs_drone_2k_noref baseline (standard rasterizer + depth, same flags): 23.43 +- 0.33 dB, n=3. conf_only: first closed_loop attempt, where render re-alignment never fired (no ACE points kept before a refit; fixed in session._queue_seeds), so it only had the variance-weighted loss."
+}

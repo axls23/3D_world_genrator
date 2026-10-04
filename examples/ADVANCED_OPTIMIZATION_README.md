@@ -65,7 +65,7 @@ This implementation adds sophisticated convergence detection and optimization te
 
 The advanced features require scipy for spectral analysis:
 
-```bash
+```bas
 cd examples
 pip install -r requirements.txt
 ```
