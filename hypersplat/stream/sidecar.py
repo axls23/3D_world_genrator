@@ -120,6 +120,13 @@ class AceSidecar:
     def load(self, head: str, pose_file: str, frames: List[str], image_resolution: int = 480):
         self._send("load", frames, head=head, pose_file=pose_file, image_resolution=image_resolution)
 
+    def mapper(self, frames: List[str], **params):
+        """Switch the sidecar to continuous mapping (scripts/acezero/stream_mapper.py)."""
+        self._send("mapper", frames, **params)
+
+    def tick(self, n: int = 1):
+        self._send("tick", n=n)
+
     def forget(self, frames: List[str]):
         if frames:
             self._send("forget", frames)

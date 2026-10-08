@@ -43,6 +43,7 @@ import cv2
 import numpy as np
 import pyarrow as pa
 
+from .gauge import Sim3, fit_sim3
 from .keyframes import KeyframeGate
 from .schema import VIEW_SCHEMA
 from .sidecar import AceSidecar
@@ -79,6 +80,30 @@ class StreamConfig:
     # are still unregistered schedules the next one (the extended map may reach them), also
     # after the source ended; the chain stops at the first refit that gains fewer
     refit_min_gain: int = 2
+    # Refit training recipe. "legacy": train_ace defaults (circle 1cycle peaking at 5e-3, fixed
+    # iterations, randomly initialized pose MLP). "ace0": a mapping iteration as in the ACE-Zero
+    # paper - 1cyclepoly warmup 5e-4 -> 3e-3, cooldown to 5e-4 as soon as 70% of reprojection
+    # errors are under 10 px, pose MLP starting at the input poses (zero-init output layer)
+    refit_recipe: str = "legacy"
+    # Align every refit to the previous map by Sim(3) before its poses reach the trainer. ACE-Zero
+    # reconstructs up to a similarity and nothing pins it between refits; the trainer's frame is
+    # frozen at bootstrap, so without the lock gauge drift moves cameras under the Gaussians
+    gauge_lock: bool = False
+    # "refit": the map grows by whole ACE refits (train_ace jobs, ~2 min each, landing as one
+    # pose update). "continuous": after the first map the sidecar keeps training the head a few
+    # iterations per trainer step and relocalizes keyframes round-robin (ACE-Zero's
+    # mapping / relocalization loop, interleaved with 3DGS training; scripts/acezero/stream_mapper.py)
+    ace_mode: str = "refit"
+    mapper_iters_per_tick: int = 4      # head iterations per trainer step
+    mapper_reloc_every: int = 2         # trainer steps per round-robin relocalization
+    mapper_adopt_min_inliers: float = 0.5   # adopt relocalized poses only while the head fits this well
+    mapper_anchor_tol: float = 0.01     # a frame that moved less (x path extent) ...
+    mapper_anchor_after: int = 2        # ... this many relocalizations in a row is anchored
+    mapper_publish_every: int = 25      # ticks between network snapshots used for localization
+    mapper_max_backlog: int = 4         # ticks the sidecar may lag behind the trainer
+    mapper_lr: float = 5e-4             # ACE-Zero's cooldown LR: the head is always warm
+    mapper_passes: int = 2              # augmented encodings per frame in the patch buffer
+    mapper_samples_per_pass: int = 1024
     max_inflight: int = 4               # localize requests in flight (fast pace back-pressure)
     seed_points_per_frame: int = 1500
     flight_port: Optional[int] = None   # also serve views/stats over Arrow Flight
@@ -204,6 +229,13 @@ class StreamSession:
         self._ace_pts: Dict[int, Tuple[np.ndarray, np.ndarray, int]] = {}   # kid -> (pix, z, version)
         self._aligned_version: Dict[int, int] = {}
         self._refit_requested = 0
+        # Gauge lock: map version -> Sim(3) from that map's frame into the bootstrap frame, the
+        # per-refit alignment diagnostics, and live poses that beat their map event here
+        self._gauges: Dict[int, Sim3] = {}
+        self.refit_log: List[Dict] = []
+        self.refit_pairs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}   # version -> (new, ref) w2c
+        self._early_rows: List[Dict] = []
+        self.reloc_moves: List[Tuple[float, int, float]] = []   # (time, kid, camera move) per reloc
         self._views_cache: Tuple[int, Optional[pa.Table]] = (-1, None)
         self._views_lock = threading.Lock()
         self._ingest: Optional[threading.Thread] = None
@@ -462,7 +494,7 @@ class StreamSession:
 
     def _maybe_refit(self, force: bool = False):
         """Caller holds _cond."""
-        if self._job is not None or not self.map_ready.is_set():
+        if self._job is not None or not self.map_ready.is_set() or self.cfg.ace_mode == "continuous":
             return
         if not force and not (self._new_failed >= self.cfg.refit_min_unregistered
                               or self._new_registered >= self.cfg.refit_every_registered
@@ -481,6 +513,19 @@ class StreamSession:
                 "--num_data_workers", str(v["num_data_workers"]), "--pose_refinement", "mlp",
                 "--pose_refinement_wait", "0", "--refine_calibration", "False",
                 "--aug_rotation", str(v["aug_rotation"]), "--repro_loss_soft_clamp", str(v["repro_loss_soft_clamp"])]
+        if self.cfg.refit_recipe == "ace0":
+            # ACE-Zero's mapping iteration (paper Sec. 3.3 / supp.), scaled to the refit budget:
+            # warm start from the live head, short warmup, early cooldown on the inlier trigger
+            it = int(self.cfg.refit_iterations)
+            args += ["--learning_rate_schedule", "1cyclepoly", "--learning_rate_max", "0.003",
+                     "--learning_rate_min", "0.0005", "--learning_rate_warmup_learning_rate", "0.0005",
+                     "--learning_rate_warmup_iterations", str(max(100, it // 8)),
+                     "--learning_rate_cooldown_iterations", str(max(500, it * 3 // 8)),
+                     "--learning_rate_cooldown_trigger_px_threshold", "10",
+                     "--learning_rate_cooldown_trigger_percent_threshold", "0.7",
+                     "--pose_refinement_zero_init", "True"]
+        elif self.cfg.refit_recipe != "legacy":
+            raise ValueError(f"unknown refit_recipe {self.cfg.refit_recipe!r}")
         args += self._ace_extra_args()
         logger.info(f"[Stream] Refitting ACE map on {len(frames)} keyframes "
                     f"({self._new_failed} unregistered, {self._new_registered} new registered)")
@@ -513,6 +558,8 @@ class StreamSession:
             self._on_pose(rows[0], from_map=False)
         elif kind == "map":
             self._on_map(rows)
+        elif kind == "reloc":
+            self._on_reloc(rows)
         elif kind == "error":
             self._on_error(rows[0]["meta"])
         elif kind == "exit":
@@ -523,7 +570,23 @@ class StreamSession:
                 self.gpu_lease.release("ace")  # its refit died with it: don't block Difix
                 self._cond.notify_all()
 
+    def _to_bootstrap_frame(self, row: Dict) -> Dict:
+        S = self._gauges.get(row["version"])
+        if S is None or row.get("w2c") is None:
+            return row
+        row = dict(row)
+        row["w2c"] = S.w2c(row["w2c"])
+        if len(row["points"]):
+            row["points"] = S.points(row["points"]).astype(np.float32)
+        return row
+
     def _on_pose(self, row: Dict, from_map: bool) -> Optional[Keyframe]:
+        if self.cfg.gauge_lock and self.cfg.ace_mode == "refit":
+            if not from_map and row["version"] > self.map_version:
+                # Localized by a map whose event (and so its alignment) has not arrived yet
+                self._early_rows.append(row)
+                return None
+            row = self._to_bootstrap_frame(row)
         kf = self.store.by_ace_path().get(row["frame"])
         registered = was_registered = False
         if kf is not None:  # else evicted meanwhile
@@ -556,6 +619,87 @@ class StreamSession:
             self._cond.notify_all()
         return kf
 
+    def _fit_gauge(self, rows: List[Dict], meta: Dict):
+        """Align a refit to the poses the trainer has now (bootstrap frame) and log how far the
+        refit really moved the cameras. Measured always; applied with ``gauge_lock``."""
+        version = rows[0]["version"]
+        by_path = self.store.by_ace_path()
+        new, ref = [], []
+        for row in rows:
+            kf = by_path.get(row["frame"]) if row["frame"] else None
+            if (kf is None or row.get("w2c") is None or row["conf"] < self.store.conf_threshold
+                    or not self.store.is_registered(kf)):
+                continue
+            new.append(row["w2c"])
+            ref.append(kf.w2c)
+        if len(new):
+            self.refit_pairs[version] = (np.stack(new), np.stack(ref))
+        prev = self._gauges.get(max(self._gauges)) if self._gauges else Sim3()
+        r = fit_sim3(np.stack(new), np.stack(ref), candidates=(Sim3(), prev)) if len(new) >= 3 else None
+        if r is None or r.inliers < 5:
+            logger.warning(f"[Stream] Refit v{version}: {len(new)} frames registered in both maps, "
+                           f"too few to align; keeping the previous gauge")
+            if self.cfg.gauge_lock:
+                self._gauges[version] = prev
+            return
+        cref = np.stack([np.linalg.inv(w)[:3, 3] for w in ref])
+        extent = float(np.linalg.norm(cref.max(0) - cref.min(0))) or 1.0
+        entry = {"version": version, "seconds": meta.get("seconds"), "common": r.used,
+                 "inliers": r.inliers, "scale": r.sim3.s, "rot_deg": r.sim3.angle_deg,
+                 "shift": float(np.linalg.norm(r.sim3.t)) / extent,
+                 "res_median": r.center_median / extent, "res_p90": r.center_p90 / extent,
+                 "res_max": r.center_max / extent, "rot_res_median_deg": r.rot_median_deg,
+                 "rot_res_max_deg": r.rot_max_deg, "raw_median": r.raw_center_median / extent,
+                 "raw_max": r.raw_center_max / extent, "locked": self.cfg.gauge_lock}
+        # Over all shared frames, not just the alignment inliers (the trim is relative to the
+        # median, so with a tight median it also drops frames that barely moved)
+        rel = r.all_res / extent
+        entry.update(all_median=float(np.median(rel)), all_p90=float(np.percentile(rel, 90)),
+                     all_max=float(rel.max()), moved_1pct=int((rel > 0.01).sum()),
+                     moved_5pct=int((rel > 0.05).sum()))
+        self.refit_log.append(entry)
+        logger.info(f"[Stream] Refit v{version} gauge: scale {r.sim3.s:.3f}, rot {r.sim3.angle_deg:.2f} deg, "
+                    f"shift {entry['shift']:.1%} of path; after alignment cameras moved median "
+                    f"{entry['res_median']:.2%} / p90 {entry['res_p90']:.2%} / max {entry['res_max']:.2%} "
+                    f"of path, {r.rot_median_deg:.2f} deg (raw median {entry['raw_median']:.2%}, "
+                    f"max {entry['raw_max']:.2%}); {r.inliers}/{r.used} frames; all frames aligned "
+                    f"median {entry['all_median']:.2%} p90 {entry['all_p90']:.2%} max {entry['all_max']:.2%}, "
+                    f"{entry['moved_1pct']} moved >1%, {entry['moved_5pct']} >5% of path"
+                    + ("" if self.cfg.gauge_lock else " [not locked]"))
+        if self.cfg.gauge_lock:
+            self._gauges[version] = r.sim3
+
+    def _on_reloc(self, rows: List[Dict]):
+        """Round-robin relocalizations of the continuous mapper: pose updates (and late
+        registrations) one frame at a time. Records how far registered cameras move."""
+        by_path = self.store.by_ace_path()
+        for row in rows:
+            kf = by_path.get(row["frame"])
+            old = kf.w2c if kf is not None and self.store.is_registered(kf) else None
+            if row.get("version", 0) > self.map_version:
+                self.map_version = row["version"]
+            self._on_pose(row, from_map=True)
+            if (old is not None and row.get("w2c") is not None
+                    and row["conf"] >= self.store.conf_threshold):
+                moved = float(np.linalg.norm(np.linalg.inv(row["w2c"])[:3, 3] - np.linalg.inv(old)[:3, 3]))
+                self.reloc_moves.append((time.time(), kf.kid, moved))
+            self.stats_counters["relocs"] = self.stats_counters.get("relocs", 0) + 1
+            if (row.get("meta") or {}).get("anchored"):
+                self.stats_counters["anchored"] = self.stats_counters.get("anchored", 0) + 1
+
+    def tick(self, n: int = 1) -> bool:
+        """One trainer step's worth of continuous mapping. Skipped while another job (online
+        Difix) holds the GPU lease, or before the first map."""
+        if (self.cfg.ace_mode != "continuous" or not self.map_ready.is_set() or self.sidecar is None
+                or not self.sidecar.alive or self.gpu_lease.holder not in (None, "ace")):
+            return False
+        try:
+            self.sidecar.tick(n)
+        except RuntimeError:
+            return False
+        self.stats_counters["mapper_ticks"] = self.stats_counters.get("mapper_ticks", 0) + n
+        return True
+
     def _on_map(self, rows: List[Dict]):
         meta = rows[0]["meta"]
         self.map_version = rows[0]["version"]
@@ -565,9 +709,14 @@ class StreamSession:
         if first:
             self._freeze_normalization(rows)
         n_before = len(self.store.registered())
+        if meta.get("reason") == "refit":
+            self._fit_gauge(rows, meta)
         for row in rows:
             if row["frame"]:
                 self._on_pose(row, from_map=True)
+        early, self._early_rows = self._early_rows, []
+        for row in early:
+            self._on_pose(row, from_map=False)
         n_reg = len(self.store.registered())
         logger.info(f"[Stream] ACE map v{self.map_version} ({meta.get('reason')}, {meta.get('seconds')} s): "
                     f"{n_reg}/{len(self.store)} keyframes registered, focal {self.focal_file:.1f} px")
@@ -598,6 +747,17 @@ class StreamSession:
                 # Keyframes that arrived during the bootstrap
                 for kf in self.store.pending():
                     self._send_localize(kf)
+                if self.cfg.ace_mode == "continuous":
+                    c = self.cfg
+                    self.sidecar.mapper(
+                        [kf.ace_path for kf in self.store.frames() if kf.ace_path],
+                        conf_threshold=self.store.conf_threshold, iters_per_tick=c.mapper_iters_per_tick,
+                        reloc_every=c.mapper_reloc_every, publish_every=c.mapper_publish_every,
+                        adopt_min_inliers=c.mapper_adopt_min_inliers, anchor_tol=c.mapper_anchor_tol,
+                        anchor_after=c.mapper_anchor_after,
+                        max_backlog=c.mapper_max_backlog, lr=c.mapper_lr, passes=c.mapper_passes,
+                        samples_per_pass=c.mapper_samples_per_pass, max_frames=c.max_keyframes)
+                    logger.info("[Stream] Continuous ACE mapping on: the head trains in step with 3DGS")
             self._cond.notify_all()
         if self.profile is not None:
             self.profile.set("stream.map_version", self.map_version, "stream")

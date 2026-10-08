@@ -276,6 +276,10 @@ if __name__ == '__main__':
     parser.add_argument('--pose_refinement_lr', type=float, default=0.001,
                         help='learning rate for the pose refinement')
 
+    parser.add_argument('--pose_refinement_zero_init', type=_strtobool, default=False,
+                        help='zero-init the refiner output layer so refinement starts at the input poses '
+                             '(no random offset at iteration 0; for warm-started refits)')
+
     parser.add_argument('--refinement_ortho', type=str, default="gram-schmidt", choices=['gram-schmidt', 'procrustes'],
                         help='orthogonalization method for pose rotations after pose updates')
 

@@ -19,12 +19,20 @@ Commands (cmd, frames, args, params-JSON):
     load       frames; params: head, pose_file, image_resolution
         Adopt an existing ACE map (e.g. a batch ACE-Zero run) and localize the frames on it.
     forget     frames      drop evicted frames from the pose table
+    mapper     frames; params: conf_threshold, iters_per_tick, reloc_per_tick, publish_every,
+               max_backlog, lr, passes, samples_per_pass, max_frames
+        Switch to continuous mapping (stream_mapper.py): the head keeps training a few
+        iterations per tick on the registered frames, and frames are relocalized round-robin
+        (`frames`: every keyframe the client has). Refits are refused from then on.
+    tick       params: n   run n mapper units (iterations + relocalizations); the client sends one
+               per 3DGS step, so mapping keeps pace with training (backlog capped)
     shutdown
 
 Events (kind, version, frame, w2c, conf, focal, points, pix, meta):
     ready      one row
     pose       one row per localize
     map        one batch, a row per frame; meta: reason, seconds
+    reloc      one row per round-robin relocalization by the continuous mapper
     error      meta: cmd, msg
 
 w2c is world-to-camera (OpenCV / COLMAP convention, as in ACE pose files); focal is in pixels
@@ -57,6 +65,7 @@ sys.path.insert(0, str(HERE.parents[1]))  # repo root: hypersplat.stream.schema
 import dataset_io  # noqa: E402
 import dsacstar  # noqa: E402
 from ace_network import Regressor  # noqa: E402
+from stream_mapper import ContinuousMapper  # noqa: E402
 from dataset import CamLocDataset  # noqa: E402
 from hypersplat.stream.schema import (  # noqa: E402
     EVENT_SCHEMA, IpcWriter, event_batch, ipc_batches, parse_meta,
@@ -93,6 +102,24 @@ class Sidecar:
         self.stopping = threading.Event()
         self.seed = 0                   # seed points per frame: rng from (seed, frame name)
         self.child = None               # running ACE script (bootstrap / refit), for shutdown
+        # Continuous mapping (``mapper`` command): the mapper, its thread, the tick budget the
+        # client grants, every known frame (round-robin relocalization) and registrations
+        # waiting to be encoded into the patch buffer
+        self.mapper = None
+        self.mapper_cfg = {}
+        self.mapper_thread = None
+        self.tick_cv = threading.Condition()
+        self.tick_budget = 0
+        self.known = []
+        self.reloc_pos = 0
+        self.pending_add = []
+        self.units = 0
+        # Anchoring: a frame whose relocalized pose stayed within anchor_tol (of the camera path
+        # extent) anchor_after times in a row keeps that pose as its fixed target and leaves
+        # the round-robin; relocalization effort goes to the frontier and unregistered frames
+        self.anchored = set()
+        self.stable_count = {}
+        self.extent = None
 
     # ------------------------------------------------------------------ io
     def emit(self, rows):
@@ -313,6 +340,123 @@ class Sidecar:
             self.error("refit", str(e))
             shutil.rmtree(str(out_dir), ignore_errors=True)
 
+    # ------------------------------------------------------------------ continuous mapping
+    def start_mapper(self, frames, params):
+        if self.mapper is not None:
+            return
+        if self.head_path is None:
+            raise RuntimeError("mapper needs a map (bootstrap or load first)")
+        cfg = {"conf_threshold": 500.0, "iters_per_tick": 4, "reloc_every": 2,
+               "publish_every": 25, "max_backlog": 4, "adopt_min_inliers": 0.5,
+               "anchor_tol": 0.01, "anchor_after": 2}
+        cfg.update({k: v for k, v in params.items() if k in cfg})
+        kw = {k: params[k] for k in ("lr", "passes", "samples_per_pass", "max_frames", "progress")
+              if k in params}
+        head_state = torch.load(str(self.head_path), map_location="cpu")
+        mapper = ContinuousMapper(self.encoder_state, head_state, self.device,
+                                  image_resolution=self.image_resolution, seed=self.seed, **kw)
+        t0 = time.time()
+        with self.net_lock:
+            reg = [f for f, (_, c) in sorted(self.poses.items()) if c >= cfg["conf_threshold"]]
+            poses = {f: self.poses[f][0] for f in reg}
+            self.known = sorted(set(frames) | set(self.poses))
+        for f in reg:
+            if Path(f).exists():
+                mapper.add_frame(f, poses[f], self.focal)
+        with self.net_lock:
+            self.mapper, self.mapper_cfg = mapper, cfg
+        _logger.info(f"continuous mapper on {len(mapper.frames)} registered frames "
+                     f"({len(self.known)} known), encoded in {time.time() - t0:.1f} s; {cfg} {kw}")
+        self.mapper_thread = threading.Thread(target=self._mapper_loop, name="ace-mapper", daemon=True)
+        self.mapper_thread.start()
+
+    def _mapper_loop(self):
+        t_log, t_units = time.time(), 0.0
+        while not self.stopping.is_set():
+            with self.tick_cv:
+                while self.tick_budget <= 0 and not self.stopping.is_set():
+                    self.tick_cv.wait(0.5)
+                if self.stopping.is_set():
+                    return
+                self.tick_budget -= 1
+            t0 = time.time()
+            try:
+                self._mapper_unit()
+            except Exception as e:  # report, keep the localization service alive
+                _logger.exception("mapper unit failed")
+                self.error("tick", str(e))
+            t_units += time.time() - t0
+            if time.time() - t_log > 30:
+                m = self.mapper
+                _logger.info(f"mapper: {m.iterations} iterations, {len(m.frames)} frames in buffer, "
+                             f"{len(self.anchored)} anchored, "
+                             f"{len(self.known)} known, map v{self.version}, inliers(10px) "
+                             f"{(m.inlier_ema or 0) * 100:.1f}%, {1000 * t_units / max(1, self.units):.0f} ms/unit")
+                t_log = time.time()
+
+    def _mapper_unit(self):
+        m, cfg = self.mapper, self.mapper_cfg
+        with self.net_lock:
+            adds, self.pending_add = self.pending_add, []
+            adds = [(f, self.poses[f][0]) for f in dict.fromkeys(adds) if f in self.poses]
+        for f, w2c in adds:
+            if Path(f).exists() and not m.add_frame(f, w2c, self.focal):
+                _logger.warning("mapper buffer full: %s not added", f)
+        for _ in range(int(cfg["iters_per_tick"])):
+            m.step()
+        self.units += 1
+        if self.units % int(cfg["publish_every"]) == 0:
+            net = m.snapshot()
+            with self.net_lock:
+                self.network = net
+                self.version += 1
+            torch.cuda.empty_cache()
+        if self.units % int(cfg["reloc_every"]):
+            return
+        if self.extent is None or self.units % 200 == 0:
+            with self.net_lock:
+                cen = [np.linalg.inv(w)[:3, 3] for w, c in self.poses.values() if c >= cfg["conf_threshold"]]
+            if len(cen) >= 2:
+                cen = np.stack(cen)
+                self.extent = float(np.linalg.norm(cen.max(0) - cen.min(0))) or 1.0
+        with self.net_lock:
+            todo = [f for f in self.known if f not in self.anchored]
+            if not todo:
+                return
+            frame = todo[self.reloc_pos % len(todo)]
+            self.reloc_pos += 1
+            net = self.network
+        if not Path(frame).exists():
+            return
+        row = self.localize(frame, net)
+        row["kind"] = "reloc"
+        if row.get("w2c") is None or row["conf"] < cfg["conf_threshold"]:
+            return  # nothing adopted: the trainer keeps what it has
+        w2c = np.array(row["w2c"]).reshape(4, 4)
+        if frame in m.slot_of:
+            # A half-trained head relocalizes noisily, and an adopted pose is the next target:
+            # adopt only while the map fits its frames (ACE-Zero relocalizes after a mapping
+            # round has converged)
+            if (m.inlier_ema or 0.0) < cfg["adopt_min_inliers"]:
+                return
+            with self.net_lock:
+                old = self.poses.get(frame, (None, 0.0))[0]
+            moved = (float(np.linalg.norm(np.linalg.inv(w2c)[:3, 3] - np.linalg.inv(old)[:3, 3]))
+                     if old is not None else np.inf)
+            if self.extent and moved < cfg["anchor_tol"] * self.extent:
+                self.stable_count[frame] = self.stable_count.get(frame, 0) + 1
+            else:
+                self.stable_count[frame] = 0
+            m.set_pose(frame, w2c)
+            if self.stable_count[frame] >= int(cfg["anchor_after"]):
+                self.anchored.add(frame)
+                row["meta"] = {"anchored": True}
+        elif not m.add_frame(frame, w2c, self.focal):  # registered late: joins the map
+            _logger.warning("mapper buffer full: %s not added", frame)
+        with self.net_lock:
+            self.poses[frame] = (w2c, row["conf"])
+        self.emit([row])
+
     def start_job(self, cmd, fn, frames, args, params):
         # Jobs run one at a time, and a new one waits for the previous one instead of failing
         # as busy: the client sends the next refit as soon as it sees the previous job's map
@@ -338,18 +482,41 @@ class Sidecar:
                         with self.net_lock:
                             network = self.network
                         row = self.localize(frames[0], network)
-                        if row.get("w2c") is not None:
-                            with self.net_lock:
+                        with self.net_lock:
+                            if row.get("w2c") is not None:
                                 self.poses[row["frame"]] = (np.array(row["w2c"]).reshape(4, 4), row["conf"])
+                            if self.mapper is not None:
+                                if row["frame"] not in self.known:
+                                    self.known.append(row["frame"])
+                                if row["conf"] >= self.mapper_cfg["conf_threshold"]:
+                                    self.pending_add.append(row["frame"])
                         self.emit([row])
+                    elif cmd == "mapper":
+                        self.start_mapper(frames, params)
+                    elif cmd == "tick":
+                        with self.tick_cv:
+                            cap = int(self.mapper_cfg.get("max_backlog", 4))
+                            self.tick_budget = min(cap, self.tick_budget + int(params.get("n", 1)))
+                            self.tick_cv.notify()
+                    elif cmd in jobs and self.mapper is not None and cmd != "load":
+                        self.error(cmd, "continuous mapping is on: refits are not used")
                     elif cmd in jobs:
                         self.start_job(cmd, jobs[cmd], frames, args, params)
                     elif cmd == "forget":
                         with self.net_lock:
                             for fr in frames:
                                 self.poses.pop(fr, None)
+                                if fr in self.known:
+                                    self.known.remove(fr)
+                                self.anchored.discard(fr)
+                                self.stable_count.pop(fr, None)
+                                if self.mapper is not None:
+                                    self.pending_add = [f for f in self.pending_add if f != fr]
+                                    self.mapper.remove_frame(fr)
                     elif cmd == "shutdown":
                         self.stopping.set()
+                        with self.tick_cv:
+                            self.tick_cv.notify_all()
                         self.terminate_child()
                         return
                     else:

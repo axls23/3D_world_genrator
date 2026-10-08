@@ -96,6 +96,10 @@ class PoseRefiner:
         self.learning_rate = options.pose_refinement_lr
         self.update_weight = options.pose_refinement_weight
         self.orthonormalization = options.refinement_ortho
+        # Zero-init the MLP's output layer: the refiner starts at exactly the input poses instead
+        # of a random offset (with weight 0.1 that offset was ~0.8 deg / 7 px per pose, enough
+        # to knock a warm-started map from converged to 10-25% batch inliers)
+        self.zero_init = getattr(options, "pose_refinement_zero_init", False)
 
         # pose buffer for current estimate of refined poses
         self.pose_buffer = None
@@ -128,6 +132,9 @@ class PoseRefiner:
         else:
             # use small network to predict pose updates
             self.pose_network = PoseNetwork(0, 128)
+            if self.zero_init:
+                nn.init.zeros_(self.pose_network.fc3.weight)
+                nn.init.zeros_(self.pose_network.fc3.bias)
             self.pose_network = self.pose_network.to(self.device)
             self.pose_network.train()
             use_fused = False
