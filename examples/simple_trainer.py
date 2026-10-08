@@ -116,6 +116,19 @@ class Config:
 
     # Port for the viewer server
     port: int = 8081
+    # Viewer walk mode (stream runs; needs scripts/viewer/build_walk_client.sh): keep the
+    # viewer camera at capture height inside the region the training cameras covered
+    viewer_walk: bool = True
+    # Walkable radius around each camera / walk speed, in median camera spacings
+    walk_radius_mult: float = 3.0
+    walk_speed_mult: float = 4.0
+    # Max look up/down from horizontal in walk mode (degrees)
+    walk_pitch_deg: float = 35.0
+    # Viewer-only splat cleanup ("Clean view"): hide splats that only show up as streaks and
+    # floaters off the training views. Training is unaffected.
+    viewer_min_opacity: float = 0.02
+    viewer_max_aniso: float = 30.0
+    viewer_max_scale_voxels: float = 8.0
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
@@ -321,6 +334,15 @@ class Config:
     stream_min_motion: float = 8.0
     # Steps between pulls of new seed points (new keyframes/poses are picked up every step)
     stream_sync_every: int = 50
+    # ACE refits: "legacy" train_ace defaults or "ace0" (ACE-Zero paper mapping iteration), and
+    # Sim(3) gauge lock of every refit to the bootstrap frame (hypersplat/stream/gauge.py)
+    stream_refit_recipe: Literal["legacy", "ace0"] = "legacy"
+    stream_gauge_lock: bool = False
+    # "continuous": after the first map the ACE head keeps training in step with 3DGS (one tick
+    # per `stream_ace_tick_every` steps) and keyframes are relocalized round-robin, instead of
+    # whole refits (hypersplat/stream/session.py, scripts/acezero/stream_mapper.py)
+    stream_ace_mode: Literal["refit", "continuous"] = "refit"
+    stream_ace_tick_every: int = 1
     # File sources: steps to keep training once every keyframe is localized (None: to the
     # dynamic end below)
     stream_tail_steps: Optional[int] = None
@@ -922,6 +944,13 @@ class Runner:
             )
             if getattr(self, "dashboard", None) is not None:
                 self.dashboard.viewer_port = cfg.port
+            self.walk = None
+            if self.stream is not None and cfg.viewer_walk:
+                from hypersplat.stream.walk_bounds import WalkBoundsPublisher, WalkConfig
+                self.walk = WalkBoundsPublisher(self.server, WalkConfig(
+                    radius_mult=cfg.walk_radius_mult, speed_mult=cfg.walk_speed_mult,
+                    pitch_deg=cfg.walk_pitch_deg))
+                self._walk_update(force=True)
 
         # Streaming mode initialization
         self.streaming_manager = None
@@ -983,6 +1012,8 @@ class Runner:
             record_stop_file=os.path.join(cfg.result_dir, "STOP_RECORDING"),
             record_seconds=cfg.stream_record_seconds, record_keyframes=cfg.stream_record_keyframes,
             depth=cfg.stream_depth, ace_deterministic=cfg.deterministic,
+            refit_recipe=cfg.stream_refit_recipe, gauge_lock=cfg.stream_gauge_lock,
+            ace_mode=cfg.stream_ace_mode,
         )
         self.depth_estimator = None
         if cfg.stream_depth:
@@ -1088,6 +1119,7 @@ class Runner:
                       f"{h.value} steps (densify until {h.refine_stop_iter})")
                 self._horizon_logged = h.value
         self._views_seen = seen
+        self._walk_update()
         if self._stop_at is not None and step >= self._stop_at:
             print(f"\n[WorldStop] Ending at step {step} after the final Difix round")
             return True
@@ -1806,6 +1838,7 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        opacity_keep: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -1814,6 +1847,8 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        if opacity_keep is not None:  # viewer-only cull: zero opacity drops the splat
+            opacities = opacities * opacity_keep
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -2084,6 +2119,10 @@ class Runner:
                 tic = time.time()
 
             stream_stop = False
+            if self.stream is not None and step % cfg.stream_ace_tick_every == 0:
+                # Continuous ACE mapping: the sidecar runs this step's mapping work on the GPU
+                # alongside the 3DGS step (no-op in refit mode)
+                self.stream.tick()
             if self.stream is not None and step % cfg.stream_sync_every == 0:
                 stream_stop = self._stream_sync(step)
                 if horizon.value != max_steps:
@@ -2972,7 +3011,57 @@ class Runner:
         print(f"Custom render saved to {out_path}")
 
     @torch.no_grad()
+    def _viewer_keep(self) -> Tensor:
+        """Viewer-only splat mask: drop near-transparent splats and long needles. Seen off the
+        training views these render as streaks across the screen instead of surface."""
+        cfg = self.cfg
+        opa = torch.sigmoid(self.splats["opacities"])
+        sc = torch.exp(self.splats["scales"])
+        smax, smin = sc.max(-1).values, sc.min(-1).values.clamp_min(1e-9)
+        keep = opa >= cfg.viewer_min_opacity
+        voxel = getattr(self, "stream_voxel", None)
+        if voxel:
+            big = smax > cfg.viewer_max_scale_voxels * voxel
+            needle = (smax / smin > cfg.viewer_max_aniso) & (smax > 2.0 * voxel)
+            keep &= ~(big | needle)
+        else:
+            keep &= smax / smin <= cfg.viewer_max_aniso
+        return keep.to(opa.dtype)
+
+    def _walk_update(self, force: bool = False):
+        """Refresh the viewer's walk bounds from the registered cameras (stream runs)."""
+        walk = getattr(self, "walk", None)
+        if walk is None:
+            return
+        st = self.stream
+        key = (st.views_registered, st.map_version)
+        try:
+            walk.update(self.parser.camtoworlds, self.parser.scene_scale, key=key, force=force)
+        except Exception as e:  # the viewer must never take training down
+            print(f"[Walk] bounds update failed: {e}")
+
     def _viewer_render_fn(
+        self, camera_state: CameraState, render_tab_state: RenderTabState
+    ):
+        """nerfview's render thread calls os._exit(1) on any exception, which would end the
+        training run: a failed viewer frame is logged and shown blank instead."""
+        from nerfview._renderer import InterruptRenderException
+        try:
+            return self._viewer_render(camera_state, render_tab_state)
+        except InterruptRenderException:
+            raise  # nerfview's own cancel of a stale frame
+        except Exception:
+            if not getattr(self, "_viewer_error_logged", False):
+                import traceback
+                print("[Viewer] render failed (training continues; further errors not shown):")
+                traceback.print_exc()
+                self._viewer_error_logged = True
+            h = max(int(render_tab_state.viewer_height), 1)
+            w = max(int(render_tab_state.viewer_width), 1)
+            return np.zeros((h, w, 3), dtype=np.float32)
+
+    @torch.no_grad()
+    def _viewer_render(
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
         assert isinstance(render_tab_state, GsplatRenderTabState)
@@ -2986,6 +3075,10 @@ class Runner:
         K = camera_state.get_K((width, height))
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
+        walk = getattr(self, "walk", None)
+        near_plane = render_tab_state.near_plane
+        if walk is not None:
+            near_plane = walk.near_plane(near_plane)
 
         RENDER_MODE_MAP = {
             "rgb": "RGB",
@@ -3000,9 +3093,10 @@ class Runner:
             width=width,
             height=height,
             sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
-            near_plane=render_tab_state.near_plane,
+            near_plane=near_plane,
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
+            opacity_keep=self._viewer_keep() if render_tab_state.clean_view else None,
             eps2d=render_tab_state.eps2d,
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
             / 255.0,
@@ -3220,6 +3314,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         finally:
             if runner.stream is not None:
                 print(f"[Stream] Final: {runner.stream.stats()}")
+                if getattr(runner, "walk", None) is not None and runner.walk.bounds is not None:
+                    runner.walk.bounds.save_npz(f"{cfg.result_dir}/walk_bounds.npz")
                 runner.stream.stop()
                 if runner.dashboard is not None:
                     runner.dashboard.update_training(done=True)

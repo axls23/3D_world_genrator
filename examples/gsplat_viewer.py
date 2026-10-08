@@ -1,8 +1,26 @@
+import time
+
 import viser
 from pathlib import Path
 from typing import Literal
 from typing import Tuple, Callable
 from nerfview import Viewer, RenderTabState
+from nerfview._renderer import Renderer, RenderTask
+
+
+class _FloorRenderer(Renderer):
+    """nerfview renderer whose moving frames never drop below `min_move_res` pixels tall.
+
+    nerfview sizes moving frames from measured rays/s at 30 fps; while training shares the GPU
+    that collapses to a few dozen pixels and the upscaled frame reads as smeared noise."""
+
+    def _get_img_wh(self, aspect: float) -> Tuple[int, int]:
+        W, H = super()._get_img_wh(aspect)
+        floor = min(self.viewer.render_tab_state.min_move_res, self.viewer.render_tab_state.viewer_res)
+        if self._state != "high" and H < floor:
+            H = floor
+            W = int(H * aspect)
+        return W, H
 
 
 class GsplatRenderTabState(RenderTabState):
@@ -27,6 +45,10 @@ class GsplatRenderTabState(RenderTabState):
     ] = "turbo"
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    # Hide streak/floater splats in the viewer only (render_fn decides what that means)
+    clean_view: bool = True
+    # Minimum height of frames rendered while the camera moves
+    min_move_res: int = 360
 
 
 class GsplatViewer(Viewer):
@@ -43,6 +65,19 @@ class GsplatViewer(Viewer):
     ):
         super().__init__(server, render_fn, output_dir, mode)
         server.gui.set_panel_label("gsplat viewer")
+
+    def _connect_client(self, client: viser.ClientHandle):
+        # nerfview's handler, with the resolution-floored renderer
+        client_id = client.client_id
+        self._renderers[client_id] = _FloorRenderer(viewer=self, client=client, lock=self.lock)
+        self._renderers[client_id].start()
+
+        @client.camera.on_update
+        def _(_: viser.CameraHandle):
+            self._last_move_time = time.time()
+            with self.server.atomic():
+                camera_state = self.get_camera_state(client)
+                self._renderers[client_id].submit(RenderTask("move", camera_state))
 
     def _init_rendering_tab(self):
         self.render_tab_state = GsplatRenderTabState()
@@ -207,6 +242,30 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.rasterize_mode = rasterize_mode_dropdown.value
                     self.rerender(_)
 
+                clean_view_checkbox = server.gui.add_checkbox(
+                    "Clean view",
+                    initial_value=self.render_tab_state.clean_view,
+                    hint="Hide near-transparent and needle-shaped splats (viewer only).",
+                )
+
+                @clean_view_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.clean_view = clean_view_checkbox.value
+                    self.rerender(_)
+
+                min_move_res_number = server.gui.add_number(
+                    "Min move res",
+                    initial_value=self.render_tab_state.min_move_res,
+                    min=30,
+                    max=2048,
+                    step=10,
+                    hint="Minimum image height while the camera moves.",
+                )
+
+                @min_move_res_number.on_update
+                def _(_) -> None:
+                    self.render_tab_state.min_move_res = int(min_move_res_number.value)
+
                 camera_model_dropdown = server.gui.add_dropdown(
                     "Camera",
                     ("pinhole", "ortho", "fisheye"),
@@ -233,6 +292,8 @@ class GsplatViewer(Viewer):
                 "colormap_dropdown": colormap_dropdown,
                 "rasterize_mode_dropdown": rasterize_mode_dropdown,
                 "camera_model_dropdown": camera_model_dropdown,
+                "clean_view_checkbox": clean_view_checkbox,
+                "min_move_res_number": min_move_res_number,
             }
         )
         super()._populate_rendering_tab()

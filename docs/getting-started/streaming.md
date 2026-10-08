@@ -193,6 +193,40 @@ count, longest chunk and wall time (also in `scene_profile.json` under `difix.ro
 - `--stream-bootstrap-cooldown N`: cap the first ACE map's cooldown iterations (sooner first
   map; background refits recover accuracy).
 
+## ACE refits: recipe, gauge lock, continuous mapping (opt-in)
+
+All three are off by default and not yet A/B-tested on 3DGS quality. Measurements are from
+`scripts/experiments/ace_refit_bench.py` (the ACE loop alone; Kenilworth clip, 400 keyframes,
+cached bootstrap map).
+
+- `--refit-recipe ace0`: refits train like an ACE-Zero mapping iteration: 1cyclepoly warmup to
+  3e-3, early cooldown once 70 % of reprojection errors are under 10 px, pose MLP starting at
+  the input poses (zero-init output layer, `--pose_refinement_zero_init` in train_ace). Refits
+  take ~70-115 s instead of 100-260 s.
+- `--gauge-lock`: ACE-Zero reconstructs up to a similarity, and every refit rotates and scales
+  the whole map a little (0.3-1 deg and ~1 % per refit on Kenilworth). The lock fits a robust
+  Sim(3) (RANSAC over frame pairs, never worse than identity or the previous lock;
+  `hypersplat/stream/gauge.py`) from each refit's poses to the trainer's and applies it, so
+  the trainer's frame stays the bootstrap's. Each refit logs `Refit vN gauge: ...` with the
+  movement left after alignment.
+- `--ace-continuous`: no refits; after the first map the ACE head trains a few iterations per
+  3DGS step and keyframes are relocalized round-robin (`scripts/acezero/stream_mapper.py`).
+  Experimental: in its first tuning it registered fewer frames (208/400 vs ~360 after 10 min)
+  and let poses drift more than refits, at +80-110 ms per 3DGS step.
+- Known: the biggest pose jumps after a refit are frames registered by the previous refit (up
+  to 34 % of the path); older frames move 0.1-0.3 %. Neither option above changes that.
+
+## Viewer walk mode
+
+Stream runs open the viewer in a ground-level walk mode: WASD walk, drag to look, Shift run,
+pitch limited to 35 deg, the camera kept inside the region the training cameras covered and at
+their height (it grows as keyframes register). "Clean view" hides near-transparent and
+needle-shaped splats (viewer only), and moving frames never drop below "Min move res".
+`--no-walk` restores free-fly. Walk mode needs the patched viser client:
+`scripts/viewer/build_walk_client.sh` (`--restore` puts the stock client back); the demo warns
+if it is missing. A finished run writes `walk_bounds.npz`; `examples/simple_viewer.py
+--walk_bounds <file>` walks it again.
+
 ## Memory on a 6 GB GPU
 
 | Component | VRAM |

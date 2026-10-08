@@ -157,7 +157,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
                 if sh_degree is not None
                 else None
             ),
-            near_plane=render_tab_state.near_plane,
+            near_plane=walk.near_plane(render_tab_state.near_plane) if walk else render_tab_state.near_plane,
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
@@ -203,6 +203,12 @@ def main(local_rank: int, world_rank, world_size: int, args):
         return renders
 
     server = viser.ViserServer(port=args.port, verbose=False)
+    walk = None
+    if args.walk_bounds:
+        # walk_bounds.npz written by a stream run (simple_trainer, result_dir)
+        from hypersplat.stream.walk_bounds import WalkBounds, WalkBoundsPublisher
+        walk = WalkBoundsPublisher(server)
+        walk.publish(WalkBounds.load_npz(args.walk_bounds))
     _ = GsplatViewer(
         server=server,
         render_fn=viewer_render_fn,
@@ -242,6 +248,10 @@ if __name__ == "__main__":
         "--with_ut", action="store_true", help="use uncentered transform"
     )
     parser.add_argument("--with_eval3d", action="store_true", help="use eval 3D")
+    parser.add_argument(
+        "--walk_bounds", type=str, default=None,
+        help="walk_bounds.npz from a stream run: ground-level walk mode",
+    )
     args = parser.parse_args()
     assert args.scene_grid % 2 == 1, "scene_grid must be odd"
 

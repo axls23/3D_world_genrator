@@ -1,0 +1,408 @@
+diff --git a/client/src/CameraControls.tsx b/client/src/CameraControls.tsx
+index 3728d90..fb733ec 100644
+--- a/client/src/CameraControls.tsx
++++ b/client/src/CameraControls.tsx
+@@ -1,6 +1,7 @@
+ import { ViewerContext, ViewerMutable } from "./ViewerContext";
+ import {
+   CameraControls,
++  CameraControlsImpl,
+   Grid,
+   Instance,
+   Instances,
+@@ -13,6 +14,7 @@ import * as THREE from "three";
+ import { computeT_threeworld_world } from "./WorldTransformUtils";
+ import { useThrottledMessageSender } from "./WebsocketUtils";
+ import { isFormElement } from "./utils/isFormElement";
++import { activeWalkBounds, clampMove, eyeHeight, WalkBounds } from "./WalkMode";
+ 
+ // Rotation from the three.js camera convention to the OpenCV one. Constant, so
+ // it lives at module scope instead of being rebuilt every render.
+@@ -684,9 +686,11 @@ export function SynchronizedCameraControls() {
+   // effect has no dependencies, so the listeners are attached once and removed
+   // on unmount.
+   const heldKeysRef = useRef<Set<string>>(new Set());
++  const shiftRef = useRef(false);
+   React.useEffect(() => {
+     const held = heldKeysRef.current;
+     const onKeyDown = (event: KeyboardEvent) => {
++      shiftRef.current = event.shiftKey;
+       if (!CAMERA_MOVEMENT_KEYS.has(event.code)) return;
+       if (isFormElement(event.target)) return;
+       // Ignore auto-repeat: only a fresh press counts as a new hold.
+@@ -696,10 +700,12 @@ export function SynchronizedCameraControls() {
+       setKeyboardCrosshairCounter((count) => count + 1);
+     };
+     const onKeyUp = (event: KeyboardEvent) => {
++      shiftRef.current = event.shiftKey;
+       if (!held.delete(event.code)) return;
+       setKeyboardCrosshairCounter((count) => Math.max(0, count - 1));
+     };
+     const onBlur = () => {
++      shiftRef.current = false;
+       // A window blur swallows keyups, so drop all held keys at once.
+       if (held.size === 0) return;
+       held.clear();
+@@ -716,12 +722,182 @@ export function SynchronizedCameraControls() {
+     };
+   }, []);
+ 
++  // Walk mode (hypersplat patch, see WalkMode.ts): first-person movement on the ground plane,
++  // clamped every frame to the server's walkable grid. `walkRef.saved` holds the free-fly
++  // settings while walk mode is on, so turning it off restores them.
++  const walkRef = useRef<{
++    version: number;
++    saved: null | {
++      azimuthRotateSpeed: number;
++      polarRotateSpeed: number;
++      minPolarAngle: number;
++      maxPolarAngle: number;
++      minDistance: number;
++      mouseButtons: CameraControls["mouseButtons"];
++      touches: CameraControls["touches"];
++    };
++  }>({ version: -1, saved: null });
++  const walkScratch = React.useMemo(
++    () => ({
++      T: new THREE.Matrix4(),
++      Tinv: new THREE.Matrix4(),
++      R: new THREE.Matrix3(),
++      pos: new THREE.Vector3(),
++      tgt: new THREE.Vector3(),
++      posW: new THREE.Vector3(),
++      tgtW: new THREE.Vector3(),
++      d: new THREE.Vector3(),
++    }),
++    [],
++  );
++
++  const enterWalk = (controls: CameraControls, b: WalkBounds) => {
++    const w = walkRef.current;
++    if (w.saved === null) {
++      w.saved = {
++        azimuthRotateSpeed: controls.azimuthRotateSpeed,
++        polarRotateSpeed: controls.polarRotateSpeed,
++        minPolarAngle: controls.minPolarAngle,
++        maxPolarAngle: controls.maxPolarAngle,
++        minDistance: controls.minDistance,
++        mouseButtons: { ...controls.mouseButtons },
++        touches: { ...controls.touches },
++      };
++    }
++    w.version = b.version;
++    const s = walkScratch;
++    s.T.copy(computeT_threeworld_world(viewer));
++    // Look around in place: orbit a target a hair in front of the eye, with the drag
++    // direction flipped so it feels first-person.
++    const eps = Math.max(1e-4, 0.005 * b.speed);
++    controls.getPosition(s.pos);
++    controls.getTarget(s.tgt);
++    s.d.subVectors(s.tgt, s.pos);
++    if (s.d.lengthSq() < 1e-12) s.d.set(0, 0, -1);
++    s.d.normalize().multiplyScalar(eps);
++    camera.up.set(0, 0, 1).applyMatrix3(s.R.setFromMatrix4(s.T)).normalize();
++    controls.updateCameraUp();
++    controls.minDistance = eps * 0.5;
++    controls.setPosition(s.pos.x, s.pos.y, s.pos.z, false);
++    controls.setTarget(
++      s.pos.x + s.d.x,
++      s.pos.y + s.d.y,
++      s.pos.z + s.d.z,
++      false,
++    );
++    controls.azimuthRotateSpeed = -0.5;
++    controls.polarRotateSpeed = -0.5;
++    const pitch = THREE.MathUtils.degToRad(b.pitchDeg);
++    controls.minPolarAngle = Math.PI / 2 - pitch;
++    controls.maxPolarAngle = Math.PI / 2 + pitch;
++    const ACTION = CameraControlsImpl.ACTION;
++    controls.mouseButtons.left = ACTION.ROTATE;
++    controls.mouseButtons.middle = ACTION.NONE;
++    controls.mouseButtons.right = ACTION.NONE;
++    controls.mouseButtons.wheel = ACTION.NONE;
++    controls.touches.one = ACTION.TOUCH_ROTATE;
++    controls.touches.two = ACTION.NONE;
++    controls.touches.three = ACTION.NONE;
++  };
++
++  const exitWalk = (controls: CameraControls) => {
++    const w = walkRef.current;
++    const saved = w.saved;
++    if (saved === null) return;
++    w.saved = null;
++    w.version = -1;
++    controls.azimuthRotateSpeed = saved.azimuthRotateSpeed;
++    controls.polarRotateSpeed = saved.polarRotateSpeed;
++    controls.minPolarAngle = saved.minPolarAngle;
++    controls.maxPolarAngle = saved.maxPolarAngle;
++    controls.minDistance = saved.minDistance;
++    Object.assign(controls.mouseButtons, saved.mouseButtons);
++    Object.assign(controls.touches, saved.touches);
++    // Push the orbit point back out so free-fly dolly/orbit work again.
++    const s = walkScratch;
++    controls.getPosition(s.pos);
++    controls.getTarget(s.tgt);
++    s.d.subVectors(s.tgt, s.pos).normalize();
++    controls.setTarget(
++      s.pos.x + s.d.x,
++      s.pos.y + s.d.y,
++      s.pos.z + s.d.z,
++      false,
++    );
++  };
++
++  // Returns true when walk mode handled this frame.
++  const walkFrame = (
++    controls: CameraControls,
++    held: Set<string>,
++    delta: number,
++  ): boolean => {
++    const b = activeWalkBounds();
++    if (b === null) {
++      if (walkRef.current.saved !== null) exitWalk(controls);
++      return false;
++    }
++    if (!controls.enabled) return true;
++    if (walkRef.current.saved === null || walkRef.current.version !== b.version)
++      enterWalk(controls, b);
++    const s = walkScratch;
++    s.T.copy(computeT_threeworld_world(viewer));
++    s.Tinv.copy(s.T).invert();
++    controls.getPosition(s.pos);
++    controls.getTarget(s.tgt);
++    s.posW.copy(s.pos).applyMatrix4(s.Tinv);
++    s.tgtW.copy(s.tgt).applyMatrix4(s.Tinv);
++
++    // Ground-plane movement in the viser world frame (+Z up).
++    let fx = s.tgtW.x - s.posW.x;
++    let fy = s.tgtW.y - s.posW.y;
++    const n = Math.hypot(fx, fy);
++    if (n > 1e-9) {
++      fx /= n;
++      fy /= n;
++    } else {
++      fx = 1;
++      fy = 0;
++    }
++    const step =
++      b.speed * (shiftRef.current ? 2.5 : 1.0) * Math.min(delta, 0.1);
++    // Forward/back along the view heading, strafe along its right (fy, -fx).
++    const fwd = (held.has("KeyW") ? 1 : 0) - (held.has("KeyS") ? 1 : 0);
++    const side = (held.has("KeyD") ? 1 : 0) - (held.has("KeyA") ? 1 : 0);
++    const mx = (fwd * fx + side * fy) * step;
++    const my = (fwd * fy - side * fx) * step;
++    const [nx, ny] = clampMove(
++      b,
++      s.posW.x,
++      s.posW.y,
++      s.posW.x + mx,
++      s.posW.y + my,
++    );
++    const nz = eyeHeight(b, nx, ny);
++    s.d.set(nx - s.posW.x, ny - s.posW.y, nz - s.posW.z);
++    if (s.d.lengthSq() > 1e-14) {
++      s.d.applyMatrix3(s.R.setFromMatrix4(s.T));
++      controls.moveTo(s.tgt.x + s.d.x, s.tgt.y + s.d.y, s.tgt.z + s.d.z, false);
++    }
++
++    const angular = 50.0 * THREE.MathUtils.DEG2RAD * Math.min(delta, 0.1);
++    if (held.has("ArrowLeft")) controls.rotate(angular, 0, true);
++    if (held.has("ArrowRight")) controls.rotate(-angular, 0, true);
++    if (held.has("ArrowUp")) controls.rotate(0, angular, true);
++    if (held.has("ArrowDown")) controls.rotate(0, -angular, true);
++    // Keep frames coming while a key is held, even when a wall stops the motion.
++    if (held.size > 0) viewerMutable.requestRender();
++    return true;
++  };
++
+   // Apply held-key camera movement each frame. Rates: linear 2.0/s, rotation
+   // 50 deg/s (`delta` is in seconds).
+   useFrame((_, delta) => {
+     const cameraControls = viewerMutable.cameraControl;
+     const held = heldKeysRef.current;
+-    if (cameraControls === null || held.size === 0) return;
++    if (cameraControls === null) return;
++    if (walkFrame(cameraControls, held, delta)) return;
++    if (held.size === 0) return;
+     // Respect camera locks: when a lease (or a gizmo drag) has disabled the
+     // controls, keyboard movement must not bypass it. The library's
+     // programmatic truck/forward/rotate ignore `enabled`, so guard here.
+diff --git a/client/src/MessageHandler.tsx b/client/src/MessageHandler.tsx
+index c6cea6c..4f8eb15 100644
+--- a/client/src/MessageHandler.tsx
++++ b/client/src/MessageHandler.tsx
+@@ -24,6 +24,7 @@ import { computeT_threeworld_world } from "./WorldTransformUtils";
+ import { ownerOf, rootNodeTemplate, SceneNode } from "./SceneTreeState";
+ import { applyGuiConfigUpdate } from "./ControlPanel/GuiState";
+ import { GaussianSplatsContext } from "./Splatting/GaussianSplatsHelpers";
++import { setWalkBounds } from "./WalkMode";
+ 
+ /** Swap a background-material uniform to a new texture (or null), disposing the
+  * previous texture if there was one. */
+@@ -687,6 +688,11 @@ function useMessageHandler() {
+         }
+         return;
+       }
++      case "SetWalkBoundsMessage": {
++        setWalkBounds(message);
++        viewerMutable.requestRender();
++        return;
++      }
+       case "SetOrientationMessage": {
+         // Root node wxyz is kept in store for reactive world-rotation subscribers
+         // (DefaultLights, InitialCameraSetter, WorldTransformUtils).
+diff --git a/client/src/WalkMode.ts b/client/src/WalkMode.ts
+new file mode 100644
+index 0000000..4ddfa83
+--- /dev/null
++++ b/client/src/WalkMode.ts
+@@ -0,0 +1,116 @@
++// Ground-level walk mode (hypersplat patch).
++//
++// The server sends a walkable XY grid in the viser world frame (+Z up) plus a per-cell eye
++// height (SetWalkBoundsMessage, from hypersplat/stream/walk_bounds.py). While walk mode is on,
++// SynchronizedCameraControls moves the camera on the ground plane and clamps it to this grid
++// every frame, so the viewer never leaves the region the training cameras covered.
++import { SetWalkBoundsMessage } from "./WebsocketMessages";
++
++export interface WalkBounds {
++  enabled: boolean;
++  version: number;
++  originX: number;
++  originY: number;
++  cell: number;
++  width: number;
++  height: number;
++  mask: Uint8Array;
++  heights: Float32Array;
++  speed: number;
++  pitchDeg: number;
++  // Flat indices of walkable cells, for snapping a camera that is outside the grid.
++  walkable: Int32Array;
++}
++
++let current: WalkBounds | null = null;
++
++export function setWalkBounds(message: SetWalkBoundsMessage) {
++  const mask = new Uint8Array(message.mask);
++  const walkable: number[] = [];
++  for (let i = 0; i < mask.length; i++) if (mask[i]) walkable.push(i);
++  current = {
++    enabled: message.enabled,
++    version: message.version,
++    originX: message.origin[0],
++    originY: message.origin[1],
++    cell: message.cell,
++    width: message.width,
++    height: message.height,
++    mask,
++    heights: new Float32Array(message.heights),
++    speed: message.speed,
++    pitchDeg: message.pitch_deg,
++    walkable: Int32Array.from(walkable),
++  };
++}
++
++/** Bounds when walk mode is on and usable, else null. */
++export function activeWalkBounds(): WalkBounds | null {
++  return current !== null && current.enabled && current.walkable.length > 0
++    ? current
++    : null;
++}
++
++export function isWalkable(b: WalkBounds, x: number, y: number): boolean {
++  const i = Math.round((x - b.originX) / b.cell);
++  const j = Math.round((y - b.originY) / b.cell);
++  if (i < 0 || j < 0 || i >= b.width || j >= b.height) return false;
++  return b.mask[j * b.width + i] !== 0;
++}
++
++/** Bilinear eye height at world (x, y), clamped to the grid. */
++export function eyeHeight(b: WalkBounds, x: number, y: number): number {
++  const fx = Math.min(Math.max((x - b.originX) / b.cell, 0), b.width - 1);
++  const fy = Math.min(Math.max((y - b.originY) / b.cell, 0), b.height - 1);
++  const i0 = Math.floor(fx);
++  const j0 = Math.floor(fy);
++  const i1 = Math.min(i0 + 1, b.width - 1);
++  const j1 = Math.min(j0 + 1, b.height - 1);
++  const tx = fx - i0;
++  const ty = fy - j0;
++  const h = b.heights;
++  const w = b.width;
++  const top = h[j0 * w + i0] * (1 - tx) + h[j0 * w + i1] * tx;
++  const bot = h[j1 * w + i0] * (1 - tx) + h[j1 * w + i1] * tx;
++  return top * (1 - ty) + bot * ty;
++}
++
++/** World XY of the walkable cell centre nearest to (x, y). */
++export function nearestWalkable(
++  b: WalkBounds,
++  x: number,
++  y: number,
++): [number, number] {
++  let best = -1;
++  let bestD = Infinity;
++  for (let k = 0; k < b.walkable.length; k++) {
++    const idx = b.walkable[k];
++    const cx = b.originX + (idx % b.width) * b.cell;
++    const cy = b.originY + Math.floor(idx / b.width) * b.cell;
++    const d = (cx - x) * (cx - x) + (cy - y) * (cy - y);
++    if (d < bestD) {
++      bestD = d;
++      best = idx;
++    }
++  }
++  return [
++    b.originX + (best % b.width) * b.cell,
++    b.originY + Math.floor(best / b.width) * b.cell,
++  ];
++}
++
++/** Clamp a move from (x0, y0) to (x1, y1): slide along walls instead of stopping dead.
++ * A start outside the grid (new bounds, server-set pose) snaps to the nearest walkable cell. */
++export function clampMove(
++  b: WalkBounds,
++  x0: number,
++  y0: number,
++  x1: number,
++  y1: number,
++): [number, number] {
++  if (!isWalkable(b, x0, y0)) return nearestWalkable(b, x1, y1);
++  if (isWalkable(b, x1, y1)) return [x1, y1];
++  if (isWalkable(b, x1, y0)) return [x1, y0];
++  if (isWalkable(b, x0, y1)) return [x0, y1];
++  return [x0, y0];
++}
+diff --git a/client/src/WebsocketMessages.ts b/client/src/WebsocketMessages.ts
+index d5ec0ca..4ee20cb 100644
+--- a/client/src/WebsocketMessages.ts
++++ b/client/src/WebsocketMessages.ts
+@@ -1494,6 +1494,20 @@ export interface SetCameraMinOrbitDistanceMessage {
+   type: "SetCameraMinOrbitDistanceMessage";
+   min_orbit_distance: number;
+ }
++/** Server -> client: ground-level walk bounds (hypersplat patch, see WalkMode.ts). */
++export interface SetWalkBoundsMessage {
++  type: "SetWalkBoundsMessage";
++  enabled: boolean;
++  version: number;
++  origin: [number, number];
++  cell: number;
++  width: number;
++  height: number;
++  mask: Uint8Array;
++  heights: Float32Array;
++  speed: number;
++  pitch_deg: number;
++}
+ /** Server -> client message to set how far the camera may be dollied out
+  * from its orbit (look-at) point.
+  *
+@@ -2235,6 +2249,7 @@ export type Message =
+   | SetCameraFovMessage
+   | SetCameraMinOrbitDistanceMessage
+   | SetCameraMaxOrbitDistanceMessage
++  | SetWalkBoundsMessage
+   | SetOrientationMessage
+   | SetPositionMessage
+   | TransformControlsUpdateMessage

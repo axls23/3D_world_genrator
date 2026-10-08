@@ -52,6 +52,15 @@ Options:
   --difix-start F     online Difix starts at this fraction of the run (default 0.5: the early
                       blob renders are what Difix hallucinates on); 0 = from the start
   --seed N            training random seed (default 42)
+  --refit-recipe R    ACE refit training: legacy (default) or ace0 (the ACE-Zero paper's mapping
+                      iteration: warmup to 3e-3, early cooldown on the inlier trigger, pose MLP
+                      starting at the input poses)
+  --gauge-lock        align every ACE refit to the bootstrap map (Sim(3)) before its poses reach
+                      the trainer: removes the map's per-refit rotation / scale creep
+  --no-walk           viewer: free-fly camera instead of the ground-level walk mode
+  --ace-continuous    ACE maps in step with training: after the first map the ACE head trains a
+                      little every 3DGS step and keyframes are relocalized one at a time (settled
+                      ones are anchored), instead of ~2 min refits landing as pose jumps
   --deterministic     reproducible runs of a video file: deterministic kernels for training and
                       ACE maps, file fully localized before step 0 (slower; ~0.2 dB lower)
   --no-view           no viewer / dashboard / browser
@@ -96,6 +105,10 @@ while [[ $# -gt 0 ]]; do
         --difix-start)    DIFIX_START="$2"; shift ;;
         --seed)           SEED="$2"; shift ;;
         --deterministic)  EXTRA+=(--deterministic) ;;
+        --ace-continuous) EXTRA+=(--trainer-arg "stream_ace_mode=continuous") ;;
+        --refit-recipe)   EXTRA+=(--trainer-arg "stream_refit_recipe=$2"); shift ;;
+        --gauge-lock)     EXTRA+=(--trainer-arg "stream_gauge_lock=true") ;;
+        --no-walk)        EXTRA+=(--trainer-arg "viewer_walk=false") ;;
         --no-view)        VIEW=0 ;;
         --no-browser)     BROWSER=0 ;;
         --viewer-port)    VIEWER_PORT="$2"; shift ;;
@@ -250,6 +263,8 @@ if [[ $VIEW -eq 1 ]]; then
     EXTRA+=(--stream-viewer-port "$VIEWER_PORT" --stream-dashboard-port "$DASH_PORT"
             --stream-dashboard-host "$DASH_HOST")
     [[ "$DASH_HOST" == 0.0.0.0 ]] && warn "--share: the camera feed is reachable from the network"
+    "$PY" -c 'from hypersplat.stream.walk_bounds import walk_client_installed as w; raise SystemExit(not w())' \
+        || warn "viewer walk mode unavailable: run scripts/viewer/build_walk_client.sh (free-fly only)"
 fi
 
 STOP_FILE="$OUTPUT/results/stream_3dgs/STOP"
