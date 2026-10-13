@@ -270,7 +270,12 @@ def render_view(splats, c2w: np.ndarray, K: np.ndarray, W: int, H: int, device: 
 
 
 class DifixFixer:
-    """Single-step Difix artifact remover in fp16: UNet + VAE only on the GPU (~1.8 GB)."""
+    """Single-step Difix artifact remover in fp16: UNet + VAE only on the GPU (~1.8 GB).
+
+    The weights live in page-locked host memory (hypersplat/stream/pinned.py): moving the model
+    to the GPU is one fast non-blocking copy, and moving it back to the CPU (parking it between
+    online rounds) is free - no 1.8 GB device-to-host copy. device="cpu" builds it parked
+    (e.g. preloaded on a background thread before the first round needs it)."""
 
     def __init__(self, model_id: str = "nvidia/difix", device: str = "cuda"):
         from hypersplat.beta.difix.pipeline_difix import DifixPipeline
@@ -291,13 +296,20 @@ class DifixFixer:
                                     truncation=True, return_tensors="pt").input_ids
             self.prompt_embeds = pipe.text_encoder.float()(tokens)[0].to(torch.float16)
         pipe.text_encoder = None
-        pipe.to(device)
-        self.prompt_embeds = self.prompt_embeds.to(device)
+        from hypersplat.stream.pinned import PinnedWeights
+
         self.pipe = pipe
+        self.weights = PinnedWeights([m for m in pipe.components.values() if isinstance(m, torch.nn.Module)])
+        self.device = "cpu"
+        self.to(device)
 
     def to(self, device: str) -> "DifixFixer":
         """Move the model (e.g. park it on the CPU between online rounds to free VRAM)."""
-        self.pipe.to(device)
+        if torch.device(device).type == "cuda":
+            done = self.weights.to_gpu(device)
+            torch.cuda.current_stream(torch.device(device)).wait_event(done)
+        else:
+            self.weights.park()
         self.prompt_embeds = self.prompt_embeds.to(device)
         self.device = device
         return self

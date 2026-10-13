@@ -72,6 +72,19 @@ def lib():
         L.pose_nn_distance.restype = None
         L.weighted_pick.argtypes = [dp, i64, ctypes.c_double]
         L.weighted_pick.restype = i64
+        vp = ctypes.c_void_p
+        L.ring_bytes.argtypes = [i64, i64]
+        L.ring_bytes.restype = i64
+        L.ring_init.argtypes = [vp, i64, i64, i64]
+        L.ring_init.restype = i64
+        L.ring_check.argtypes = [vp, i64]
+        L.ring_check.restype = i64
+        L.ring_push.argtypes = [vp, vp, i64]
+        L.ring_push.restype = i64
+        L.ring_pop.argtypes = [vp, vp, i64]
+        L.ring_pop.restype = i64
+        L.ring_stats.argtypes = [vp, ctypes.POINTER(i64)]
+        L.ring_stats.restype = None
         _lib = L
         return _lib
 

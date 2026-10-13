@@ -18,6 +18,15 @@ Commands (cmd, frames, args, params-JSON):
         Runs in the background; localize keeps using the old map meanwhile.
     load       frames; params: head, pose_file, image_resolution
         Adopt an existing ACE map (e.g. a batch ACE-Zero run) and localize the frames on it.
+    seed       frames[0]; params: depth, focal, image_resolution, num_head_blocks, seed_slots,
+               seed_min_iters, seed_max_iters, seed_min_inliers, seed_lr, seed_keep_depth,
+               conf_threshold + the mapper params
+        Cold start, instead of bootstrap + mapper: a fresh head learns this one frame at the
+        identity pose with scene coordinate targets from its depth map (``depth``: .npy,
+        camera z, 0 = invalid) - ACE-Zero's seed stage - then continuous mapping starts on it
+        (the frame stays anchored: it fixes the gauge). Runs in the background; the map
+        event (reason "seed") carries the seed frame only. Focal: ``focal`` (px of the frame
+        file) or ACE's heuristic, 70% of the image diagonal.
     forget     frames      drop evicted frames from the pose table
     mapper     frames; params: conf_threshold, iters_per_tick, reloc_per_tick, publish_every,
                max_backlog, lr, passes, samples_per_pass, max_frames
@@ -26,6 +35,12 @@ Commands (cmd, frames, args, params-JSON):
         (`frames`: every keyframe the client has). Refits are refused from then on.
     tick       params: n   run n mapper units (iterations + relocalizations); the client sends one
                per 3DGS step, so mapping keeps pace with training (backlog capped)
+    profile    params: units, out   torch.profiler over the next ``units`` mapper units (all
+               threads: mapping and localization), summary + trace written to ``out``
+    rings      params: delta, seed, feedback   paths of shared-memory rings (hypersplat/stream/
+               ring.py) created by the client: from now on pose and reloc rows go there
+               instead of the pipe (fixed-size records, no serialization; a full ring blocks
+               the sender, which is the backpressure on mapping)
     shutdown
 
 Events (kind, version, frame, w2c, conf, focal, points, pix, meta):
@@ -67,6 +82,9 @@ import dsacstar  # noqa: E402
 from ace_network import Regressor  # noqa: E402
 from stream_mapper import ContinuousMapper  # noqa: E402
 from dataset import CamLocDataset  # noqa: E402
+from hypersplat.stream.ring import (DELTA_DTYPE, KIND_ANCHOR, KIND_POSE,  # noqa: E402
+                                    KIND_RELOC, SEED_DTYPE, SEED_MAX_POINTS, ShmRing,
+                                    frame_kid)
 from hypersplat.stream.schema import (  # noqa: E402
     EVENT_SCHEMA, IpcWriter, event_batch, ipc_batches, parse_meta,
 )
@@ -120,12 +138,77 @@ class Sidecar:
         self.anchored = set()
         self.stable_count = {}
         self.extent = None
+        # Shared-memory rings (``rings`` command): pose / reloc rows bypass the Arrow pipe
+        self.rings = None
+        self.ring_lock = threading.Lock()   # one producer per ring: localize and mapper threads
+        self.ring_seq = 0
+        self.ring_fallbacks = 0
+        self.prof_request = None        # (units, out dir) from the ``profile`` command
 
     # ------------------------------------------------------------------ io
     def emit(self, rows):
+        if (self.rings is not None and len(rows) == 1 and rows[0].get("kind") in ("pose", "reloc")
+                and self._emit_ring(rows[0])):
+            return
         batch = event_batch(rows)
         with self.out_lock:
             self.out.write(batch)
+
+    def open_rings(self, params):
+        rings = {"delta": ShmRing(params["delta"], DELTA_DTYPE),
+                 "seed": ShmRing(params["seed"], SEED_DTYPE)}
+        with self.ring_lock:
+            self.rings = rings
+        _logger.info("pose rows now go through shared-memory rings (%s)", params["delta"])
+
+    def _push_wait(self, ring, rec, timeout=5.0):
+        """Push one record, waiting while the ring is full (the consumer is behind)."""
+        deadline = time.time() + timeout
+        while ring.push(rec) == 0:
+            if self.stopping.is_set() or time.time() > deadline:
+                return False
+            time.sleep(0.002)
+        return True
+
+    def _emit_ring(self, row):
+        """One pose / reloc row as a DELTA record (+ its seed points as a SEED record).
+        False: not sent (not a stream frame, or the ring stayed full): use the pipe."""
+        kid = frame_kid(row.get("frame") or "")
+        if kid < 0:
+            return False
+        meta = row.get("meta") or {}
+        rec = np.zeros(1, DELTA_DTYPE)
+        r = rec[0]
+        r["kid"], r["step"], r["mapper_tick"] = kid, -1, self.units
+        r["map_version"] = int(row.get("version") or 0)
+        r["kind"] = KIND_ANCHOR if meta.get("anchored") else (KIND_RELOC if row["kind"] == "reloc" else KIND_POSE)
+        r["anchored"] = 1 if meta.get("anchored") else 0
+        r["conf"] = float(row.get("conf") or 0.0)
+        r["focal"] = float(row.get("focal") or -1.0)
+        m = self.mapper
+        r["inlier_frac"] = float(m.inlier_ema) if m is not None and m.inlier_ema is not None else np.nan
+        r["move"] = np.nan
+        r["w2c"] = np.asarray(row["w2c"], np.float64).reshape(16) if row.get("w2c") is not None else np.nan
+        pts = np.asarray(row.get("points") or [], np.float32).reshape(-1, 3)[:SEED_MAX_POINTS]
+        pix = np.asarray(row.get("pix") or [], np.float32).reshape(-1, 2)[:SEED_MAX_POINTS]
+        with self.ring_lock:
+            seq = self.ring_seq + 1
+            r["seq"], r["n_seeds"] = seq, len(pts)
+            if len(pts):
+                seed = np.zeros(1, SEED_DTYPE)
+                seed[0]["seq"], seed[0]["kid"] = seq, kid
+                seed[0]["map_version"], seed[0]["n"] = r["map_version"], len(pts)
+                seed[0]["xyz"][:len(pts)] = pts
+                seed[0]["pix"][:len(pix)] = pix
+                if not self._push_wait(self.rings["seed"], seed):
+                    self.ring_fallbacks += 1
+                    return False
+            # Seeds first: the consumer finds them published when it reads the delta
+            if not self._push_wait(self.rings["delta"], rec):
+                self.ring_fallbacks += 1
+                return False   # an orphan seed (if any) is dropped by the consumer by seq
+            self.ring_seq = seq
+        return True
 
     def error(self, cmd, msg):
         self.emit([{"kind": "error", "version": self.version, "meta": {"cmd": cmd, "msg": msg}}])
@@ -185,7 +268,9 @@ class Sidecar:
 
     # ------------------------------------------------------------------ localize
     @torch.no_grad()
-    def localize(self, frame, network):
+    def localize(self, frame, network, w2c=None):
+        """Register a frame (RANSAC pose + inlier scene coordinates). ``w2c`` given: no
+        RANSAC, the inliers (count = conf) under that pose (the seed frame)."""
         row = {"kind": "pose", "version": self.version, "frame": frame, "conf": 0.0,
                "focal": self.focal}
         if network is None:
@@ -198,14 +283,18 @@ class Sidecar:
         with torch.cuda.amp.autocast(enabled=True):
             sc = network(image.unsqueeze(0).to(self.device))
         sc = sc.float().cpu()[0]  # 3, h, w
-        c2w = torch.zeros((4, 4))
         f, cx, cy = K[0, 0].item(), K[0, 2].item(), K[1, 2].item()
-        # Same arguments as register_mapping.py (inlier alpha / max pixel error 100, 16 tries)
-        conf = dsacstar.forward_rgb(sc.unsqueeze(0), c2w, self.hypotheses, self.threshold, f, cx, cy,
-                                    100, 100, network.OUTPUT_SUBSAMPLE, 1305, self.max_tries)
-        w2c = np.linalg.inv(c2w.numpy().astype(np.float64))
-        points, pix = self._inlier_points(Path(frame).name, sc.numpy(), w2c, f, cx, cy, image.shape[1:],
-                                          network.OUTPUT_SUBSAMPLE)
+        conf = None
+        if w2c is None:
+            c2w = torch.zeros((4, 4))
+            # Same arguments as register_mapping.py (inlier alpha / max pixel error 100, 16 tries)
+            conf = dsacstar.forward_rgb(sc.unsqueeze(0), c2w, self.hypotheses, self.threshold, f, cx, cy,
+                                        100, 100, network.OUTPUT_SUBSAMPLE, 1305, self.max_tries)
+            w2c = np.linalg.inv(c2w.numpy().astype(np.float64))
+        points, pix, n_inl = self._inlier_points(Path(frame).name, sc.numpy(), w2c, f, cx, cy,
+                                                 image.shape[1:], network.OUTPUT_SUBSAMPLE)
+        if conf is None:
+            conf = n_inl
         row.update(w2c=w2c.reshape(-1).tolist(), conf=float(conf),
                    focal=self.focal if self.focal > 0 else ds.get_focal_length(0),
                    points=points.astype(np.float32).reshape(-1).tolist(),
@@ -224,13 +313,14 @@ class Sidecar:
             proj = np.stack([f * Xc[:, 0] / z + cx, f * Xc[:, 1] / z + cy], axis=1)
             err = np.linalg.norm(proj - px, axis=1)
         keep = np.where((z > 1e-3) & (err < self.threshold) & np.isfinite(err))[0]
+        n_inl = len(keep)
         if len(keep) > self.max_points:
             # Per-frame rng: the same frame gets the same seed points whatever was localized
             # before it (a process-wide rng made them depend on the call history)
             rng = np.random.default_rng([self.seed, zlib.crc32(str(frame_key).encode())])
             keep = rng.choice(keep, self.max_points, replace=False)
         H, W = hw
-        return X[keep], px[keep] / np.array([W, H], dtype=np.float64)
+        return X[keep], px[keep] / np.array([W, H], dtype=np.float64), n_inl
 
     # ------------------------------------------------------------------ background jobs
     def _publish_map(self, network, head_path, frames, reason, t0):
@@ -341,17 +431,23 @@ class Sidecar:
             shutil.rmtree(str(out_dir), ignore_errors=True)
 
     # ------------------------------------------------------------------ continuous mapping
-    def start_mapper(self, frames, params):
-        if self.mapper is not None:
-            return
-        if self.head_path is None:
-            raise RuntimeError("mapper needs a map (bootstrap or load first)")
+    @staticmethod
+    def _mapper_params(params):
+        """(loop cfg, ContinuousMapper kwargs) from mapper / seed command params."""
         cfg = {"conf_threshold": 500.0, "iters_per_tick": 4, "reloc_every": 2,
                "publish_every": 25, "max_backlog": 4, "adopt_min_inliers": 0.5,
                "anchor_tol": 0.01, "anchor_after": 2}
         cfg.update({k: v for k, v in params.items() if k in cfg})
         kw = {k: params[k] for k in ("lr", "passes", "samples_per_pass", "max_frames", "progress")
               if k in params}
+        return cfg, kw
+
+    def start_mapper(self, frames, params):
+        if self.mapper is not None:
+            return  # cold start: the seed job started it
+        if self.head_path is None:
+            raise RuntimeError("mapper needs a map (bootstrap or load first)")
+        cfg, kw = self._mapper_params(params)
         head_state = torch.load(str(self.head_path), map_location="cpu")
         mapper = ContinuousMapper(self.encoder_state, head_state, self.device,
                                   image_resolution=self.image_resolution, seed=self.seed, **kw)
@@ -359,16 +455,83 @@ class Sidecar:
         with self.net_lock:
             reg = [f for f, (_, c) in sorted(self.poses.items()) if c >= cfg["conf_threshold"]]
             poses = {f: self.poses[f][0] for f in reg}
-            self.known = sorted(set(frames) | set(self.poses))
         for f in reg:
             if Path(f).exists():
                 mapper.add_frame(f, poses[f], self.focal)
-        with self.net_lock:
-            self.mapper, self.mapper_cfg = mapper, cfg
+        self._run_mapper(mapper, cfg, frames)
         _logger.info(f"continuous mapper on {len(mapper.frames)} registered frames "
                      f"({len(self.known)} known), encoded in {time.time() - t0:.1f} s; {cfg} {kw}")
+
+    def _run_mapper(self, mapper, cfg, frames):
+        with self.net_lock:
+            self.known = sorted(set(frames) | set(self.poses) | set(self.known))
+            self.mapper, self.mapper_cfg = mapper, cfg
         self.mapper_thread = threading.Thread(target=self._mapper_loop, name="ace-mapper", daemon=True)
         self.mapper_thread.start()
+
+    def seed_map(self, frames, args, params):
+        """Cold start (``seed`` command): ACE-Zero's seed stage on frames[0], then continuous
+        mapping. Errors are reported (the client retries with another frame)."""
+        t0 = time.time()
+        frame = frames[0]
+        try:
+            if self.mapper is not None or self.head_path is not None:
+                raise RuntimeError("seed: a map exists already")
+            self.image_resolution = int(params.get("image_resolution", self.image_resolution))
+            focal = float(params.get("focal", -1))
+            if focal <= 0:
+                focal = CamLocDataset(rgb_files=frame, image_short_size=self.image_resolution,
+                                      use_heuristic_focal_length=True).get_focal_length(0)
+            depth = np.load(params["depth"])
+            valid = depth[depth > 0]
+            if valid.size < 100:
+                raise RuntimeError(f"seed depth has {valid.size} valid pixels")
+            cfg, kw = self._mapper_params(params)
+            mapper = ContinuousMapper(self.encoder_state, None, self.device,
+                                      image_resolution=self.image_resolution, seed=self.seed,
+                                      num_head_blocks=int(params.get("num_head_blocks", 1)),
+                                      mean=(0.0, 0.0, float(np.median(valid))), **kw)
+            mapper.add_frame(frame, np.eye(4), focal, depth_file=str(params["depth"]),
+                             slots=int(params.get("seed_slots", 8)))
+            t1 = time.time()
+            iters = mapper.train_seed(min_iters=int(params.get("seed_min_iters", 300)),
+                                      max_iters=int(params.get("seed_max_iters", 2000)),
+                                      min_inliers=float(params.get("seed_min_inliers", 0.7)),
+                                      lr=float(params.get("seed_lr", 2e-3)),
+                                      keep_targets=bool(params.get("seed_keep_depth", False)),
+                                      stop=self.stopping)
+            if self.stopping.is_set():
+                _logger.info("seed cancelled (shutdown)")
+                return
+            net = mapper.snapshot()
+            self.focal = focal
+            row = self.localize(frame, net, w2c=np.eye(4))
+            if row["conf"] < cfg["conf_threshold"]:
+                raise RuntimeError(f"seed frame fits only {row['conf']:.0f} inliers "
+                                   f"(< {cfg['conf_threshold']:.0f}) after {iters} iterations")
+            with self.net_lock:
+                self.network = net
+                self.version += 1
+                self.poses[frame] = (np.eye(4), row["conf"])
+                self.anchored.add(frame)   # identity forever: it fixes the gauge
+            self._run_mapper(mapper, cfg, frames)
+            torch.cuda.empty_cache()
+            meta = {"reason": "seed", "seconds": round(time.time() - t0, 1), "iterations": iters,
+                    "train_seconds": round(time.time() - t1, 1),
+                    "inliers": round(float(mapper.inlier_ema or 0.0), 3)}
+            _logger.info(f"seed map from {Path(frame).name}: {iters} iterations in "
+                         f"{meta['train_seconds']} s, batch inliers {meta['inliers'] * 100:.1f}%, "
+                         f"{row['conf']:.0f} frame inliers, focal {focal:.1f} px; continuous mapping on")
+            row.update(kind="map", version=self.version, meta=meta)
+            self.emit([row])
+        except Exception as e:
+            if self.stopping.is_set():
+                _logger.info("seed cancelled (shutdown)")
+                return
+            _logger.exception("seed failed")
+            with self.net_lock:
+                self.network, self.mapper = None, None
+            self.error("seed", str(e))
 
     def _mapper_loop(self):
         t_log, t_units = time.time(), 0.0
@@ -379,6 +542,7 @@ class Sidecar:
                 if self.stopping.is_set():
                     return
                 self.tick_budget -= 1
+            self._profile_unit()
             t0 = time.time()
             try:
                 self._mapper_unit()
@@ -393,6 +557,33 @@ class Sidecar:
                              f"{len(self.known)} known, map v{self.version}, inliers(10px) "
                              f"{(m.inlier_ema or 0) * 100:.1f}%, {1000 * t_units / max(1, self.units):.0f} ms/unit")
                 t_log = time.time()
+
+    def _profile_unit(self):
+        """Start / advance / finish a requested profiler window at a mapper unit boundary."""
+        prof = getattr(self, "_prof", None)
+        if prof is None:
+            if self.prof_request is None:
+                return
+            from torch.profiler import ProfilerActivity, profile
+
+            self._prof_units, self._prof_out = self.prof_request
+            self.prof_request = None
+            torch.cuda.synchronize()
+            self._prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self._prof.__enter__()
+            self._prof_steps = [(self.units, time.time())]
+            _logger.info("CUDA profiler on for %d mapper units", self._prof_units)
+            return
+        self._prof_steps.append((self.units, time.time()))
+        if len(self._prof_steps) <= self._prof_units:
+            return
+        self._prof = None
+        torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        from hypersplat.stream.profiling import write_profile
+
+        out = write_profile(prof, self._prof_steps, self._prof_out, "sidecar")
+        _logger.info("profile written: %s", out)
 
     def _mapper_unit(self):
         m, cfg = self.mapper, self.mapper_cfg
@@ -472,7 +663,7 @@ class Sidecar:
     # ------------------------------------------------------------------ main loop
     def serve(self, commands):
         self.emit([{"kind": "ready", "version": 0}])
-        jobs = {"bootstrap": self.bootstrap, "refit": self.refit, "load": self.load}
+        jobs = {"bootstrap": self.bootstrap, "refit": self.refit, "load": self.load, "seed": self.seed_map}
         for batch in commands:
             for msg in batch.to_pylist():
                 cmd, frames, args = msg["cmd"], msg["frames"] or [], msg["args"] or []
@@ -493,6 +684,19 @@ class Sidecar:
                         self.emit([row])
                     elif cmd == "mapper":
                         self.start_mapper(frames, params)
+                    elif cmd == "depth":
+                        m = self.mapper
+                        if m is not None and frames and Path(str(params.get("depth", ""))).exists():
+                            m.depth_frac = float(params.get("depth_frac", m.depth_frac))
+                            m.depth_weight = float(params.get("depth_weight", m.depth_weight))
+                            with self.net_lock:
+                                m.set_depth(frames[0], str(params["depth"]), self.focal)
+                    elif cmd == "rings":
+                        self.open_rings(params)
+                    elif cmd == "profile":
+                        if self.mapper is None:
+                            _logger.warning("profile: only continuous mapping is profiled")
+                        self.prof_request = (int(params.get("units", 300)), params["out"])
                     elif cmd == "tick":
                         with self.tick_cv:
                             cap = int(self.mapper_cfg.get("max_backlog", 4))

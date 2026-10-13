@@ -1,0 +1,32 @@
+{
+  "name": "ab_latent_smoke_300",
+  "output": "experiments/results/ab_latent_smoke_300",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "map_cache": true,
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "300",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut",
+    "--trainer-arg",
+    "deterministic=True"
+  ],
+  "repeats": {
+    "baseline": 1,
+    "B_hold": 1
+  },
+  "variants": {
+    "baseline": {},
+    "B_hold": {
+      "latent_loss": true,
+      "latent_lambda": 0.1
+    }
+  },
+  "keep_checkpoints": false,
+  "notes": "Stage 0 gate smoke test: 300 steps, baseline vs arm B. Checks the latent gradient is live (train/latent_loss, train/grad_norm in TB) and measures step time against the 20% budget. Not a PSNR verdict."
+}

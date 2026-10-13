@@ -97,7 +97,110 @@ def _view_item(table, i: int, image_id: int, session=None) -> Dict:
         d = session.depth_map(int(table.column("kid")[i].as_py()))
         item["depth"] = (torch.from_numpy(d.astype(np.float32)) if d is not None and d.shape == (h // 2, w // 2)
                          else torch.zeros(h // 2, w // 2))
+        wmap = session.depth_weight(int(table.column("kid")[i].as_py()))
+        item["depth_w"] = (torch.from_numpy(wmap.astype(np.float32)) if wmap is not None and wmap.shape == (h // 2, w // 2)
+                           else torch.ones(h // 2, w // 2))
     return item
+
+
+# ============================================================================ device poses
+class DevicePoses:
+    """Trainer side of the device pose table (hypersplat/stream/cuda).
+
+    Every step: ``sync`` applies the session's queued pose rows on the current CUDA stream and
+    reads back the previous applies' results without blocking (jitter statistics -> filter /
+    tier thresholds, host tier map -> sampling weights); ``camtoworlds`` swaps each real view's
+    camera for its row of the table (a device gather, no host sync). With alpha = 1 and tiers
+    off the table reproduces the session's poses exactly."""
+
+    TIER_WEIGHTS = {0: 0.0, 1: 0.3, 2: 1.0, 3: 1.0}
+
+    def __init__(self, session, trainset=None, alpha: float = 1.0, tiers: bool = False,
+                 provisional_weight: float = 0.3, capacity: Optional[int] = None):
+        from .cuda import DevicePoseTable, JitterFloor
+
+        self.session = session
+        self.trainset = trainset
+        self.alpha = float(alpha)
+        self.tiers = bool(tiers)
+        self.weights = {**self.TIER_WEIGHTS, 1: float(provisional_weight)}
+        self.table = DevicePoseTable(capacity or session.cfg.max_keyframes + 64)
+        self.jitter = JitterFloor()
+        self.tier_of: Dict[int, int] = {}
+        self.extent = 1.0
+        self._transform_set = False
+        self.counts = {"applied": 0, "stale": 0, "unregistered": 0, "outlier": 0, "frozen": 0}
+        # Rows applied before the table existed (first map, early localizations): seed it with
+        # the store's current poses, ahead of anything queued from now on
+        with session._cond:
+            session.device_deltas_on = True
+            session._device_deltas.insert(0, self._store_records())
+
+    def _store_records(self) -> np.ndarray:
+        from .ring import DELTA_DTYPE, KIND_POSE
+
+        frames = [kf for kf in self.session.store.frames() if kf.w2c is not None]
+        recs = np.zeros(len(frames), DELTA_DTYPE)
+        for r, kf in zip(recs, frames):
+            r["kid"], r["map_version"], r["kind"] = kf.kid, kf.map_version, KIND_POSE
+            r["conf"], r["step"] = kf.conf, -1
+            r["inlier_frac"] = r["move"] = np.nan
+            r["w2c"] = np.asarray(kf.w2c, np.float64).reshape(16)
+        return recs
+
+    def sync(self, step: int):
+        from .cuda import APPLIED, FROZEN, OUTLIER, STALE, UNREGISTERED
+
+        s = self.session
+        if not self._transform_set:
+            if s.transform is None:
+                return                       # before the first map: rows stay queued
+            self.table.set_transform(s.transform)
+            self._transform_set = True
+        if step % 50 == 0:
+            self.extent = s.path_extent()
+            live = {kf.kid for kf in s.store.frames()}
+            for kid in [k for k in self.table._slot if k not in live]:
+                self.table.release(kid)
+                self.tier_of.pop(kid, None)
+        recs = s.take_device_deltas()
+        if len(recs):
+            self.table.ensure_stage_free()
+            promote, outlier = self.jitter.thresholds()
+            self.table.apply(recs, conf_threshold=s.store.conf_threshold, extent=self.extent,
+                             alpha=self.alpha, promote_thr=promote, outlier_thr=outlier)
+        res = self.table.poll()
+        if res is None:
+            return
+        ok = res["result"] == APPLIED
+        self.jitter.add(res["move"][ok])
+        for name, code in (("applied", APPLIED), ("stale", STALE), ("unregistered", UNREGISTERED),
+                           ("outlier", OUTLIER), ("frozen", FROZEN)):
+            self.counts[name] += int((res["result"] == code).sum())
+        for kid, t in zip(res["kid"].tolist(), res["tier"].tolist()):
+            self.tier_of[int(kid)] = int(t)
+        if self.tiers and self.trainset is not None:
+            self.trainset.tier_weight = {k: self.weights[t] for k, t in self.tier_of.items()}
+
+    def camtoworlds(self, kids, c2w: torch.Tensor) -> torch.Tensor:
+        """c2w (B, 4, 4) on the device with real views' rows replaced by the table's."""
+        if not self._transform_set:
+            return c2w
+        kid_list = kids.tolist() if torch.is_tensor(kids) else list(np.atleast_1d(kids))
+        slots = [self.table.slot_of(int(k)) if int(k) >= 0 else -1 for k in kid_list]
+        if all(sl < 0 for sl in slots):
+            return c2w
+        idx = torch.tensor([max(sl, 0) for sl in slots], device=c2w.device)
+        valid = torch.tensor([sl >= 0 for sl in slots], device=c2w.device)
+        valid = valid & (self.table.has_pose.index_select(0, idx) > 0)
+        rows = self.table.c2w_trainer.index_select(0, idx).reshape(-1, 4, 4).to(c2w.dtype)
+        return torch.where(valid[:, None, None], rows, c2w)
+
+    def stats(self) -> Dict:
+        tiers = np.bincount(np.array(list(self.tier_of.values()) or [0]), minlength=4).tolist()
+        promote, outlier = self.jitter.thresholds()
+        return {**self.counts, "tiers": tiers if self.tier_of else [0, 0, 0, 0],
+                "promote_thr": round(promote, 4), "outlier_thr": round(outlier, 4), "extent": round(self.extent, 3)}
 
 
 # ============================================================================ datasets
@@ -132,6 +235,9 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
         # the steps of a 2k drone run. None = no cap
         self.pseudo_share = pseudo_share
         self.loss_ema: Dict[int, float] = {}   # kid -> photometric loss EMA (real views)
+        # kid -> sampling factor from the device pose table's stability tier (DevicePoses);
+        # views not listed (and pseudo views) count 1
+        self.tier_weight: Dict[int, float] = {}
         self._version = None
         self._table = None
 
@@ -194,7 +300,11 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
             if self._table is not None and self._table.num_rows:
                 break
             time.sleep(0.05)
-        i = weighted_pick(self._cap_pseudo(self.hardness() / np.sqrt(1.0 + self._drawn)), self.rng.random())
+        w = self.hardness() / np.sqrt(1.0 + self._drawn)
+        if self.tier_weight:
+            tw = self.tier_weight
+            w = w * np.array([1.0 if p else tw.get(k, 1.0) for k, p in zip(self._kids, self._pseudo)])
+        i = weighted_pick(self._cap_pseudo(w), self.rng.random())
         self._drawn[i] += 1
         self.counts[self._names[i]] = int(self._drawn[i])
         return _view_item(self._table, i, 0, self.session)

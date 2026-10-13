@@ -166,9 +166,10 @@ def _depth_session():
     s.cfg = StreamConfig(source="x.mp4", depth=True)
     s._cond = threading.Condition()
     s.transform = np.eye(4)
-    s._depth, s._disp, s._ace_pts, s._aligned_version = {}, {}, {}, {}
+    s._depth, s._disp, s._ace_pts, s._aligned_version, s._depth_w = {}, {}, {}, {}, {}
     s._depth_jobs, s._refit_requested = [], 0
-    s.depth_counters = {"maps": 0, "rejected": 0, "ms": 0.0, "rel_err": None, "last_reject": None, "realigned": 0}
+    s.depth_counters = {"maps": 0, "rejected": 0, "ms": 0.0, "rel_err": None, "last_reject": None, "realigned": 0,
+                       "anchored": 0, "fb_maps": 0, "fb_score": None}
     kfs = {k: types.SimpleNamespace(kid=k, width=160, height=120) for k in (1, 2)}
     s.store = types.SimpleNamespace(get=kfs.get, frames=lambda: list(kfs.values()))
     return s
@@ -236,3 +237,32 @@ def test_align_disparity_render_anchors_guarded_by_ace():
     base = align_disparity(noisy, z)
     assert not al_bad.anchored
     assert al_bad.a == base.a and al_bad.b == base.b
+
+
+def test_render_consistency_flags_wrong_geometry():
+    from hypersplat.stream.depth import render_consistency
+
+    z, _, _ = scene()
+    real = network_like(z, seed=0)
+    good = 0.8 * network_like(z, seed=3) + 0.1          # same geometry, different exposure
+    w_good, s_good = render_consistency(real, good)
+    bad = good.copy()
+    bad[20:60, 20:60] += 0.5 * float(np.ptp(good))      # a floater: wrong surface in the render
+    w_bad, s_bad = render_consistency(real, bad)
+    assert w_good.min() >= 0.1 and w_good.max() <= 1.0
+    assert s_good > 0.9 and s_bad < s_good
+    assert w_bad[20:60, 20:60].mean() < 0.3 < w_bad[80:, 100:].mean()
+
+
+def test_session_stores_feedback_weights_and_drops_evicted():
+    s = _depth_session()
+    z, _, _ = scene()
+    s.set_depth(1, z.copy(), {"ms": 5.0}, disp=network_like(z), version=1)
+    assert s.depth_weight(1) is None
+    s.set_depth_weight(1, np.full((60, 80), 0.5, np.float32), 0.5)
+    s.set_depth_weight(1, np.full((60, 80), 0.7, np.float32), 0.9)
+    assert s.depth_weight(1).dtype == np.float16 and s.depth_counters["fb_maps"] == 2
+    assert abs(s.depth_counters["fb_score"] - (0.8 * 0.5 + 0.2 * 0.9)) < 1e-9
+    s._depth_w[99] = np.ones((1, 1), np.float16)       # evicted keyframe
+    s.set_depth(2, z.copy(), {"ms": 5.0}, disp=network_like(z), version=1)
+    assert 99 not in s._depth_w and 1 in s._depth_w

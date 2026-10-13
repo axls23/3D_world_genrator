@@ -1,0 +1,33 @@
+{
+  "name": "ab_latent_layer6_300",
+  "output": "experiments/results/ab_latent_layer6_300",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "map_cache": true,
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "300",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut",
+    "--trainer-arg",
+    "deterministic=True"
+  ],
+  "repeats": {
+    "baseline": 2,
+    "B_layer6": 1
+  },
+  "variants": {
+    "baseline": {},
+    "B_layer6": {
+      "latent_loss": true,
+      "latent_lambda": 0.1,
+      "latent_layer": 6
+    }
+  },
+  "keep_checkpoints": false,
+  "notes": "Plan step after the Stage 1 smoke fail: second baseline for noise, and arm B on the shallower Depth Anything layer 6. 300 steps, not a PSNR verdict at 500."
+}

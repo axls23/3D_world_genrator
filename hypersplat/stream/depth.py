@@ -17,9 +17,10 @@ Everything but ``DepthEstimator.predict`` is numpy / OpenCV so it can be tested 
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -41,8 +42,13 @@ class DepthEstimator:
         self.device = device
         self.model = None
         self.ms = 0.0                 # running mean inference time
+        self._lock = threading.Lock()  # shared by the preview, the depth worker, the cold start
 
     def load(self):
+        with self._lock:
+            return self._load()
+
+    def _load(self):
         if self.model is None:
             import torch
             from transformers import DepthAnythingForDepthEstimation
@@ -57,7 +63,11 @@ class DepthEstimator:
         """RGB uint8 (H, W, 3) -> relative disparity float32 (H, W), larger = closer."""
         import torch
 
-        self.load()
+        with self._lock:
+            self._load()
+            return self._predict(rgb, torch)
+
+    def _predict(self, rgb: np.ndarray, torch) -> np.ndarray:
         h, w = rgb.shape[:2]
         s = self.input_side / max(h, w)
         ih, iw = (max(14, int(round(h * s / 14)) * 14), max(14, int(round(w * s / 14)) * 14))
@@ -235,6 +245,53 @@ def dense_depth(disp: np.ndarray, rgb: np.ndarray, pix: np.ndarray, z: np.ndarra
     valid &= flying_pixel_mask(np.where(valid, depth, zmax), max_rel_grad)
     depth[~valid] = 0.0
     return DepthResult(depth, valid, al, (time.time() - t0) * 1000, disp)
+
+
+def seed_depth(disp: np.ndarray, rgb: Optional[np.ndarray], median_depth: float = 2.0,
+               far_ratio: float = 8.0, guide_radius: int = 4,
+               max_rel_grad: float = 0.04) -> Tuple[np.ndarray, Dict]:
+    """Depth for the cold-start seed frame, before any ACE points exist to align against:
+    ``z = c / disp`` (relative disparity taken as shift-free inverse depth) with ``c`` putting
+    the median at ``median_depth`` - which sets the map's units. Sky / far background
+    (beyond ``far_ratio`` x median) and depth discontinuities are 0 (no target).
+    Returns (depth float32 like ``disp``, stats)."""
+    d = disp.astype(np.float32)
+    if guide_radius > 0 and rgb is not None:
+        grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        d = guided_filter(grey, d, guide_radius)
+    pos = np.isfinite(d) & (d > 0)
+    if pos.sum() < 100:
+        return np.zeros_like(d), {"valid": 0.0, "reason": "no positive disparity"}
+    with np.errstate(divide="ignore"):
+        z = np.where(pos, 1.0 / np.maximum(d, 1e-9), 0.0)
+    z *= median_depth / float(np.median(z[pos]))
+    valid = pos & (z < far_ratio * median_depth) & (z > median_depth / (4 * far_ratio))
+    valid &= flying_pixel_mask(np.where(valid, z, far_ratio * median_depth), max_rel_grad)
+    z = np.where(valid, z, 0.0).astype(np.float32)
+    return z, {"valid": float(valid.mean()), "median": float(np.median(z[valid])) if valid.any() else 0.0}
+
+
+# ============================================================================ render feedback
+def render_consistency(disp_real: np.ndarray, disp_render: np.ndarray, k: float = 3.0,
+                       floor: float = 0.1) -> Tuple[np.ndarray, float]:
+    """Per-pixel trust in a keyframe's monocular depth, from Depth Anything run on the camera
+    frame *and* on the 3DGS render at the same pose (closed feedback loop, once per epoch).
+
+    The same network sees both images, so where the map is right the two disparities agree up
+    to an affine map (the render's exposure / contrast differs a little). The robust affine fit
+    ``disp_render ~ a * disp_real + b`` removes that; the residual, in units of its own MAD,
+    is large exactly where the render's geometry (floaters, holes, wrong surfaces) differs
+    from what the camera saw. Returns (weight in [floor, 1], agreement score in [0, 1]) -
+    1 / (1 + (r / (k sigma))^2) per pixel, score = mean weight."""
+    a, b = disp_real.astype(np.float64).ravel(), disp_render.astype(np.float64).ravel()
+    step = max(1, a.size // 20000)
+    A = np.stack([a[::step], np.ones(len(a[::step]))], 1)
+    y = b[::step]
+    coef = _irls(A, y, np.ones(len(y)), 0.05 * max(float(np.std(y)), 1e-6))
+    r = disp_render - (coef[0] * disp_real + coef[1])
+    sigma = 1.4826 * float(np.median(np.abs(r - np.median(r)))) + 1e-6
+    w = np.clip(1.0 / (1.0 + (r / (k * sigma)) ** 2), floor, 1.0).astype(np.float32)
+    return w, float(w.mean())
 
 
 # ============================================================================ preview

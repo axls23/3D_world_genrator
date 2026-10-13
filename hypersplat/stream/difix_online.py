@@ -20,6 +20,7 @@ even the smallest fails, the round is skipped instead of killing training.
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,8 @@ class OnlineDifix:
         self.stop_reason: Optional[str] = None
         self.scale_idx = 0      # index into SCALES that last fit in VRAM
         self._round: Optional[dict] = None   # in-progress chunked round (begin/step/finish_round)
+        self._preload: Optional[threading.Thread] = None
+        self._preload_error: Optional[BaseException] = None
 
     def view_seed(self, loop: int, k: int) -> Optional[int]:
         """Seed of view k of round ``loop`` (None without a base seed)."""
@@ -87,17 +90,45 @@ class OnlineDifix:
         return (int(self.seed) * 1_000_003 + loop * 1_009 + k) % (2 ** 63)
 
     # ------------------------------------------------------------------ model residency
+    def _build_fixer(self, device: str):
+        from hypersplat.beta.difix.augment import DifixFixer  # resolves the shared HF cache
+
+        logger.info(f"[Difix-online] Loading {self.model_id} (seed {self.seed}, "
+                    f"{'posterior-mean' if self.deterministic else 'sampled'} latents, "
+                    f"control pooled over {self.pool_views or 1} views)")
+        fixer = DifixFixer(self.model_id, device)
+        fixer.deterministic = self.deterministic
+        return fixer
+
+    def preload(self):
+        """Load the model into pinned host memory on a background thread, so the first round
+        only pays a host-to-device copy instead of a cold load from disk (~10 s)."""
+        if self.fixer is not None or self._preload is not None:
+            return
+
+        def run():
+            t0 = time.time()
+            try:
+                self.fixer = self._build_fixer("cpu")
+                logger.info(f"[Difix-online] Preloaded into pinned host memory in {time.time() - t0:.1f} s")
+            except BaseException as e:   # reported (and retried) by the first round
+                self._preload_error = e
+
+        self._preload = threading.Thread(target=run, name="difix-preload", daemon=True)
+        self._preload.start()
+
     def _fixer_on_gpu(self):
         import torch
 
+        if self._preload is not None:
+            self._preload.join()
+            self._preload = None
+            if self._preload_error is not None:
+                logger.warning(f"[Difix-online] preload failed ({self._preload_error}); loading now")
+                self._preload_error = None
         torch.cuda.empty_cache()
         if self.fixer is None:
-            from hypersplat.beta.difix.augment import DifixFixer  # resolves the shared HF cache
-            logger.info(f"[Difix-online] Loading {self.model_id} (seed {self.seed}, "
-                        f"{'posterior-mean' if self.deterministic else 'sampled'} latents, "
-                        f"control pooled over {self.pool_views or 1} views)")
-            self.fixer = DifixFixer(self.model_id, self.device)
-            self.fixer.deterministic = self.deterministic
+            self.fixer = self._build_fixer(self.device)
         else:
             self.fixer.to(self.device)
         return self.fixer

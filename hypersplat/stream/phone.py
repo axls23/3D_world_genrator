@@ -140,6 +140,12 @@ def detect(sysfs: Path = Path("/sys/class/video4linux")) -> Dict:
     if problems:
         return {"mode": None, "device": None, "serial": None, "label": None, "problems": problems}
     serial = ready[0]["serial"]
+    sdk, release = android.sdk_version(serial, adb)
+    if sdk is not None and sdk < android.MIN_CAMERA_SDK:
+        return {"mode": None, "device": None, "serial": None, "label": None, "problems": [
+            f"phone {serial} runs Android {release or '?'} (API {sdk}): its camera can only be streamed "
+            f"over adb from Android 12 on. Use an IP camera app instead, e.g. 'IP Webcam': start its "
+            f"server, then `adb forward tcp:8085 tcp:8080` and run with source http://127.0.0.1:8085/video"]}
     return {"mode": "android", "device": f"android://{serial}", "serial": serial,
             "label": f"Android {serial} over adb (scrcpy server {version})", "problems": []}
 

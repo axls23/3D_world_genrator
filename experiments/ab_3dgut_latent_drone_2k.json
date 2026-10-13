@@ -1,0 +1,52 @@
+{
+  "name": "ab_3dgut_latent_drone_2k",
+  "output": "experiments/results/ab_3dgut_latent_drone_2k",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "map_cache": true,
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut",
+    "--trainer-arg",
+    "deterministic=True"
+  ],
+  "repeats": {
+    "baseline": 2,
+    "B_hold": 2,
+    "C_anneal": 2,
+    "C_dinov2": 1,
+    "C_layer6": 1
+  },
+  "variants": {
+    "baseline": {},
+    "B_hold": {
+      "latent_loss": true,
+      "latent_lambda": 0.1
+    },
+    "C_anneal": {
+      "latent_loss": true,
+      "latent_lambda": 0.1,
+      "latent_anneal_end": 1000
+    },
+    "C_dinov2": {
+      "latent_loss": true,
+      "latent_lambda": 0.1,
+      "latent_anneal_end": 1000,
+      "latent_backend": "dinov2"
+    },
+    "C_layer6": {
+      "latent_loss": true,
+      "latent_lambda": 0.1,
+      "latent_anneal_end": 1000,
+      "latent_layer": 6
+    }
+  },
+  "keep_checkpoints": false,
+  "notes": "Stage 1 of the JEPA/latent plan: auxiliary 1-cos loss between frozen-ViT patch features of render and target. B_hold: constant lambda 0.1 (gate: PSNR@500 >= baseline + 0.3 dB). C_anneal: lambda annealed to 0 at step 1000 (gate: PSNR@2k >= baseline 23.25 dB, floaters down, lower early grad variance). C_dinov2 / C_layer6 are controls for backend and depth (the depth-anything backbone is the default). Matched ACE map via map_cache; baseline repeats within ~0.02 dB. Compare train/grad_norm and train/grad2d_mean in TB."
+}

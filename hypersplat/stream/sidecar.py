@@ -49,6 +49,11 @@ class AceSidecar:
         # The trainer's allocator options (e.g. expandable_segments) are for its torch; the ACE
         # env runs torch 2.0, which rejects unknown options and would crash on start
         default_env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        # Under CUDA MPS (demo --mps) the sidecar is a client with its own SM / memory caps
+        if os.environ.get("HYPERSPLAT_SIDECAR_MPS_PCT"):
+            default_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = os.environ["HYPERSPLAT_SIDECAR_MPS_PCT"]
+        if os.environ.get("HYPERSPLAT_SIDECAR_MPS_MEM"):
+            default_env["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = os.environ["HYPERSPLAT_SIDECAR_MPS_MEM"]
         cmd = [python or default_python, "-u", str(SIDECAR_SCRIPT), "--work_dir", str(work_dir),
                "--hypotheses", str(hypotheses), "--threshold", str(threshold),
                "--max_points", str(max_points)]
@@ -120,12 +125,31 @@ class AceSidecar:
     def load(self, head: str, pose_file: str, frames: List[str], image_resolution: int = 480):
         self._send("load", frames, head=head, pose_file=pose_file, image_resolution=image_resolution)
 
+    def seed(self, frame: str, depth: str, **params):
+        """Cold start: ACE-Zero's seed stage on one frame (identity pose, targets from the
+        depth map ``depth``, .npy camera z), then continuous mapping (stream_sidecar.py)."""
+        self._send("seed", [frame], depth=depth, **params)
+
     def mapper(self, frames: List[str], **params):
         """Switch the sidecar to continuous mapping (scripts/acezero/stream_mapper.py)."""
         self._send("mapper", frames, **params)
 
+    def depth(self, frame: str, depth: str, depth_frac: float = 1.0, depth_weight: float = 50.0):
+        """Attach the aligned depth map (.npy, camera z in ACE units) of a registered frame to
+        the continuous mapper's loss (depth targets lifted by the frame's current pose)."""
+        self._send("depth", [frame], depth=depth, depth_frac=float(depth_frac),
+                   depth_weight=float(depth_weight))
+
     def tick(self, n: int = 1):
         self._send("tick", n=n)
+
+    def profile(self, units: int, out_dir: str):
+        """CUDA-profile the next ``units`` mapper units (hypersplat/stream/profiling.py)."""
+        self._send("profile", units=int(units), out=str(out_dir))
+
+    def rings(self, **paths: str):
+        """Pose / reloc rows go through these shared-memory rings from now on (ring.py)."""
+        self._send("rings", **paths)
 
     def forget(self, frames: List[str]):
         if frames:

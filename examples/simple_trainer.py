@@ -42,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
+from hypersplat.stream.latent import LatentEncoder, latent_cosine_loss, latent_lambda
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 from trainer_schedule import (
     PlateauDetector,
@@ -190,6 +191,10 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Training SSIM: "torchmetrics" (stateful metric module, generic depthwise convs, host syncs
+    # in its input checks) or "fused" (fused_ssim CUDA kernel, valid padding = torchmetrics'
+    # cropped border). Evaluation always uses torchmetrics
+    ssim_impl: Literal["torchmetrics", "fused"] = "torchmetrics"
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -208,6 +213,16 @@ class Config:
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
+    # L-BFGS (quasi-Newton, torch.optim.LBFGS + strong-Wolfe line search) polish of the Gaussians
+    # once densification has stopped (parameter count fixed). Each round runs on a FIXED batch of
+    # views so the objective is deterministic, and is reverted if it does not lower that loss
+    # (no loss spikes). Params are rescaled by their Adam lr so one curvature model fits all groups.
+    lbfgs_refine: bool = False
+    lbfgs_every: int = 50          # steps between rounds (Adam keeps running in between)
+    lbfgs_views: int = 4           # views in the fixed batch
+    lbfgs_max_iter: int = 8        # L-BFGS iterations per round
+    lbfgs_history: int = 5         # history size (memory: 2 * history * N * params-per-splat floats)
+    lbfgs_lr: float = 5.0          # first step moves the largest element by this many Adam-lr units
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -272,6 +287,21 @@ class Config:
     # Ramp: linearly increase depth_lambda over this many steps (None: schedule-relative, 500 @ 30k)
     depth_ramp_steps: Optional[int] = None
 
+    # Auxiliary latent loss: 1 - cos between frozen-ViT patch features of render and target
+    latent_loss: bool = False
+    # Weight for the latent loss
+    latent_lambda: float = 0.1
+    # Warm-up: no latent loss before this step
+    latent_warmup_steps: int = 0
+    # Linearly anneal latent_lambda to 0 at this step (0: hold constant)
+    latent_anneal_end: int = 0
+    # Feature backend: "depth_anything" (cached, depth-tuned) or "dinov2"
+    latent_backend: Literal["depth_anything", "dinov2"] = "depth_anything"
+    # ViT layer (-1: last; depth_anything accepts 3, 6, 9, 12)
+    latent_layer: int = -1
+    # Long side (px) of the images fed to the ViT
+    latent_side: int = 224
+
     # Early stopping on a plateau of the (EMA-smoothed) training loss
     early_stopping: bool = False
     # Stop after this many steps without relative improvement (None: ~7% of max_steps)
@@ -283,6 +313,10 @@ class Config:
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
+    # CUDA timeline: torch.profiler over profile_cuda_steps steps from profile_cuda_start
+    # (0 = off). Writes {result_dir}/profile/: Chrome trace, op table, sync/copy summary.
+    profile_cuda_steps: int = 0
+    profile_cuda_start: int = 500
     # Save training images to tensorboard
     tb_save_image: bool = False
 
@@ -343,6 +377,31 @@ class Config:
     # whole refits (hypersplat/stream/session.py, scripts/acezero/stream_mapper.py)
     stream_ace_mode: Literal["refit", "continuous"] = "refit"
     stream_ace_tick_every: int = 1
+    # Cold start (implies continuous mode): no bootstrap wait. The first keyframe's Depth
+    # Anything depth seeds the ACE map in seconds, training starts on it, and the mapper
+    # registers the following keyframes as they arrive (StreamConfig.cold_start). Focal: ACE's
+    # heuristic unless stream_cold_focal (px of the ACE-res frames)
+    stream_cold_start: bool = False
+    stream_cold_focal: Optional[float] = None
+    # Depth Anything keeps guiding the ACE mapper loss after the seed (needs stream_depth and
+    # continuous/cold-start mapping): aligned depth -> scene-coordinate targets under each frame's pose
+    stream_mapper_depth: bool = False
+    stream_mapper_depth_frac: float = 1.0
+    stream_mapper_depth_weight: float = 50.0
+    # Continuous mode: ACE pose / reloc rows through shared-memory rings instead of the pipe
+    stream_ring: bool = False
+    # Record the ACE events this run applied to {result_dir}/stream_events.arrows, or replay a
+    # recording instead of running ACE (identical pose stream across A/B arms)
+    stream_record: bool = False
+    # Device pose table (hypersplat/stream/cuda): ACE pose rows applied by a CUDA kernel on the
+    # training stream; real views render with the table's pose. stream_pose_alpha < 1 filters
+    # relocalization jitter (SO(3) x R^3 EMA, corrections pass whole); stream_tiers weights
+    # sampling by pose stability (provisional views x stream_tier_provisional_weight)
+    stream_device_poses: bool = False
+    stream_pose_alpha: float = 1.0
+    stream_tiers: bool = False
+    stream_tier_provisional_weight: float = 0.3
+    stream_replay: Optional[str] = None
     # File sources: steps to keep training once every keyframe is localized (None: to the
     # dynamic end below)
     stream_tail_steps: Optional[int] = None
@@ -389,7 +448,7 @@ class Config:
     # Dense depth for streams (hypersplat/stream/depth.py): Depth Anything V2 on each
     # registered keyframe, aligned to its ACE points, used to seed Gaussians densely and as a
     # log-depth loss. Keyframes per sync step, seed pixel stride, loss weight.
-    stream_depth: bool = False
+    stream_depth: bool = True   # --no-stream-depth turns it off
     stream_depth_model: str = "depth-anything/Depth-Anything-V2-Small-hf"
     stream_depth_per_sync: int = 3
     stream_depth_seed_stride: int = 8
@@ -398,6 +457,12 @@ class Config:
     # images need detail
     stream_depth_seed_cap_frac: float = 0.8
     stream_depth_lambda: float = 0.05
+    # Depth guard: Depth Anything supervises when the render drifts from it. The EMA of the
+    # log-depth error is compared to its running best; while it exceeds best x (1 + tol) the
+    # depth weight is boosted (x1.02 per step, up to guard_max), then decays back to 1.
+    stream_depth_guard: bool = True   # --no-stream-depth-guard turns it off
+    stream_depth_guard_tol: float = 0.25
+    stream_depth_guard_max: float = 8.0
     # Closed depth loop (with_eval3d: the rasterizer renders ray-hit depth and its variance).
     # A rendered pixel is "confident" when its depth std is below stream_depth_conf_tau x its
     # depth. conf_weight: weight the depth loss per pixel by 1 / (1 + (std / (tau z))^2)
@@ -406,6 +471,10 @@ class Config:
     stream_depth_conf_tau: float = 0.05
     stream_depth_conf_weight: bool = False
     stream_depth_render_align: int = 0
+    # Render feedback: every epoch, run Depth Anything on the 3DGS render of this many train
+    # keyframes (round-robin) next to their camera frame, and down-weight the depth loss where
+    # the two disagree (render_consistency). Runs with the ACE refit / 3DGUT training; 0 = off
+    stream_depth_feedback: int = 0
     # Per-keyframe corrections for streams (hypersplat/stream/training.StreamViewAdjust):
     # pose deltas (pose_opt_lr / pose_opt_reg / pose_warmup_steps / JOGS phases apply) and an
     # exposure gain + bias per keyframe (camera auto-exposure). Slots follow keyframe ids, so
@@ -738,7 +807,7 @@ class Runner:
         os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb", flush_secs=2)
 
         self.stream = None
         if cfg.stream_source:
@@ -774,6 +843,7 @@ class Runner:
                                      debug_dir=f"{cfg.result_dir}/difix_online",
                                      seed=cfg.difix_seed, deterministic=cfg.difix_deterministic,
                                      pool_views=cfg.difix_pool_views)
+            self.difix.preload()   # pinned host copy now; the first round only copies to the GPU
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -910,6 +980,7 @@ class Runner:
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
+        self._latent_enc = None  # LatentEncoder, built on first use (shares the depth model)
         self.lpips = None
         try:
             if cfg.lpips_net == "alex":
@@ -1013,19 +1084,26 @@ class Runner:
             record_seconds=cfg.stream_record_seconds, record_keyframes=cfg.stream_record_keyframes,
             depth=cfg.stream_depth, ace_deterministic=cfg.deterministic,
             refit_recipe=cfg.stream_refit_recipe, gauge_lock=cfg.stream_gauge_lock,
-            ace_mode=cfg.stream_ace_mode,
+            ace_mode="continuous" if cfg.stream_cold_start else cfg.stream_ace_mode, ring=cfg.stream_ring,
+            cold_start=cfg.stream_cold_start, cold_focal=cfg.stream_cold_focal,
+            mapper_depth=cfg.stream_mapper_depth, mapper_depth_frac=cfg.stream_mapper_depth_frac,
+            mapper_depth_weight=cfg.stream_mapper_depth_weight,
+            record=f"{cfg.result_dir}/stream_events.arrows" if cfg.stream_record else None,
+            replay=cfg.stream_replay,
         )
         self.depth_estimator = None
         if cfg.stream_depth:
             from hypersplat.stream.depth import DepthEstimator
             self.depth_estimator = DepthEstimator(cfg.stream_depth_model, device=str(self.device)).load()
         self.stream = StreamSession(scfg, profile=SceneProfile.from_env())
+        self.stream.depth_estimator = self.depth_estimator   # cold start seeds with it
         self.stream_stop_file = StopFile(cfg.result_dir)
         self.stream.start()
         self.dashboard = None
         if cfg.stream_dashboard_port:
             from hypersplat.stream.dashboard import Dashboard
-            self.dashboard = Dashboard(self.stream, cfg.stream_dashboard_port, cfg.stream_dashboard_host).start()
+            self.dashboard = Dashboard(self.stream, cfg.stream_dashboard_port, cfg.stream_dashboard_host,
+                                  tb_dir=f"{cfg.result_dir}/tb").start()
             print(f"[Stream] Dashboard (3D viewer | camera): {self.dashboard.url}", flush=True)
         print("[Stream] Waiting for the first ACE map...")
         preview = None
@@ -1055,6 +1133,12 @@ class Runner:
                                        pseudo_share=cfg.difix_pseudo_share,
                                        prefetch=0 if cfg.deterministic else 2)
         self.valset = StreamValSet(self.stream)
+        self.device_poses = None
+        if cfg.stream_device_poses or cfg.stream_tiers or cfg.stream_pose_alpha < 1.0:
+            from hypersplat.stream.training import DevicePoses
+            self.device_poses = DevicePoses(self.stream, self.trainset, alpha=cfg.stream_pose_alpha,
+                                            tiers=cfg.stream_tiers,
+                                            provisional_weight=cfg.stream_tier_provisional_weight)
         self.stream_voxel = seed_voxel_size(self.parser.points, self.parser.scene_scale)
         self.stream_horizon = StreamHorizon(cfg.max_steps, getattr(cfg.strategy, "refine_stop_iter", cfg.max_steps),
                                             cfg.stream_extend_steps, cfg.stream_max_steps_cap)
@@ -1422,11 +1506,12 @@ class Runner:
         realigned = self._realign_depth() if self.depth_estimator is not None else None
         if realigned is not None and cfg.stream_depth_render_align > 0 and cfg.with_eval3d:
             realigned += self._render_align_depth(step)
+        fb = self._depth_feedback(step) if self.depth_estimator is not None and cfg.stream_depth_feedback > 0 else None
         t2 = time.time()
         refit = s.request_refit(cfg.stream_cycle_refit_min)
         msg = (f"[Cycle] epoch {self._epoch} @ step {step} ({n_train} keyframes): difix {difix} "
                f"{(t1 - t0):.1f}s | depth {'-' if realigned is None else f're-aligned {realigned}'} "
-               f"{(t2 - t1) * 1000:.0f}ms | ace {'refit started' if refit else s.stats()['job'] or 'idle'}")
+               f"{(t2 - t1) * 1000:.0f}ms{'' if fb is None else f' (feedback {fb[0]} views, agree {fb[1]:.2f})'} | ace {'refit started' if refit else s.stats()['job'] or 'idle'}")
         if self._epoch <= 3 or self._epoch % 10 == 0 or refit or (realigned or 0) > 0:
             print("\n" + msg)
         if self.dashboard is not None:
@@ -1465,6 +1550,39 @@ class Runner:
         self.stream.set_pseudo(self._pseudo_pool)
         return f"+{len(views)} ({len(self._pseudo_pool)} pooled)"
 
+    @torch.no_grad()
+    def _depth_feedback(self, step: int) -> Tuple[int, float]:
+        """Depth Anything on the 3DGS render and on the camera frame of a few train keyframes
+        (round-robin, half resolution); their disagreement becomes the per-pixel trust of the
+        depth loss (hypersplat/stream/depth.render_consistency)."""
+        from hypersplat.stream.depth import render_consistency
+        from hypersplat.stream.schema import select_rows
+
+        cfg, s = self.cfg, self.stream
+        _, table = s.views()
+        table = select_rows(table, kind="real", split="train")
+        if table.num_rows == 0 or s.transform is None:
+            return 0, 0.0
+        kids = table.column("kid").to_pylist()
+        rr = getattr(self, "_feedback_rr", 0) % len(kids)
+        order = kids[rr:] + kids[:rr]
+        self._feedback_rr = rr + cfg.stream_depth_feedback
+        row = {kid: i for i, kid in enumerate(kids)}
+        c2ws = np.array(table.column("c2w").to_pylist()).reshape(-1, 4, 4)
+        K0 = np.array(table.column("K")[0].as_py()).reshape(3, 3)
+        W0, H0 = int(table.column("width")[0].as_py()), int(table.column("height")[0].as_py())
+        n, score = 0, 0.0
+        for kid, disp, _, _, _ in s.anchor_jobs(order)[: cfg.stream_depth_feedback]:
+            h, w = disp.shape            # cached disparity is half res: render at that size
+            K = K0.copy()
+            K[0] *= w / W0
+            K[1] *= h / H0
+            rgb = self._render_uint8(c2ws[row[kid]], K, w, h, step)
+            wmap, sc = render_consistency(disp, self.depth_estimator.predict(rgb))
+            s.set_depth_weight(kid, wmap, sc)
+            n, score = n + 1, score + sc
+        return n, (score / n if n else 0.0)
+
     def _realign_depth(self) -> int:
         """Re-fit cached depth of keyframes ACE re-localized since their last alignment."""
         from hypersplat.stream.depth import dense_depth
@@ -1479,6 +1597,29 @@ class Runner:
         return n
 
     @torch.no_grad()
+    def _depth_guard_update(self, err: float, step: int) -> float:
+        """Depth-weight multiplier from the render-vs-Depth-Anything error trend (see
+        stream_depth_guard)."""
+        cfg = self.cfg
+        g = getattr(self, "_dguard", None)
+        if g is None:
+            g = self._dguard = {"ema": err, "best": err, "boost": 1.0, "n": 0}
+        if err != err or err == float("inf"):
+            return g["boost"]
+        g["n"] += 1
+        g["ema"] = 0.98 * g["ema"] + 0.02 * err
+        if g["n"] > 50:   # let the EMA settle before it defines "best"
+            # best creeps up so new keyframes / re-aligned maps can reset the reference
+            g["best"] = min(g["best"] * 1.0005, g["ema"])
+            if g["ema"] > g["best"] * (1.0 + cfg.stream_depth_guard_tol):
+                g["boost"] = min(cfg.stream_depth_guard_max, g["boost"] * 1.02)
+            else:
+                g["boost"] = max(1.0, g["boost"] * 0.99)
+        if self.writer is not None and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+            self.writer.add_scalar("train/depth_guard_boost", g["boost"], step)
+            self.writer.add_scalar("train/depth_err_ema", g["ema"], step)
+        return g["boost"]
+
     def _render_align_depth(self, step: int) -> int:
         """Closed depth loop: re-fit the monocular depth of a few train keyframes (round-robin)
         to confident pixels of the current render as well as ACE's points; kept only when it
@@ -1915,6 +2056,115 @@ class Runner:
                   pass
         return render_colors, render_alphas, info
 
+    def lbfgs_refine_round(self, step: int, next_batch):
+        """One L-BFGS round on a fixed view batch; reverts if it does not reduce that batch's loss.
+
+        ``next_batch()`` returns one training batch (the loop's own loader, so stream runs get
+        their pose/exposure handling)."""
+        cfg, device = self.cfg, self.device
+        names = list(self.splats.keys())
+        views = []
+        for _ in range(cfg.lbfgs_views):
+            d = next_batch()
+            cam = d["camtoworld"].to(device)
+            if getattr(self, "device_poses", None) is not None and "kid" in d:
+                cam = self.device_poses.camtoworlds(d["kid"], cam)
+            iid = d["image_id"].to(device)
+            slots = None
+            with torch.no_grad():
+                if cfg.pose_opt:
+                    cam = self.pose_adjust(cam, iid)
+                if self.view_adjust is not None and "kid" in d:
+                    slots = self.view_adjust.slot_ids(d["kid"], cam, d.get("is_pseudo"))
+                    cam = self.view_adjust.adjust_pose(cam, slots)
+            views.append((cam, d["K"].to(device), d["image"].to(device) / 255.0, iid, slots))
+        sh_degree = cfg.sh_degree
+
+        # Rescale each group by its Adam lr: u = p / s. Gradients wrt u are g * s.
+        scale = {k: max(float(self.optimizers[k].param_groups[0]["lr"]), 1e-6) for k in names}
+        u = {k: torch.nn.Parameter(self.splats[k].detach().clone() / scale[k]) for k in names}
+        backup = {k: self.splats[k].detach().clone() for k in names}
+
+        def evaluate(backward: bool) -> float:
+            total = 0.0
+            for cam, K, px, iid, slots in views:
+                with torch.set_grad_enabled(backward):
+                    colors, _, _ = self.rasterize_splats(
+                        camtoworlds=cam, Ks=K, width=px.shape[2], height=px.shape[1],
+                        sh_degree=sh_degree, near_plane=cfg.near_plane, far_plane=cfg.far_plane,
+                        image_ids=iid, render_mode="RGB")
+                    if slots is not None:
+                        colors = self.view_adjust.adjust_colors(colors, slots)
+                    colors = torch.nan_to_num(colors, nan=0.0, posinf=1.0, neginf=0.0)
+                    if cfg.ssim_impl == "fused":
+                        from fused_ssim import fused_ssim
+                        ssim = fused_ssim(colors.permute(0, 3, 1, 2), px.permute(0, 3, 1, 2), padding="valid")
+                    else:
+                        ssim = self.ssim(colors.permute(0, 3, 1, 2), px.permute(0, 3, 1, 2))
+                    loss = ((1.0 - cfg.ssim_lambda) * F.l1_loss(colors, px)
+                            + cfg.ssim_lambda * (1.0 - ssim)) / len(views)
+                    if cfg.opacity_reg > 0.0:
+                        loss = loss + cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean() / len(views)
+                    if cfg.scale_reg > 0.0:
+                        loss = loss + cfg.scale_reg * torch.exp(
+                            torch.clamp(self.splats["scales"], max=10.0)).mean() / len(views)
+                if backward:
+                    loss.backward()
+                total += float(loss)
+            return total
+
+        def closure():
+            for k in names:
+                self.splats[k].data.copy_(u[k].detach() * scale[k])
+                self.splats[k].grad = None
+            loss = evaluate(True)
+            ok = math.isfinite(loss)
+            for k in names:
+                g = self.splats[k].grad
+                if g is None or not ok:
+                    u[k].grad = torch.zeros_like(u[k])
+                else:
+                    u[k].grad = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) * scale[k]
+                self.splats[k].grad = None
+            return torch.tensor(loss if ok else 1e6, device=device)
+
+        try:
+            before = float(closure())
+            # torch's first L-BFGS step is lr / |g|_1: with ~1e7 parameters that is ~1e-7 and a short
+            # round never recovers. Pick the variable scale a so the first step moves the largest
+            # element by lbfgs_lr Adam-lr units (a = lr * |g|_1 / |g|_inf), then run with lr = 1.
+            l1 = sum(float(x.grad.abs().sum()) for x in u.values())
+            linf = max(float(x.grad.abs().max()) for x in u.values())
+            if not (l1 > 0 and linf > 0 and math.isfinite(l1)):
+                raise FloatingPointError("degenerate gradient")
+            a = cfg.lbfgs_lr * l1 / linf
+            for k in names:
+                scale[k] *= a
+                u[k].data.copy_(backup[k] / scale[k])
+            opt = torch.optim.LBFGS(list(u.values()), lr=1.0, max_iter=cfg.lbfgs_max_iter,
+                                    max_eval=int(cfg.lbfgs_max_iter * 2.5), history_size=cfg.lbfgs_history,
+                                    line_search_fn="strong_wolfe")
+            opt.step(closure)
+            for k in names:
+                self.splats[k].data.copy_(u[k].detach() * scale[k])
+            after = evaluate(False)
+        except FloatingPointError:
+            before, after = 0.0, float("inf")
+        except torch.cuda.OutOfMemoryError:
+            before, after = 0.0, float("inf")
+            torch.cuda.empty_cache()
+        bad = (not math.isfinite(after)) or after >= before
+        for k in names:
+            if bad or not torch.isfinite(self.splats[k]).all():
+                self.splats[k].data.copy_(backup[k])
+            self.splats[k].grad = None
+        del u, backup
+        # exposure/pose-adjust modules saw gradients from the closure; the main optimizers must not
+        for o in self.pose_optimizers + self.app_optimizers + getattr(self, "stream_exposure_optimizers", []):
+            o.zero_grad(set_to_none=True)
+        if step % (cfg.lbfgs_every * 10) == 0 or bad:
+            print(f"[LBFGS] step {step}: batch loss {before:.5f} -> {after:.5f}" + (" (reverted)" if bad else ""))
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -2112,6 +2362,7 @@ class Runner:
             pbar = tqdm.tqdm(range(init_step, max_steps))
         difix_deferred = False
         for step in pbar:
+            self._profile_tick(step)
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -2119,6 +2370,10 @@ class Runner:
                 tic = time.time()
 
             stream_stop = False
+            if self.stream is not None:
+                self.stream.trainer_step = step
+                if getattr(self, "device_poses", None) is not None:
+                    self.device_poses.sync(step)
             if self.stream is not None and step % cfg.stream_ace_tick_every == 0:
                 # Continuous ACE mapping: the sidecar runs this step's mapping work on the GPU
                 # alongside the 3DGS step (no-op in refit mode)
@@ -2154,6 +2409,8 @@ class Runner:
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            if getattr(self, "device_poses", None) is not None and "kid" in data:
+                camtoworlds = camtoworlds_gt = self.device_poses.camtoworlds(data["kid"], camtoworlds)
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
@@ -2257,9 +2514,14 @@ class Runner:
             
             l1loss = F.l1_loss(colors, pixels)
             view_l1 = (colors.detach() - pixels).abs().mean(dim=(1, 2, 3)) if self.stream is not None else None
-            ssimloss = 1.0 - self.ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
-            )
+            if cfg.ssim_impl == "fused":
+                from fused_ssim import fused_ssim
+                ssimloss = 1.0 - fused_ssim(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2),
+                                            padding="valid")
+            else:
+                ssimloss = 1.0 - self.ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+                )
             ssimloss = torch.nan_to_num(ssimloss, nan=0.0, posinf=0.0, neginf=0.0)
             
             # RGB branch always exists in the graph, but weight can be 0.0
@@ -2343,7 +2605,10 @@ class Runner:
                 valid = (stream_depth_gt > 0) & (pred > 1e-4)
                 if valid.any():
                     err = (torch.log(pred[valid]) - torch.log(stream_depth_gt[valid])).abs()
-                    if cfg.stream_depth_conf_weight and "render_depth_var" in info:
+                    fbw = data["depth_w"].to(device)[valid] if cfg.stream_depth_feedback > 0 and "depth_w" in data else None
+                    if fbw is not None and not (cfg.stream_depth_conf_weight and "render_depth_var" in info):
+                        sdl = (err * fbw).sum() / fbw.sum().clamp(min=1e-6)
+                    elif cfg.stream_depth_conf_weight and "render_depth_var" in info:
                         # Fuzzy render pixels (depth spread over several surfaces) trust the
                         # monocular target less
                         var = F.adaptive_avg_pool2d(info["render_depth_var"].permute(0, 3, 1, 2),
@@ -2351,11 +2616,16 @@ class Runner:
                         rel_std = var.sqrt() / pred.clamp(min=1e-4)
                         wgt = (1.0 / (1.0 + (rel_std / cfg.stream_depth_conf_tau) ** 2)).clamp(min=0.1)
                         wgt = wgt.detach()[valid]
+                        if fbw is not None:
+                            wgt = wgt * fbw
                         sdl = (err * wgt).sum() / wgt.sum()
                     else:
                         sdl = err.mean()
                     ramp = min(1.0, (step - cfg.depth_warmup_steps) / max(cfg.depth_ramp_steps, 1))
-                    loss = loss + cfg.stream_depth_lambda * ramp * torch.nan_to_num(sdl, nan=0.0, posinf=0.0)
+                    boost = 1.0
+                    if cfg.stream_depth_guard:
+                        boost = self._depth_guard_update(float(sdl), step)
+                    loss = loss + cfg.stream_depth_lambda * ramp * boost * torch.nan_to_num(sdl, nan=0.0, posinf=0.0)
                     self._stream_depth_loss = float(sdl)
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -2411,7 +2681,25 @@ class Runner:
             # Per-image weight (ACE-Zero pose confidence / pseudo-view trust), default 1.0
             view_weight = data["loss_weight"].float().mean().to(device) if "loss_weight" in data else 1.0
             loss = loss + ((1.0 - cfg.ssim_lambda) * l1loss + cfg.ssim_lambda * ssimloss) * rgb_weight * view_weight
-            
+
+            # Latent (frozen-ViT feature) loss: smoother, wider-basin gradient than L1/SSIM.
+            # Inside the graph before backward() so it also shapes means2d grads / densification.
+            latent_loss_val = None
+            if cfg.latent_loss:
+                lam = latent_lambda(step, cfg.latent_lambda, cfg.latent_warmup_steps, cfg.latent_anneal_end)
+                if lam > 0.0:
+                    if self._latent_enc is None:
+                        shared = getattr(getattr(self, "depth_estimator", None), "model", None)
+                        self._latent_enc = LatentEncoder(
+                            input_side=cfg.latent_side, layer=cfg.latent_layer,
+                            backend=cfg.latent_backend, device=str(device),
+                            model=shared if cfg.latent_backend == "depth_anything" else None,
+                        ).load()
+                    f_render = self._latent_enc.features(colors.permute(0, 3, 1, 2).clamp(0, 1))
+                    f_target = self._latent_enc.target_features(pixels.permute(0, 3, 1, 2))
+                    latent_loss_val = latent_cosine_loss(f_render, f_target)
+                    loss = loss + lam * latent_loss_val * view_weight
+
             # regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
@@ -2457,7 +2745,7 @@ class Runner:
                     param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
             
             # PREVENT NaN: Aggressive gradient clipping (balanced: 0.1)
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in self.splats.values()], max_norm=0.1
             )
 
@@ -2507,8 +2795,22 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                # pre-clip total grad norm (clip_grad_norm_ returns the unclipped norm)
+                self.writer.add_scalar("train/grad_norm", grad_norm.item(), step)
+                grad2d_state = self.strategy_state.get("grad2d")
+                if grad2d_state is not None:
+                    self.writer.add_scalar(
+                        "train/grad2d_mean", grad2d_state.mean().item(), step
+                    )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if latent_loss_val is not None:
+                    self.writer.add_scalar("train/latent_loss", latent_loss_val.item(), step)
+                    self.writer.add_scalar(
+                        "train/latent_lambda",
+                        latent_lambda(step, cfg.latent_lambda, cfg.latent_warmup_steps, cfg.latent_anneal_end),
+                        step,
+                    )
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -2719,6 +3021,17 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
+            if (cfg.lbfgs_refine and step >= getattr(cfg.strategy, "refine_stop_iter", 0)
+                    and step % cfg.lbfgs_every == 0 and step < max_steps - 1):
+                def _next_batch():
+                    nonlocal trainloader_iter
+                    try:
+                        return next(trainloader_iter)
+                    except StopIteration:
+                        trainloader_iter = iter(trainloader)
+                        return next(trainloader_iter)
+                self.lbfgs_refine_round(step, _next_batch)
+
             # Online Difix: pseudo views from the live model replace the previous round's.
             # A round deferred while an ACE refit holds the GPU is retried every step.
             if self.stream is not None and cfg.stream_cycle and not is_final_step:
@@ -2780,6 +3093,43 @@ class Runner:
 
             if is_final_step:
                 break
+        self._profile_stop()
+
+    def _profile_tick(self, step: int):
+        """Start / stop the CUDA profiler window (profile_cuda_steps > 0)."""
+        cfg = self.cfg
+        if cfg.profile_cuda_steps <= 0 or self.world_rank != 0:
+            return
+        prof = getattr(self, "_cuda_prof", None)
+        if prof is None and step == cfg.profile_cuda_start:
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize()
+            # HYPERSPLAT_PROFILE_STACK=1: Python call stacks too (to find host-sync call sites)
+            self._cuda_prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                      with_stack=os.environ.get("HYPERSPLAT_PROFILE_STACK") == "1")
+            self._cuda_prof.__enter__()
+            self._cuda_prof_steps = [(step, time.time())]
+            print(f"\n[Profile] CUDA profiler on for {cfg.profile_cuda_steps} steps from step {step}")
+            if self.stream is not None and hasattr(self.stream.sidecar, "profile"):
+                # Same window in the ACE sidecar (a mapper unit per trainer step)
+                self.stream.sidecar.profile(cfg.profile_cuda_steps, f"{cfg.result_dir}/profile")
+        elif prof is not None:
+            self._cuda_prof_steps.append((step, time.time()))
+            if step >= cfg.profile_cuda_start + cfg.profile_cuda_steps:
+                self._profile_stop()
+
+    def _profile_stop(self):
+        prof = getattr(self, "_cuda_prof", None)
+        if prof is None:
+            return
+        self._cuda_prof = None
+        torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        from hypersplat.stream.profiling import write_profile
+
+        out = write_profile(prof, self._cuda_prof_steps, f"{self.cfg.result_dir}/profile", "trainer")
+        print(f"[Profile] wrote {out}")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -3314,6 +3664,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         finally:
             if runner.stream is not None:
                 print(f"[Stream] Final: {runner.stream.stats()}")
+                if getattr(runner, "device_poses", None) is not None:
+                    print(f"[Stream] Device poses: {runner.device_poses.stats()}")
                 if getattr(runner, "walk", None) is not None and runner.walk.bounds is not None:
                     runner.walk.bounds.save_npz(f"{cfg.result_dir}/walk_bounds.npz")
                 runner.stream.stop()

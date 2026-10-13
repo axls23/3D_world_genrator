@@ -68,6 +68,22 @@ def adb_devices(adb: Optional[str] = None) -> list:
     return [{"serial": p[0], "state": p[1]} for p in (l.split() for l in out.splitlines()[1:]) if len(p) >= 2]
 
 
+MIN_CAMERA_SDK = 31   # scrcpy camera capture needs Android 12 (API 31)
+
+
+def sdk_version(serial: str, adb: Optional[str] = None) -> Tuple[Optional[int], str]:
+    """(API level, Android release) of an authorised device; (None, "") if unknown."""
+    adb = adb or adb_path()
+    if not adb:
+        return None, ""
+    try:
+        out = subprocess.run([adb, "-s", serial, "shell", "getprop ro.build.version.sdk; getprop ro.build.version.release"],
+                             capture_output=True, text=True, timeout=20).stdout.split()
+        return int(out[0]), (out[1] if len(out) > 1 else "")
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return None, ""
+
+
 def parse_android_spec(spec: str) -> Dict:
     u = urlparse(spec)
     q = {k: v[-1] for k, v in parse_qs(u.query).items()}

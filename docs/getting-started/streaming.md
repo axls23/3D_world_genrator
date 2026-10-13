@@ -40,6 +40,36 @@ cable (webcam mode or USB debugging). If neither is connected the script asks yo
 in and waits, printing what is missing (e.g. an unaccepted USB-debugging prompt); without a
 terminal it exits instead. `--camera N` / `--builtin` choose a camera explicitly.
 
+### Defaults of the demo script
+
+`demo/run_stream_demo.sh` composes the stream defaults; the pipeline and trainer keep stock
+defaults (no 3DGUT, cold start, L-BFGS or Difix), so the script is the place to change the demo.
+Every run prints the effective set on start (`config :` and `command:` lines).
+
+| Default | Setting | Opt out |
+|---|---|---|
+| Cold start (no ACE bootstrap wait, continuous ACE) | on | `--no-cold-start`; off automatically with `--map-cache` / `--replay` |
+| Mapper depth prior (weight 50) | on | `--no-mapper-depth` |
+| 3DGUT (`--with_ut`) | on | `--no-ut` (`--refine-poses` also turns it off) |
+| L-BFGS polish every 50 steps | on | `--no-lbfgs` |
+| Online Difix (share 0.15, from 50 % of the run) | on | `--no-difix` |
+| Seed 42 | on | `--seed N` |
+| Step ceiling | auto: 7000 video / 10000 live | `--steps N` |
+| MPS, refit recipe, gauge lock, ring, device poses, record | off | `--mps`, `--refit-recipe ace0`, `--gauge-lock`, `--cuda-ring`, `--device-poses`, `--record` |
+
+Evidence behind these defaults, with the status of each number:
+
+| Setting | Measured | Status |
+|---|---|---|
+| Mapper depth, hard prior (ACE depth loss) | inliers 84 % -> 43 %, -2.3 dB | measured; not the default prior |
+| Mapper depth, soft prior (the default) | `ab_cold_depth`: -2.27 dB (n=1); `ab_cold_depth2`: 23.40 vs 23.20 dB, but LPIPS 0.501 vs 0.431 (n=2) | mixed; unverified |
+| Online Difix | no results file in the repo for the drone 2k A/B | unverified |
+| L-BFGS polish | +0.003 dB on the 2k drone run | within noise |
+| 3DGUT | the `--with_ut` help says "same quality as standard" on the drone A/B; no stream-demo result file | unverified for the demo |
+| Deterministic mode | ~0.2 dB lower (help text); no results file | unverified |
+
+Changing a default should be backed by an A/B run under `experiments/` before it lands here.
+
 **Stop recording.** A live source otherwise keeps adding frames for as long as it runs. Press
 `s` in the terminal, click *Stop recording* in the dashboard, `touch
 <output_dir>/results/stream_3dgs/STOP_RECORDING`, or set `--record-seconds S` /
@@ -108,20 +138,28 @@ Endpoints: `/` split page, `/frame.jpg` newest frame, `/feed.mjpg` MJPEG (VLC et
 
 ## Run it
 
+Native (no Docker). The script sets `HF_HOME` to `../hf_cache` when it exists; the trainer
+needs the repo root on `PYTHONPATH` (the script sets it for the trainer only).
+
 ```bash
-# Recorded video, just in time (frames as fast as ACE keeps up)
-python scripts/pipeline/automated_intelligent_pipeline.py demo/input/drone_demo.mp4 \
-    --stream --difix-online --max_steps 7000 --output_dir demo/output/stream
+# Final demo, recorded video, with the default set above (the command the script prints)
+demo/run_stream_demo.sh --video
+
+# Same, 2000 steps (a quick check, not a quality run)
+demo/run_stream_demo.sh --video --steps 2000
 
 # Rehearse the live path on a recording (a 30 fps "camera" that drops frames when busy)
-... drone_demo.mp4 --stream --stream-pace realtime --difix-online
+demo/run_stream_demo.sh --video --realtime
 
-# Live sources (run until --max_steps, default 10000 - a hard ceiling - or a graceful stop)
-... 0 --stream                          # first local camera
-... /dev/video2 --stream
-... rtsp://192.168.1.20:8554/cam --stream
-... flight://0.0.0.0:8815 --stream      # wait for an external camera over Arrow Flight
+# Live sources: the script's defaults apply; --steps is a ceiling (default 10000)
+demo/run_stream_demo.sh --camera /dev/video2
+demo/run_stream_demo.sh rtsp://192.168.1.20:8554/cam
+demo/run_stream_demo.sh flight://0.0.0.0:8815
 ```
+
+Calling the pipeline directly gives stock defaults, not the demo set. Add the flags explicitly
+if you need them (`--stream --difix-online --with_ut --stream-depth ...`); see
+`demo/run_stream_demo.sh --help` for the trainer-arg equivalents.
 
 Stop a live run gracefully (final checkpoint, PLY and eval are still written):
 `touch <output_dir>/results/stream_3dgs/STOP` or `POST /api/stream/stop` (only a STOP written
@@ -180,7 +218,9 @@ count, longest chunk and wall time (also in `scene_profile.json` under `difix.ro
 
 ## Dense depth, pose and exposure refinement (streams)
 
-- `--depth` (demo) / `--stream-depth`: Depth Anything V2 Small on each registered keyframe,
+- Depth is on in the demo through the mapper prior (`--no-mapper-depth` turns that off; see the
+  defaults table for the evidence). `--depth` (demo) / `--stream-depth` (pipeline, opt-in):
+  Depth Anything V2 Small on each registered keyframe,
   sharpened with a guided filter, aligned to the keyframe's ACE points (robust affine fit in
   inverse depth, scored on held-out points), edge pixels dropped. Seeds new Gaussians densely
   (until 80 % of the Gaussian cap) and adds a log-depth loss. Drone clip @7k: 23.99 -> 24.99 dB,
@@ -195,7 +235,9 @@ count, longest chunk and wall time (also in `scene_profile.json` under `difix.ro
 
 ## ACE refits: recipe, gauge lock, continuous mapping (opt-in)
 
-All three are off by default and not yet A/B-tested on 3DGS quality. Measurements are from
+The refit recipe, gauge lock and continuous mapping are not A/B-tested on 3DGS quality.
+Continuous mapping is on by default in the demo (through cold start); the other two are opt-in
+(`--refit-recipe ace0`, `--gauge-lock`). Measurements are from
 `scripts/experiments/ace_refit_bench.py` (the ACE loop alone; Kenilworth clip, 400 keyframes,
 cached bootstrap map).
 
@@ -259,6 +301,8 @@ image ops (OpenCV) were already native.
 - Per-image modules (`--pose_opt`, `--app_opt`, bilateral grid, masks, depth loss) are
   disabled for streams: they are sized once while the keyframe set keeps changing. ACE
   refits refine poses instead.
-- The first map needs `stream_bootstrap_frames` (24) keyframes with some parallax, then
-  ~70 s of ACE training on this GPU before training starts.
+- Without cold start (`--no-cold-start`, or with `--map-cache` / `--replay`), the first map
+  needs `stream_bootstrap_frames` (24) keyframes with some parallax, then ~70 s of ACE training
+  on this GPU before training starts. With the demo default (cold start) the first keyframe's
+  depth seeds the map within seconds instead.
 - One camera (single intrinsics) per stream.

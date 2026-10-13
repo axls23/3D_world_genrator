@@ -9,6 +9,10 @@ Lifecycle
   1. bootstrap   buffer ``bootstrap_frames`` keyframes (pinned), build the first ACE map with
                  hybrid ACE-Zero, localize them, freeze the world normalization from it
                  (same transform the COLMAP Parser uses, so all downstream code agrees).
+                 ``cold_start`` instead: no bootstrap wait. The first keyframe's Depth Anything
+                 depth seeds a fresh ACE head at the identity pose (ACE-Zero's seed stage, a
+                 few seconds), the normalization is frozen from that one camera, training
+                 starts, and continuous mapping registers the other keyframes as they arrive.
   2. track       localize every new keyframe (~35 ms) against the current map; registered
                  ones contribute seed points for new Gaussians.
   3. grow        when frames stop registering (the camera left the mapped area) or enough
@@ -44,6 +48,7 @@ import numpy as np
 import pyarrow as pa
 
 from .gauge import Sim3, fit_sim3
+from .ring import DELTA_DTYPE, KIND_POSE, SEED_DTYPE, ShmRing
 from .keyframes import KeyframeGate
 from .schema import VIEW_SCHEMA
 from .sidecar import AceSidecar
@@ -105,6 +110,13 @@ class StreamConfig:
     mapper_passes: int = 2              # augmented encodings per frame in the patch buffer
     mapper_samples_per_pass: int = 1024
     max_inflight: int = 4               # localize requests in flight (fast pace back-pressure)
+    # Continuous mode: pose / reloc rows (+ seed points) come through shared-memory rings
+    # (hypersplat/stream/ring.py) instead of the Arrow pipe once mapping starts
+    ring: bool = False
+    # Record every ACE event the session applies (with the trainer step) to this Arrow file, or
+    # replay such a recording instead of running ACE (hypersplat/stream/record.py)
+    record: Optional[str] = None
+    replay: Optional[str] = None
     seed_points_per_frame: int = 1500
     flight_port: Optional[int] = None   # also serve views/stats over Arrow Flight
     work_dir: Optional[str] = None      # default /dev/shm/hypersplat-stream-<pid>
@@ -123,6 +135,28 @@ class StreamConfig:
     # Train ACE maps (bootstrap and refits) with deterministic cuDNN kernels: the autotuner
     # picks algorithms by timing, so a map built while 3DGS shares the GPU varies run to run
     ace_deterministic: bool = False
+    # Cold start (needs ace_mode "continuous"): no bootstrap. The sharpest of the first
+    # ``cold_seed_frames`` keyframes seeds the map (identity pose, Depth Anything depth with
+    # its median at ``cold_seed_depth`` ACE units - shift-free inverse depth), training starts
+    # on it, and the continuous mapper registers the rest. ``cold_focal``: focal in px of the
+    # ACE-res frames (default ACE's heuristic, 0.7 x image diagonal; it is not refined)
+    cold_start: bool = False
+    cold_seed_frames: int = 1
+    cold_seed_depth: float = 2.0
+    cold_focal: Optional[float] = None
+    cold_retries: int = 3               # seed attempts (next keyframe each) before failing
+    seed_slots: int = 8                 # mapper slots of seed-frame augmentations (x passes)
+    seed_min_iters: int = 300
+    seed_max_iters: int = 2000
+    seed_min_inliers: float = 0.5       # batch inlier EMA (10 px) that ends the seed stage
+    seed_lr: float = 5e-3
+    seed_keep_depth: bool = False       # keep the depth targets after the seed stage
+    # Continuous mapper: every aligned depth map (Depth Anything x ACE points) joins the mapper
+    # loss as depth-lifted scene-coordinate targets under the frame's current pose, so Depth
+    # Anything keeps guiding the head (and the relocalized poses) after the seed. Needs ``depth``.
+    mapper_depth: bool = False
+    mapper_depth_frac: float = 1.0      # share of depth-target rows used per mapper step
+    mapper_depth_weight: float = 50.0   # soft prior weight (loss units per scene unit)
 
 
 def normalization_transform(c2ws: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -139,6 +173,28 @@ def normalization_transform(c2ws: np.ndarray, points: np.ndarray) -> np.ndarray:
     T = T2 @ T1
     if np.median(pts[:, 2]) > np.mean(pts[:, 2]):  # up-side-down fix, as in the Parser
         T = np.diag([1.0, -1.0, -1.0, 1.0]) @ T
+    return T
+
+
+def cold_normalization_transform(c2w: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """World normalization from one camera (cold start), in the Parser's convention: the
+    camera's up axis becomes +z, the median of its scene points the origin, and the camera
+    sits at unit distance from it."""
+    up = c2w[:3, :3] @ np.array([0.0, -1.0, 0.0])
+    up /= np.linalg.norm(up)
+    z = np.array([0.0, 0.0, 1.0])
+    v, c = np.cross(up, z), float(up @ z)
+    if c > -1 + 1e-9:
+        vx = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+        R = np.eye(3) + vx + vx @ vx / (1.0 + c)
+    else:
+        R = np.diag([1.0, -1.0, -1.0])
+    center = np.median(points, axis=0) if len(points) else c2w[:3, 3] + c2w[:3, 2]
+    dist = float(np.linalg.norm(c2w[:3, 3] - center)) or 1.0
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = -R @ center
+    T[:3, :] /= dist
     return T
 
 
@@ -209,8 +265,15 @@ class StreamSession:
         self.init_rgbs = np.zeros((0, 3), np.float32)
         self.ace_values: Dict = {}
 
-        self._job: Optional[str] = None     # bootstrap | refit in the sidecar
-        self._bootstrap_target = cfg.bootstrap_frames
+        if cfg.cold_start and cfg.ace_mode != "continuous":
+            raise ValueError("cold_start needs ace_mode='continuous' (the mapper grows the seed map)")
+        self._job: Optional[str] = None     # bootstrap | seed | refit in the sidecar
+        self._bootstrap_target = cfg.cold_seed_frames if cfg.cold_start else cfg.bootstrap_frames
+        self._seed_kid: Optional[int] = None     # cold start: the frame that fixes the gauge
+        self._seed_tried: List[int] = []
+        # Cold start: Depth Anything for the seed frame (the trainer hands in its own when it
+        # has one; else loaded on demand)
+        self.depth_estimator = None
         self._inflight = 0
         self._new_failed = 0                # frames that failed to register since the last refit
         self._new_registered = 0
@@ -222,7 +285,9 @@ class StreamSession:
         self._depth_jobs: List[Tuple[int, np.ndarray, np.ndarray]] = []   # (kid, pix, camera z)
         self._depth: Dict[int, np.ndarray] = {}   # kid -> half-res depth, trainer units, 0 = invalid
         self.depth_counters = {"maps": 0, "rejected": 0, "ms": 0.0, "rel_err": None, "last_reject": None,
-                               "realigned": 0, "anchored": 0}
+                               "realigned": 0, "anchored": 0, "fb_maps": 0, "fb_score": None}
+        # Per-pixel depth trust from the render-vs-camera Depth Anything check (half res, fp16)
+        self._depth_w: Dict[int, np.ndarray] = {}
         # Re-alignment after ACE refits: cached sharpened disparity (half res, fp16), the latest
         # ACE points per keyframe and the map version each depth map was aligned against
         self._disp: Dict[int, np.ndarray] = {}
@@ -246,6 +311,18 @@ class StreamSession:
         self._latest: Optional[Tuple[np.ndarray, float, bool, int]] = None
         self._latest_seq = 0
         self._last_accept_time = 0.0
+        self._rings: Optional[Dict[str, ShmRing]] = None
+        self._ring_thread: Optional[threading.Thread] = None
+        self.ring_counters = {"rows": 0, "seeds": 0, "orphan_seeds": 0, "max_batch": 0}
+        self.trainer_step = -1              # set by the trainer every step (record / replay clock)
+        # Device pose table (hypersplat/stream/cuda): every applied pose row is also queued as a
+        # DELTA record for the trainer, which applies them on its CUDA stream each step
+        self.device_deltas_on = False
+        self._device_deltas: List[np.ndarray] = []
+        self._recorder = None
+        if cfg.record:
+            from .record import EventRecorder
+            self._recorder = EventRecorder(cfg.record)
 
     # ================================================================ lifecycle
     def start(self):
@@ -264,8 +341,13 @@ class StreamSession:
                 self.flight_server = FrameFlightServer(f"grpc://0.0.0.0:{self.cfg.flight_port}",
                                                        views=self.views_table, stats=self.stats)
                 self.flight_server.serve_in_background()
-        self.sidecar = AceSidecar(self.work_dir / "ace", self._on_event,
-                                  max_points=self.cfg.seed_points_per_frame)
+        if self.cfg.replay:
+            from .record import ReplaySidecar
+            self.sidecar = ReplaySidecar(self.cfg.replay, self._on_event, lambda: self.trainer_step,
+                                         frames_dir=str(self.frames_dir))
+        else:
+            self.sidecar = AceSidecar(self.work_dir / "ace", self._on_event,
+                                      max_points=self.cfg.seed_points_per_frame)
         if not self.sidecar.ready.wait(120) or not self.sidecar.alive:
             raise RuntimeError("ACE sidecar failed to start (see [ace-sidecar] log lines)")
         self._ingest = threading.Thread(target=self._ingest_loop, name="stream-ingest", daemon=True)
@@ -294,6 +376,13 @@ class StreamSession:
             self._ingest.join(timeout=5)
         if self.sidecar is not None:
             self.sidecar.close()
+        if self._ring_thread is not None:
+            self._ring_thread.join(timeout=2)
+        for ring in (self._rings or {}).values():
+            ring.close()
+        if self._recorder is not None:
+            self._recorder.close()
+            logger.info(f"[Stream] Recorded {self._recorder.events} ACE events to {self._recorder.path}")
         if self.flight_server is not None:
             try:
                 self.flight_server.shutdown()
@@ -394,11 +483,14 @@ class StreamSession:
                 while self._inflight >= self.cfg.max_inflight and not self._stop.is_set():
                     self._cond.wait(0.5)
                 self._send_localize(kf)
-            elif self._job is None and len(self.store) >= self._bootstrap_target:
-                self._start_bootstrap()
-            elif self._job == "bootstrap" and self.source.pace == "fast":
+            elif self._job is None and len(self.store) >= self._bootstrap_target and not self.failed:
+                if self.cfg.cold_start:
+                    self._start_seed()
+                else:
+                    self._start_bootstrap()
+            elif self._job in ("bootstrap", "seed") and self.source.pace == "fast":
                 # Just-in-time mode: no point reading ahead of the map
-                while self._job == "bootstrap" and not self._stop.is_set():
+                while self._job in ("bootstrap", "seed") and not self._stop.is_set():
                     self._cond.wait(0.5)
 
     def _send_localize(self, kf: Keyframe):
@@ -492,6 +584,61 @@ class StreamSession:
         args = build_ace_args(self.ace_values, hybrid=True) + self._ace_extra_args()
         self.sidecar.bootstrap(frames, args, cache_dir=cache_dir)
 
+    # ================================================================ cold start
+    def _start_seed(self):
+        """Cold start: seed the map from the sharpest untried of the first keyframes. Caller
+        holds _cond; the depth inference and the command run on their own thread."""
+        # A held-out frame cannot seed: training would start without a view
+        cands = [kf for kf in self.store.frames()
+                 if kf.ace_path and kf.split == "train" and kf.kid not in self._seed_tried]
+        if not cands:
+            return
+        kf = max(cands[: max(1, self.cfg.cold_seed_frames)], key=lambda k: k.sharpness)
+        self._seed_tried.append(kf.kid)
+        self.ace_values = self._ace_schedule(max(len(self.store), 2))
+        self.store.conf_threshold = float(self.ace_values["registration_confidence"])
+        self._job = "seed"
+        self._job_t0 = time.time()
+        threading.Thread(target=self._seed_job, args=(kf,), name="stream-seed", daemon=True).start()
+
+    def _seed_job(self, kf: Keyframe):
+        try:
+            t0 = time.time()
+            rgb = cv2.cvtColor(cv2.imread(kf.ace_path), cv2.COLOR_BGR2RGB)
+            if self.depth_estimator is None:
+                from .depth import DepthEstimator
+                self.depth_estimator = DepthEstimator()
+            from .depth import seed_depth
+            depth, st = seed_depth(self.depth_estimator.predict(rgb), rgb, self.cfg.cold_seed_depth)
+            if st["valid"] < 0.2:
+                raise RuntimeError(f"seed depth valid on {st['valid']:.0%} of the frame")
+            path = self.work_dir / f"seed_depth_{kf.kid:06d}.npy"
+            np.save(path, depth)
+            if self.cfg.ring and self._rings is None:
+                self._open_rings()   # before the mapper: its first rows use them
+            c = self.cfg
+            logger.info(f"[Stream] Cold start: seeding the ACE map from keyframe {kf.kid} "
+                        f"(depth {(time.time() - t0) * 1000:.0f} ms, valid {st['valid']:.0%}); "
+                        f"training starts once it fits")
+            self.sidecar.seed(kf.ace_path, str(path), focal=float(c.cold_focal or -1.0),
+                              image_resolution=int(self.ace_values.get("image_resolution", c.ace_short_side)),
+                              num_head_blocks=int(self.ace_values.get("num_head_blocks", 1)),
+                              seed_slots=c.seed_slots, seed_min_iters=c.seed_min_iters,
+                              seed_max_iters=c.seed_max_iters, seed_min_inliers=c.seed_min_inliers,
+                              seed_lr=c.seed_lr, seed_keep_depth=c.seed_keep_depth, **self._mapper_params())
+        except Exception as e:
+            logger.exception("[Stream] cold start seed failed")
+            self._on_error({"cmd": "seed", "msg": f"{type(e).__name__}: {e}"})
+
+    def _mapper_params(self) -> Dict:
+        c = self.cfg
+        return dict(conf_threshold=self.store.conf_threshold, iters_per_tick=c.mapper_iters_per_tick,
+                    reloc_every=c.mapper_reloc_every, publish_every=c.mapper_publish_every,
+                    adopt_min_inliers=c.mapper_adopt_min_inliers, anchor_tol=c.mapper_anchor_tol,
+                    anchor_after=c.mapper_anchor_after,
+                    max_backlog=c.mapper_max_backlog, lr=c.mapper_lr, passes=c.mapper_passes,
+                    samples_per_pass=c.mapper_samples_per_pass, max_frames=c.max_keyframes)
+
     def _maybe_refit(self, force: bool = False):
         """Caller holds _cond."""
         if self._job is not None or not self.map_ready.is_set() or self.cfg.ace_mode == "continuous":
@@ -554,6 +701,10 @@ class StreamSession:
 
     # ================================================================ sidecar events
     def _on_event(self, kind: str, rows: List[Dict]):
+        if self._recorder is not None and kind != "exit":
+            self._recorder.add(kind, rows, self.trainer_step)
+        if self.device_deltas_on and kind in ("pose", "reloc", "map"):
+            self._queue_device_deltas(kind, rows)
         if kind == "pose":
             self._on_pose(rows[0], from_map=False)
         elif kind == "map":
@@ -687,6 +838,104 @@ class StreamSession:
             if (row.get("meta") or {}).get("anchored"):
                 self.stats_counters["anchored"] = self.stats_counters.get("anchored", 0) + 1
 
+    def _queue_device_deltas(self, kind: str, rows: List[Dict]):
+        from .ring import KIND_ANCHOR, KIND_RELOC, frame_kid
+
+        recs = np.zeros(len(rows), DELTA_DTYPE)
+        keep = np.zeros(len(rows), bool)
+        for i, row in enumerate(rows):
+            kid = frame_kid(row.get("frame") or "")
+            if kid < 0:
+                continue
+            anchored = bool((row.get("meta") or {}).get("anchored"))
+            r = recs[i]
+            r["kid"], r["step"], r["map_version"] = kid, self.trainer_step, int(row.get("version") or 0)
+            r["kind"] = KIND_ANCHOR if anchored else (KIND_POSE if kind == "pose" else KIND_RELOC)
+            r["anchored"] = int(anchored)
+            r["conf"], r["focal"] = float(row.get("conf") or 0.0), float(row.get("focal") or -1.0)
+            r["inlier_frac"] = r["move"] = np.nan
+            r["w2c"] = np.asarray(row["w2c"], np.float64).reshape(16) if row.get("w2c") is not None else np.nan
+            keep[i] = True
+        with self._cond:
+            self._device_deltas.append(recs[keep])
+
+    def take_device_deltas(self) -> np.ndarray:
+        """DELTA records of the pose rows applied since the last call, in order."""
+        with self._cond:
+            batches, self._device_deltas = self._device_deltas, []
+        return np.concatenate(batches) if batches else np.zeros(0, DELTA_DTYPE)
+
+    def path_extent(self) -> float:
+        """Extent of the registered camera centres (ACE units); 1 before there are two."""
+        cen = [np.linalg.inv(kf.w2c)[:3, 3] for kf in self.store.registered() if kf.w2c is not None]
+        if len(cen) < 2:
+            return 1.0
+        cen = np.stack(cen)
+        return float(np.linalg.norm(cen.max(0) - cen.min(0))) or 1.0
+
+    # ================================================================ shared-memory rings
+    def _open_rings(self):
+        try:
+            d = self.work_dir / "rings"
+            d.mkdir(parents=True, exist_ok=True)
+            rings = {"delta": ShmRing(d / "delta", DELTA_DTYPE, capacity=1024),
+                     "seed": ShmRing(d / "seed", SEED_DTYPE, capacity=64)}
+        except (RuntimeError, OSError, ValueError) as e:
+            logger.warning(f"[Stream] shared-memory rings unavailable ({e}); pose rows stay on the pipe")
+            return
+        self._rings = rings
+        self._ring_thread = threading.Thread(target=self._ring_loop, name="stream-ring", daemon=True)
+        self._ring_thread.start()
+        self.sidecar.rings(delta=str(rings["delta"].path), seed=str(rings["seed"].path))
+        logger.info(f"[Stream] pose rows through shared-memory rings ({d})")
+
+    def _ring_rows(self, deltas: np.ndarray, seeds: Dict[int, np.void]) -> List[Tuple[str, Dict]]:
+        """DELTA records -> the event rows the pipe would have delivered (same handlers)."""
+        out = []
+        for r in deltas:
+            kid = int(r["kid"])
+            w2c = r["w2c"].reshape(4, 4)
+            row = {"kind": "pose" if r["kind"] == KIND_POSE else "reloc",
+                   "version": int(r["map_version"]), "frame": str(self.frames_dir / f"kf_{kid:06d}.jpg"),
+                   "w2c": None if not np.isfinite(w2c).all() else w2c.astype(np.float64),
+                   "conf": float(r["conf"]), "focal": float(r["focal"]),
+                   "points": np.zeros((0, 3), np.float32), "pix": np.zeros((0, 2), np.float32),
+                   "meta": {"anchored": True} if r["anchored"] else {}}
+            seed = seeds.pop(int(r["seq"]), None)
+            if seed is not None:
+                n = int(seed["n"])
+                row["points"], row["pix"] = seed["xyz"][:n].copy(), seed["pix"][:n].copy()
+                self.ring_counters["seeds"] += 1
+            out.append((row["kind"], row))
+        return out
+
+    def _ring_loop(self):
+        rings, seeds = self._rings, {}
+        idle = 0.0005
+        while not self._stop.is_set():
+            # Deltas before seeds: the producer publishes a delta's seed before the delta, so
+            # every seed of the deltas popped here is already in the seed ring
+            deltas = rings["delta"].pop(256)
+            for rec in rings["seed"].pop(64):
+                seeds[int(rec["seq"])] = rec
+            if not len(deltas):
+                time.sleep(idle)
+                idle = min(idle * 2, 0.004)
+                continue
+            idle = 0.0005
+            self.ring_counters["rows"] += len(deltas)
+            self.ring_counters["max_batch"] = max(self.ring_counters["max_batch"], len(deltas))
+            for kind, row in self._ring_rows(deltas, seeds):
+                try:
+                    self._on_event(kind, [row])
+                except Exception:
+                    logger.exception("ring event handler failed")
+            # A seed whose delta never came (the sender fell back to the pipe) is dropped
+            last = int(deltas["seq"][-1])
+            for seq in [q for q in seeds if q <= last]:
+                seeds.pop(seq)
+                self.ring_counters["orphan_seeds"] += 1
+
     def tick(self, n: int = 1) -> bool:
         """One trainer step's worth of continuous mapping. Skipped while another job (online
         Difix) holds the GPU lease, or before the first map."""
@@ -706,7 +955,10 @@ class StreamSession:
         if rows[0]["focal"] and rows[0]["focal"] > 0:
             self.focal_file = float(rows[0]["focal"])
         first = not self.map_ready.is_set()
-        if first:
+        seeded = meta.get("reason") == "seed"
+        if first and seeded:
+            self._freeze_normalization_cold(rows)
+        elif first:
             self._freeze_normalization(rows)
         n_before = len(self.store.registered())
         if meta.get("reason") == "refit":
@@ -721,8 +973,10 @@ class StreamSession:
         logger.info(f"[Stream] ACE map v{self.map_version} ({meta.get('reason')}, {meta.get('seconds')} s): "
                     f"{n_reg}/{len(self.store)} keyframes registered, focal {self.focal_file:.1f} px")
         with self._cond:
-            if meta.get("reason") in ("bootstrap", "load"):
+            if meta.get("reason") in ("bootstrap", "load", "seed"):
                 self.stats_counters["bootstrap_s"] = meta.get("seconds")
+                if seeded:
+                    self.stats_counters["seed_iterations"] = meta.get("iterations")
             elif meta.get("reason") == "refit":
                 self.stats_counters["refits"] += 1
                 self.stats_counters["last_refit_s"] = meta.get("seconds")
@@ -742,21 +996,22 @@ class StreamSession:
             if first:
                 for kf in self.store.frames():
                     kf.pinned = False
+                if seeded:
+                    seed_kf = self.store.by_ace_path().get(rows[0]["frame"])
+                    if seed_kf is not None:   # never evicted: it holds the gauge
+                        seed_kf.pinned = True
+                        self._seed_kid = seed_kf.kid
                 self.store.map_ready_at = time.time()
                 self.map_ready.set()
                 # Keyframes that arrived during the bootstrap
                 for kf in self.store.pending():
                     self._send_localize(kf)
+                if self.cfg.ace_mode == "continuous" and not seeded:   # a seed starts it itself
+                    if self.cfg.ring:
+                        self._open_rings()   # before the mapper: its first rows use them
+                    self.sidecar.mapper([kf.ace_path for kf in self.store.frames() if kf.ace_path],
+                                        **self._mapper_params())
                 if self.cfg.ace_mode == "continuous":
-                    c = self.cfg
-                    self.sidecar.mapper(
-                        [kf.ace_path for kf in self.store.frames() if kf.ace_path],
-                        conf_threshold=self.store.conf_threshold, iters_per_tick=c.mapper_iters_per_tick,
-                        reloc_every=c.mapper_reloc_every, publish_every=c.mapper_publish_every,
-                        adopt_min_inliers=c.mapper_adopt_min_inliers, anchor_tol=c.mapper_anchor_tol,
-                        anchor_after=c.mapper_anchor_after,
-                        max_backlog=c.mapper_max_backlog, lr=c.mapper_lr, passes=c.mapper_passes,
-                        samples_per_pass=c.mapper_samples_per_pass, max_frames=c.max_keyframes)
                     logger.info("[Stream] Continuous ACE mapping on: the head trains in step with 3DGS")
             self._cond.notify_all()
         if self.profile is not None:
@@ -773,6 +1028,17 @@ class StreamSession:
                 self._job = None
                 self._cache_failed = True
                 self._start_bootstrap()
+            elif cmd == "seed":
+                self._job = None
+                if len(self._seed_tried) >= self.cfg.cold_retries:
+                    self.failed = f"cold start failed after {len(self._seed_tried)} seeds: {msg}"
+                elif any(kf.kid not in self._seed_tried and kf.split == "train" for kf in self.store.frames()):
+                    self._start_seed()
+                elif self.source_ended:
+                    self.failed = f"cold start failed: {msg}"
+                else:
+                    # the next keyframe retries (_add_keyframe)
+                    self._bootstrap_target = len(self.store) + 1
             elif cmd == "bootstrap":
                 self._job = None
                 self._bootstrap_target += self.cfg.bootstrap_retry_frames
@@ -791,6 +1057,16 @@ class StreamSession:
             elif cmd == "localize":
                 self._inflight = max(0, self._inflight - 1)
             self._cond.notify_all()
+
+    def _freeze_normalization_cold(self, rows: List[Dict]):
+        row = rows[0]
+        c2w = np.linalg.inv(row["w2c"])
+        pts = np.asarray(row["points"], np.float64).reshape(-1, 3)
+        self.transform = cold_normalization_transform(c2w, pts)
+        # One camera has no spread: its distance to the scene centre (1 by construction)
+        self.scene_scale = 1.0
+        logger.info(f"[Stream] World normalization frozen from the seed camera / {len(pts)} points; "
+                    f"scene scale {self.scene_scale:.3f}")
 
     def _freeze_normalization(self, rows: List[Dict]):
         good = [r for r in rows if r["w2c"] is not None and r["conf"] >= self.store.conf_threshold]
@@ -879,10 +1155,17 @@ class StreamSession:
         small = (depth_ace if depth_ace.shape == (th, tw)
                  else cv2.resize(depth_ace, (tw, th), interpolation=cv2.INTER_NEAREST))
         scale = float(np.linalg.norm(self.transform[:3, 0]))
+        if self.cfg.mapper_depth and self.cfg.ace_mode == "continuous" and kf is not None and kf.ace_path:
+            try:
+                p = self.work_dir / f"mapper_depth_{kid:06d}.npy"
+                np.save(p, depth_ace.astype(np.float32))
+                self.sidecar.depth(kf.ace_path, str(p), self.cfg.mapper_depth_frac, self.cfg.mapper_depth_weight)
+            except Exception:
+                logger.exception("[Stream] mapper depth hand-off failed")
         with self._cond:
             self._depth[kid] = (small * scale).astype(np.float16)
             live = {kf.kid for kf in self.store.frames()}
-            for d in (self._depth, self._disp, self._ace_pts, self._aligned_version):
+            for d in (self._depth, self._disp, self._ace_pts, self._aligned_version, self._depth_w):
                 for k in [k for k in d if k not in live]:
                     del d[k]
         err = stats.get("rel_err")
@@ -897,6 +1180,17 @@ class StreamSession:
 
     def depth_map(self, kid: int) -> Optional[np.ndarray]:
         return self._depth.get(kid)
+
+    def depth_weight(self, kid: int) -> Optional[np.ndarray]:
+        return self._depth_w.get(kid)
+
+    def set_depth_weight(self, kid: int, weight: np.ndarray, score: float):
+        """Store the render-feedback trust map of one keyframe (half res like its depth map)."""
+        with self._cond:
+            self._depth_w[kid] = weight.astype(np.float16)
+        c = self.depth_counters
+        c["fb_maps"] += 1
+        c["fb_score"] = score if c["fb_score"] is None else 0.8 * c["fb_score"] + 0.2 * score
 
     def realign_jobs(self) -> List[Tuple[int, np.ndarray, np.ndarray, np.ndarray, int]]:
         """(kid, cached disparity, pix, z, version) of depth maps whose keyframe got newer ACE
@@ -993,6 +1287,8 @@ class StreamSession:
             if self._job == "bootstrap":
                 return "mapping", (f"Building the ACE map from {self._bootstrap_target} keyframes "
                                    "(about a minute); keep the camera moving")
+            if self._job == "seed":
+                return "mapping", "Seeding the ACE map from the first keyframe (a few seconds)"
             n = len(self.store)
             if self.gate.offered == 0:
                 return "waiting", "Waiting for frames from the source"
@@ -1021,15 +1317,21 @@ class StreamSession:
             "source_status": getattr(self.source, "status", None),
             "depth_maps": len(self._depth) if self.cfg.depth else None,
             "depth_rejected": self.depth_counters["rejected"] if self.cfg.depth else None,
+            "depth_last_reject": self.depth_counters["last_reject"] if self.cfg.depth else None,
             "depth_rel_err": (round(self.depth_counters["rel_err"], 4)
                               if self.cfg.depth and self.depth_counters["rel_err"] is not None else None),
             "depth_ms": round(self.depth_counters["ms"], 1) if self.cfg.depth else None,
             "depth_backlog": len(self._depth_jobs) if self.cfg.depth else None,
             "depth_realigned": self.depth_counters["realigned"] if self.cfg.depth else None,
             "depth_anchored": self.depth_counters["anchored"] if self.cfg.depth else None,
+            "depth_feedback": self.depth_counters["fb_maps"] if self.cfg.depth else None,
+            "depth_feedback_score": (round(self.depth_counters["fb_score"], 3)
+                                     if self.cfg.depth and self.depth_counters["fb_score"] is not None else None),
             "refits_requested": self._refit_requested,
             "reconnects": getattr(self.source, "reconnects", 0), "live": bool(getattr(self.source, "live", False)),
             "views_registered": self.views_registered, "gpu_lease": self.gpu_lease.holder,
+            "ring": ({**self.ring_counters, "waiting": self._rings["delta"].stats()[0],
+                      "refused": self._rings["delta"].stats()[2]} if self._rings else None),
             "failed": self.failed, **self.stats_counters,
         }
 

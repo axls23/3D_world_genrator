@@ -7,6 +7,7 @@
 #   ./run_stream_demo.sh --camera 2                    # a specific camera index / /dev/videoN
 #   ./run_stream_demo.sh --builtin                     # the laptop's own camera
 #   ./run_stream_demo.sh --phone                       # Android phone over USB-C (webcam mode / scrcpy)
+#   ./run_stream_demo.sh --wifi                        # find an IP camera / phone app on the Wi-Fi
 #   ./run_stream_demo.sh rtsp://192.168.1.20:8554/cam  # network camera
 #   ./run_stream_demo.sh flight://0.0.0.0:8815         # remote camera pushing over Arrow Flight
 #   ./run_stream_demo.sh --video                       # recorded clip (demo/input/drone_demo.mp4)
@@ -27,6 +28,8 @@ Options:
   --builtin           use the laptop's built-in camera (same as --camera 0)
   --phone             Android phone on the USB-C / Thunderbolt port: USB webcam mode if the phone
                       offers it, else its camera over adb (USB debugging; no app, no sudo)
+  --wifi              scan the local network for an IP camera / phone camera app and use it
+                      (several found: asks which; python -m hypersplat.stream.wifi lists them)
   --phone-camera C    back (default) or front
   --video [FILE]      use a video file instead of a camera (default demo/input/drone_demo.mp4)
   --realtime          play a video like a live camera (frames drop when busy)
@@ -39,6 +42,9 @@ Options:
   --no-auto-stop      train to the step ceiling instead of stopping on convergence
   --depth             dense depth per keyframe (Depth Anything V2, aligned to ACE points):
                       denser seeding + depth loss, ~20 ms per keyframe
+  --depth-feedback K  implies --depth; every epoch also runs Depth Anything on the 3DGS render of K
+                      keyframes next to the camera frame and down-weights the depth loss where they
+                      disagree (alongside the ACE refit and training; K=3 is cheap)
   --refine-poses      refine each keyframe's pose and exposure while training (uses the standard
                       rasterizer: 3DGUT has no pose gradients, so this turns --ut off)
   --ut / --no-ut      3DGUT: unscented-transform projection + world-space (eval3d) rasterizer
@@ -61,6 +67,25 @@ Options:
   --ace-continuous    ACE maps in step with training: after the first map the ACE head trains a
                       little every 3DGS step and keyframes are relocalized one at a time (settled
                       ones are anchored), instead of ~2 min refits landing as pose jumps
+  --cold-start / --no-cold-start
+                      no ACE bootstrap wait (implies --ace-continuous): the first keyframe's
+                      Depth Anything depth seeds the ACE map in seconds, training starts on it,
+                      and the following keyframes register as they arrive. ON by default, except
+                      with --map-cache / --replay (they need a bootstrap map)
+  --focal F           with --cold-start: focal length in px of the ACE-res (480 short side)
+                      frames; default ACE's guess (0.7 x diagonal), which is not refined
+  --mapper-depth [W] / --no-mapper-depth
+                      ON by default (with cold start / --ace-continuous): Depth Anything keeps guiding the ACE
+                      mapper after the seed. Each registered keyframe's aligned depth becomes a soft
+                      scene-coordinate prior under its current pose (weight W, default 50; the
+                      reprojection loss stays the main loss). Implies --depth. Experimental: a hard
+                      version of this prior (ACE's own depth loss) dropped the mapper's inliers
+                      from 84% to 43% and cost 2.3 dB; the soft one is unverified: 1 run at 23.40 dB vs 23.20 plain (spread ~1.3 dB)
+  --lbfgs [EVERY] / --no-lbfgs
+                      second-order polish (ON by default, every 50 steps): after densification stops, every EVERY steps (default
+                      50) an L-BFGS round (strong-Wolfe line search, 4 fixed views) on all Gaussian
+                      parameters; a round that does not lower its batch loss is reverted. Measured
+                      +0.003 dB on the 2k drone run (noise) - it needs a long refinement tail
   --deterministic     reproducible runs of a video file: deterministic kernels for training and
                       ACE maps, file fully localized before step 0 (slower; ~0.2 dB lower)
   --no-view           no viewer / dashboard / browser
@@ -69,6 +94,23 @@ Options:
   --dashboard-port P  split-view dashboard port (default 8090)
   --share             serve the dashboard on all interfaces (exposes the camera feed!)
   --budget-mb MB      keyframe store memory budget (default 256)
+  --cuda-ring         with --ace-continuous: ACE pose rows reach the trainer through shared-memory
+                      rings (fixed-size records) instead of the Arrow pipe
+  --mps [T,S[,MEM]]   CUDA MPS: trainer and ACE sidecar share the GPU concurrently instead of
+                      time-slicing it; T / S = SM percentage caps (default 100,100), MEM = the
+                      sidecar's GPU memory cap (e.g. 1500M; it backs off instead of the trainer
+                      running out). Starts a private MPS daemon for this run, stopped on exit
+  --device-poses      ACE poses applied on the GPU by a CUDA kernel (device pose table); real
+                      views render with the table's pose (same poses as without it)
+  --pose-filter A     with device poses: filter relocalization jitter, gain A in (0, 1]
+                      (0.3 averages ~5 relocalizations; corrections pass at once)
+  --tiers             with device poses: sample views by pose stability (provisional x0.3)
+  --record            write the ACE events this run applied (with the training step) to
+                      <output>/results/stream_3dgs/stream_events.arrows
+  --replay FILE       replay such a recording instead of running ACE: the same pose stream,
+                      step for step (use the same video, --map-cache and options)
+  --profile-cuda N[@S] CUDA timeline of N training steps from step S (default 500): Chrome
+                      trace + sync/copy/kernel summary in <output>/results/stream_3dgs/profile
   --output DIR        output directory (default demo/output/stream_demo)
   -h, --help          this help
 EOF
@@ -78,24 +120,27 @@ SOURCE="usb"
 OUTPUT="demo/output/stream_demo"
 DEMO_VIDEO="demo/input/drone_demo.mp4"
 EXTRA=()
-DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 PHONE_FACING=back
+DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 WIFI=0 PHONE_FACING=back
 DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
 UT=default REFINE_POSES=0
+COLD=default LBFGS=1 LBFGS_EVERY=50 MAPDEPTH=1 MAPDEPTH_W=50
 VIEWER_PORT=8080 DASH_PORT=8090 DASH_HOST=127.0.0.1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --camera)         SOURCE="$2"; shift ;;
         --builtin)        SOURCE="0" ;;
         --phone)          PHONE=1 ;;
+        --wifi)           WIFI=1 ;;
         --phone-camera)   PHONE_FACING="$2"; shift ;;
         --video)          if [[ $# -gt 1 && "$2" != -* ]]; then SOURCE="$2"; shift; else SOURCE="$DEMO_VIDEO"; fi ;;
         --realtime)       EXTRA+=(--stream-pace realtime) ;;
-        --steps)          EXTRA+=(--max_steps "$2"); shift ;;
+        --steps)          EXTRA+=(--max_steps "$2"); EXTRA_STEPS="$2"; shift ;;
         --target-psnr)    EXTRA+=(--stream-target-psnr "$2"); shift ;;
         --no-auto-stop)   EXTRA+=(--no-early-stopping) ;;
         --record-seconds) EXTRA+=(--stream-record-seconds "$2"); shift ;;
         --record-keyframes) EXTRA+=(--stream-record-keyframes "$2"); shift ;;
         --depth)          EXTRA+=(--stream-depth) ;;
+        --depth-feedback) EXTRA+=(--stream-depth --trainer-arg "stream_depth_feedback=$2"); shift ;;
         --refine-poses)   EXTRA+=(--stream-pose-opt --stream-exposure-opt); REFINE_POSES=1 ;;
         --ut)             UT=1 ;;
         --no-ut)          UT=0 ;;
@@ -106,6 +151,15 @@ while [[ $# -gt 0 ]]; do
         --seed)           SEED="$2"; shift ;;
         --deterministic)  EXTRA+=(--deterministic) ;;
         --ace-continuous) EXTRA+=(--trainer-arg "stream_ace_mode=continuous") ;;
+        --cold-start)     COLD=1 ;;
+        --no-cold-start)  COLD=0 ;;
+        --focal)          EXTRA+=(--trainer-arg "stream_cold_focal=$2"); shift ;;
+        --mapper-depth)   MAPDEPTH=1
+                          if [[ "${2:-}" =~ ^[0-9.]+$ ]]; then MAPDEPTH_W="$2"; shift; fi ;;
+        --no-mapper-depth) MAPDEPTH=0 ;;
+        --lbfgs)          LBFGS=1
+                          if [[ "${2:-}" =~ ^[0-9]+$ ]]; then LBFGS_EVERY="$2"; shift; fi ;;
+        --no-lbfgs)       LBFGS=0 ;;
         --refit-recipe)   EXTRA+=(--trainer-arg "stream_refit_recipe=$2"); shift ;;
         --gauge-lock)     EXTRA+=(--trainer-arg "stream_gauge_lock=true") ;;
         --no-walk)        EXTRA+=(--trainer-arg "viewer_walk=false") ;;
@@ -115,6 +169,16 @@ while [[ $# -gt 0 ]]; do
         --dashboard-port) DASH_PORT="$2"; shift ;;
         --share)          DASH_HOST=0.0.0.0 ;;
         --budget-mb)      EXTRA+=(--stream-budget-mb "$2"); shift ;;
+        --cuda-ring)      EXTRA+=(--trainer-arg "stream_ring=true") ;;
+        --mps)            if [[ $# -gt 1 && "$2" =~ ^[0-9] ]]; then MPS="$2"; shift; else MPS="100,100"; fi ;;
+        --record)         EXTRA+=(--trainer-arg "stream_record=true") ;;
+        --device-poses)   EXTRA+=(--trainer-arg "stream_device_poses=true") ;;
+        --pose-filter)    EXTRA+=(--trainer-arg "stream_device_poses=true" --trainer-arg "stream_pose_alpha=$2"); shift ;;
+        --tiers)          EXTRA+=(--trainer-arg "stream_device_poses=true" --trainer-arg "stream_tiers=true") ;;
+        --replay)         EXTRA+=(--trainer-arg "stream_replay=$(realpath "$2")"); shift ;;
+        --profile-cuda)   EXTRA+=(--trainer-arg "profile_cuda_steps=${2%@*}")
+                          [[ "$2" == *@* ]] && EXTRA+=(--trainer-arg "profile_cuda_start=${2#*@}")
+                          shift ;;
         --output)         OUTPUT="$2"; shift ;;
         -h|--help)        usage; exit 0 ;;
         -*)               echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -123,6 +187,20 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 EXTRA+=(--seed "$SEED")
+# Cold start (no ACE bootstrap wait) by default, unless the run needs a bootstrap map: a cached or
+# recorded map, or a replay. An explicit --cold-start with those is the user's call.
+if [[ "$COLD" == default ]]; then
+    COLD=1
+    for a in "${EXTRA[@]}"; do [[ "$a" == --stream-map-cache || "$a" == stream_replay=* ]] && COLD=0; done
+fi
+[[ $COLD -eq 1 ]] && EXTRA+=(--trainer-arg "stream_cold_start=true")
+# Mapper depth prior needs continuous ACE mapping (cold start, or --ace-continuous) and dense depth
+if [[ $MAPDEPTH -eq 1 ]]; then
+    CONT=$COLD; for a in "${EXTRA[@]}"; do [[ "$a" == stream_ace_mode=continuous ]] && CONT=1; done
+    [[ $CONT -eq 1 ]] && EXTRA+=(--stream-depth --trainer-arg "stream_ace_mode=continuous" \
+        --trainer-arg "stream_mapper_depth=true" --trainer-arg "stream_mapper_depth_weight=$MAPDEPTH_W")
+fi
+[[ $LBFGS -eq 1 ]] && EXTRA+=(--trainer-arg "lbfgs_refine=true" --trainer-arg "lbfgs_every=$LBFGS_EVERY")
 # 3DGUT by default; an explicit --refine-poses wins over the default (UT has no pose gradients)
 [[ "$UT" == default ]] && { [[ $REFINE_POSES -eq 1 ]] && UT=0 || UT=1; }
 [[ $UT -eq 1 ]] && EXTRA+=(--with_ut)
@@ -178,13 +256,33 @@ HELP
     esac
 fi
 
+# ---------------------------------------------------------------- wifi camera
+if [[ $WIFI -eq 1 ]]; then
+    info "wifi   : scanning the local network for cameras..."
+    mapfile -t WCAMS < <("$PY" -m hypersplat.stream.wifi | "$PY" -c '
+import json, sys
+for c in json.load(sys.stdin): print(c["url"])')
+    if [[ ${#WCAMS[@]} -eq 0 ]]; then
+        fail "no camera found on the network. On the phone: join the same Wi-Fi as this PC (mobile data off), start the camera app's server, then retry; or pass its URL directly"
+    elif [[ ${#WCAMS[@]} -eq 1 ]]; then
+        SOURCE="${WCAMS[0]%% *}"
+    else
+        echo "[stream-demo] Cameras found:" >&2
+        for i in "${!WCAMS[@]}"; do echo "  $((i+1))) ${WCAMS[$i]}" >&2; done
+        read -r -p "[stream-demo] Pick one [1]: " pick </dev/tty
+        SOURCE="${WCAMS[$(( ${pick:-1} - 1 ))]%% *}"
+    fi
+    [[ -n "$SOURCE" ]] || fail "invalid choice"
+    info "wifi   : using $SOURCE"
+fi
+
 # ---------------------------------------------------------------- usb camera
 # Default source: an external USB camera, else an Android phone on the USB cable (webcam mode
 # or USB debugging). The laptop's built-in camera is only used when asked for (--builtin).
 usb_detect() { "$PY" -m hypersplat.stream.phone usb "$PHONE_FACING" || fail "USB camera detection failed"; }
 usb_field() { "$PY" -c 'import json, sys; d = json.load(sys.stdin); v = d[sys.argv[1]]
 print("\n".join(v) if isinstance(v, list) else v or "")' "$1"; }
-if [[ $PHONE -eq 0 && "$SOURCE" == usb ]]; then
+if [[ $PHONE -eq 0 && $WIFI -eq 0 && "$SOURCE" == usb ]]; then
     det=$(usb_detect)
     SOURCE=$(usb_field device <<<"$det")
     if [[ -z "$SOURCE" ]]; then
@@ -256,6 +354,36 @@ if command -v nvidia-smi >/dev/null; then
     (( free_mb >= 3500 )) || warn "only ${free_mb} MB GPU memory free; close other viewers/players for full-resolution Difix"
 fi
 
+# ---------------------------------------------------------------- CUDA MPS
+# A private MPS daemon (its own pipe dir, so other GPU jobs are unaffected): the trainer and
+# the ACE sidecar become clients of one GPU context and run kernels concurrently; each gets an
+# SM cap, and the sidecar optionally a memory cap (HYPERSPLAT_SIDECAR_MPS_* -> AceSidecar)
+MPS_DIR=""
+mps_stop() {
+    [[ -n "$MPS_DIR" ]] || return 0
+    CUDA_MPS_PIPE_DIRECTORY="$MPS_DIR/pipe" nvidia-cuda-mps-control <<<quit >/dev/null 2>&1 || true
+    rm -rf "$MPS_DIR"
+    MPS_DIR=""
+}
+if [[ -n "${MPS:-}" ]]; then
+    command -v nvidia-cuda-mps-control >/dev/null || fail "--mps: nvidia-cuda-mps-control not found"
+    IFS=, read -r MPS_T MPS_S MPS_MEM <<<"$MPS"
+    MPS_DIR="/dev/shm/hypersplat-mps-$$"
+    mkdir -p "$MPS_DIR/pipe" "$MPS_DIR/log"
+    export CUDA_MPS_PIPE_DIRECTORY="$MPS_DIR/pipe" CUDA_MPS_LOG_DIRECTORY="$MPS_DIR/log"
+    if nvidia-cuda-mps-control -d; then
+        trap mps_stop EXIT
+        export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="${MPS_T:-100}"
+        export HYPERSPLAT_SIDECAR_MPS_PCT="${MPS_S:-100}"
+        [[ -n "${MPS_MEM:-}" ]] && export HYPERSPLAT_SIDECAR_MPS_MEM="0=$MPS_MEM"
+        info "MPS    : on (trainer ${MPS_T:-100}% SMs, ACE sidecar ${MPS_S:-100}%${MPS_MEM:+, sidecar memory cap $MPS_MEM})"
+    else
+        warn "--mps: the MPS daemon did not start; continuing time-sliced"
+        unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+        rm -rf "$MPS_DIR"; MPS_DIR=""
+    fi
+fi
+
 port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 if [[ $VIEW -eq 1 ]]; then
     port_free "$VIEWER_PORT" || fail "viewer port $VIEWER_PORT is in use (--viewer-port P)"
@@ -273,6 +401,10 @@ rm -f "$STOP_FILE" "$REC_FILE"
 
 info "source : $SOURCE ($([[ $LIVE -eq 1 ]] && echo live || echo video file))"
 info "output : $OUTPUT/results/stream_3dgs"
+# Effective configuration after defaults: the first log is enough to see what actually ran
+info "config : cold-start=$COLD (ace $([[ $COLD -eq 1 ]] && echo continuous || echo refit))  mapper-depth=$MAPDEPTH (w=$MAPDEPTH_W)  lbfgs=$LBFGS (every $LBFGS_EVERY)"
+info "         3dgut=$UT  difix=$DIFIX (share $DIFIX_SHARE, start $DIFIX_START)  seed=$SEED  mps=${MPS:-off}  steps=${EXTRA_STEPS:-auto}"
+info "command: PYTHONPATH=$ROOT $PY -u scripts/pipeline/automated_intelligent_pipeline.py $SOURCE --stream --output_dir $OUTPUT ${EXTRA[*]}"
 info "options: ${EXTRA[*]}"
 if [[ $PHONE -eq 1 || "$SOURCE" == android://* ]]; then
     info "tip    : walk slowly around the subject; stay on the 1x lens, no zoom, stabilization off,"
@@ -288,7 +420,7 @@ fi
 # ---------------------------------------------------------------- run
 # Own process group: Ctrl+C reaches only this script, which asks the trainer to finish
 # (STOP file) instead of killing it mid-step.
-setsid "$PY" -u scripts/pipeline/automated_intelligent_pipeline.py "$SOURCE" \
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" setsid "$PY" -u scripts/pipeline/automated_intelligent_pipeline.py "$SOURCE" \
     --stream --output_dir "$OUTPUT" "${EXTRA[@]}" &
 PID=$!
 

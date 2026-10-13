@@ -5,6 +5,8 @@
     GET /frame.jpg    newest frame the session received (keyframes flash green); the page polls it
     GET /feed.mjpg    the same as an MJPEG stream (VLC, other clients)
     GET /status.json  session stats + phase + training progress + viewer port
+    GET /metrics.json every TensorBoard scalar of the run (<result_dir>/tb) as downsampled series;
+                      the page charts them live below the viewer
     GET /depth.jpg    live depth of the camera while the first map is built (with --depth)
     POST /api/stop_recording
                       stop taking camera frames (camera released); training continues on the
@@ -68,6 +70,17 @@ PAGE = """<!doctype html>
   #hint { color:var(--muted); }
   main { flex:1; display:flex; min-height:0; }
   #left { flex:3; min-width:0; position:relative; border-right:1px solid var(--line); }
+  #left { display:flex; flex-direction:column; }
+  #vwrap { position:relative; flex:1; min-height:0; }
+  #charts { flex:0 0 36vh; overflow:auto; border-top:1px solid var(--line); background:var(--panel);
+            padding:6px 10px 10px; }
+  #charts h3 { font-size:11px; margin:6px 0 4px; color:var(--muted); text-transform:uppercase;
+               letter-spacing:.06em; }
+  .cgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:6px; }
+  .chart { border:1px solid var(--line); border-radius:6px; padding:4px 6px; }
+  .chart .t { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); }
+  .chart .t b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+  .chart canvas { width:100%; height:64px; display:block; }
   #left iframe { width:100%; height:100%; border:0; display:none; background:#000; }
   #placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
                  justify-content:center; gap:10px; color:var(--muted); text-align:center; padding:24px; }
@@ -104,10 +117,13 @@ PAGE = """<!doctype html>
 </header>
 <main>
   <section id="left">
+    <div id="vwrap">
     <iframe id="viewer" title="3DGS viewer"></iframe>
     <div id="placeholder"><div class="spinner" id="spinner"></div>
       <img id="depthprev" alt="Live depth preview" hidden>
       <div id="ph-text">The 3D viewer opens when training starts.</div></div>
+    </div>
+    <div id="charts"><div class="world" id="charts-empty">Loss charts (TensorBoard) appear once training logs.</div></div>
   </section>
   <section id="right">
     <h2>Camera</h2>
@@ -168,6 +184,53 @@ async function pollDepth() {
   setTimeout(pollDepth, 350);
 }
 pollDepth();
+// Live loss charts from the run's TensorBoard scalars, grouped by tag prefix
+const charts = {};
+function drawChart(cv, pts, color) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  if (pts.length < 2) return;
+  let x0 = pts[0][0], x1 = pts[pts.length - 1][0], lo = Infinity, hi = -Infinity;
+  for (const p of pts) { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const pad = 3, X = x => pad + (w - 2 * pad) * (x - x0) / Math.max(1, x1 - x0),
+        Y = y => h - pad - (h - 2 * pad) * (y - lo) / (hi - lo);
+  g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1])));
+  g.stroke();
+}
+async function pollMetrics() {
+  try {
+    const m = await (await fetch("/metrics.json", {cache: "no-store"})).json();
+    const tags = Object.keys(m.scalars || {}).sort();
+    const box = document.getElementById("charts");
+    if (tags.length) document.getElementById("charts-empty")?.remove();
+    const color = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#5ec27a";
+    for (const tag of tags) {
+      let c = charts[tag];
+      if (!c) {
+        const grp = tag.includes("/") ? tag.split("/")[0] : "other";
+        let sec = document.getElementById("grp-" + grp);
+        if (!sec) {
+          box.insertAdjacentHTML("beforeend", `<h3>${grp}</h3><div class="cgrid" id="grp-${grp}"></div>`);
+          sec = document.getElementById("grp-" + grp);
+        }
+        const el = document.createElement("div"); el.className = "chart";
+        el.innerHTML = `<div class="t"><span></span><b></b></div><canvas></canvas>`;
+        el.firstChild.firstChild.textContent = tag.slice(tag.indexOf("/") + 1);
+        sec.appendChild(el);
+        c = charts[tag] = {cv: el.querySelector("canvas"), val: el.querySelector("b")};
+      }
+      const pts = m.scalars[tag];
+      c.val.textContent = pts.length ? fmt(pts[pts.length - 1][1]) : "-";
+      drawChart(c.cv, pts, color);
+    }
+  } catch (e) {}
+  setTimeout(pollMetrics, 3000);
+}
+pollMetrics();
 let viewerSet = false;
 async function tick() {
   try {
@@ -214,8 +277,12 @@ tick();
 
 
 class Dashboard:
-    def __init__(self, session, port: int = 8090, host: str = "127.0.0.1"):
+    def __init__(self, session, port: int = 8090, host: str = "127.0.0.1", tb_dir: Optional[str] = None):
         self.session = session
+        self.tb_dir = tb_dir
+        self._tb = None
+        self._tb_cache = (0.0, {})
+        self._tb_lock = threading.Lock()
         self.host, self.port = host, port
         self.viewer_port: Optional[int] = None
         self.training: Dict = {}
@@ -237,6 +304,32 @@ class Dashboard:
         phase, hint = self.session.phase()
         return {**stats, "phase": phase, "hint": hint, "viewer_port": self.viewer_port,
                 "training": dict(self.training)}
+
+    def metrics(self, max_points: int = 300) -> Dict:
+        """Every TensorBoard scalar of the run as [[step, value], ...] (evenly thinned to
+        max_points); re-read at most every 2 s."""
+        with self._tb_lock:
+            t, cached = self._tb_cache
+            if time.time() - t < 2.0 or not self.tb_dir:
+                return cached
+            try:
+                if self._tb is None:
+                    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+                    self._tb = EventAccumulator(self.tb_dir, size_guidance={"scalars": 0})
+                self._tb.Reload()
+                out = {}
+                for tag in self._tb.Tags().get("scalars", []):
+                    ev = self._tb.Scalars(tag)
+                    stride = max(1, len(ev) // max_points)
+                    pts = ev[::stride]
+                    if pts[-1] is not ev[-1]:
+                        pts = pts + [ev[-1]]
+                    out[tag] = [[e.step, e.value] for e in pts]
+                cached = {"scalars": out}
+            except Exception as e:  # tensorboard missing / no event file yet
+                cached = {"scalars": cached.get("scalars", {}), "error": str(e)}
+            self._tb_cache = (time.time(), cached)
+            return cached
 
     def frame_jpeg(self) -> Optional[bytes]:
         """Newest source frame as JPEG (cached per frame), or None before the first frame."""
@@ -279,6 +372,8 @@ class Dashboard:
                     self._send(200, "text/html; charset=utf-8", PAGE.encode())
                 elif path == "/status.json":
                     self._send(200, "application/json", json.dumps(dash.status(), default=str).encode())
+                elif path == "/metrics.json":
+                    self._send(200, "application/json", json.dumps(dash.metrics(), default=str).encode())
                 elif path == "/frame.jpg":
                     jpg = dash.frame_jpeg()
                     if jpg is None:
