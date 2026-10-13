@@ -55,6 +55,7 @@ Every run prints the effective set on start (`config :` and `command:` lines).
 | Online Difix (share 0.15, from 50 % of the run) | on | `--no-difix` |
 | Seed 42 | on | `--seed N` |
 | Step ceiling | auto: 7000 video / 10000 live | `--steps N` |
+| Latent (JEPA-style) loss: 1 - cos of frozen-ViT features, render vs photo | off | on with `--jepa`; tune with `--jepa-lambda/-warmup/-anneal-end/-backend/-layer/-side` (not V-JEPA; failed its 300-step gate, see the evidence table) |
 | MPS, refit recipe, gauge lock, ring, device poses, record | off | `--mps`, `--refit-recipe ace0`, `--gauge-lock`, `--cuda-ring`, `--device-poses`, `--record` |
 
 Evidence behind these defaults, with the status of each number:

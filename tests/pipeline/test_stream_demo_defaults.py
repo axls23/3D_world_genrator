@@ -57,3 +57,20 @@ def test_effective_config_banner_present(text):
     assert 'info "config :' in text
     assert 'info "command: PYTHONPATH=$ROOT' in text
     assert "EXTRA_STEPS" in text
+
+
+def test_jepa_defaults_off(text):
+    assert "JEPA=0 JEPA_TUNED=0" in text
+    assert 'JEPA_BACKEND=depth_anything JEPA_LAYER=-1 JEPA_SIDE=224' in text
+
+
+@pytest.mark.parametrize("args, message", [
+    (["--jepa", "--jepa-backend", "vjepa"], "--jepa-backend must be"),
+    (["--jepa", "--jepa-layer", "7"], "--jepa-layer for depth_anything"),
+])
+def test_jepa_validation_fails_before_launch(args, message):
+    # validation runs before any environment check or pipeline launch
+    res = subprocess.run(["bash", str(SCRIPT), *args, "--output", "/tmp/jepa_validate_unused"],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert res.returncode == 2
+    assert message in res.stderr

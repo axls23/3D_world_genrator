@@ -111,6 +111,16 @@ Options:
                       step for step (use the same video, --map-cache and options)
   --profile-cuda N[@S] CUDA timeline of N training steps from step S (default 500): Chrome
                       trace + sync/copy/kernel summary in <output>/results/stream_3dgs/profile
+  --jepa / --no-jepa  latent (JEPA-style) loss: 1 - cos between frozen-ViT patch features of the
+                      render and the photo, added to the photometric loss. OFF by default.
+                      Feature model: Depth Anything V2 backbone (default) or plain DINOv2
+                      (note: this is not V-JEPA; it failed its 300-step gate on the drone clip)
+  --jepa-lambda L     latent loss weight (default 0.1)
+  --jepa-warmup S     no latent loss before step S (default 0)
+  --jepa-anneal-end S linearly anneal the weight to 0 at step S (default 0: hold constant)
+  --jepa-backend B    depth_anything (default) or dinov2
+  --jepa-layer L      ViT layer: -1 last (default); depth_anything accepts 3, 6, 9, 12
+  --jepa-side PX      long side fed to the ViT (default 224)
   --output DIR        output directory (default demo/output/stream_demo)
   -h, --help          this help
 EOF
@@ -124,6 +134,8 @@ DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 WIFI=0 PHONE_FACING=back
 DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
 UT=default REFINE_POSES=0
 COLD=default LBFGS=1 LBFGS_EVERY=50 MAPDEPTH=1 MAPDEPTH_W=50
+JEPA=0 JEPA_TUNED=0 JEPA_LAMBDA=0.1 JEPA_WARMUP=0 JEPA_ANNEAL=0
+JEPA_BACKEND=depth_anything JEPA_LAYER=-1 JEPA_SIDE=224
 VIEWER_PORT=8080 DASH_PORT=8090 DASH_HOST=127.0.0.1
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -179,6 +191,14 @@ while [[ $# -gt 0 ]]; do
         --profile-cuda)   EXTRA+=(--trainer-arg "profile_cuda_steps=${2%@*}")
                           [[ "$2" == *@* ]] && EXTRA+=(--trainer-arg "profile_cuda_start=${2#*@}")
                           shift ;;
+        --jepa)           JEPA=1 ;;
+        --no-jepa)        JEPA=0 ;;
+        --jepa-lambda)    JEPA_TUNED=1; JEPA_LAMBDA="$2"; shift ;;
+        --jepa-warmup)    JEPA_TUNED=1; JEPA_WARMUP="$2"; shift ;;
+        --jepa-anneal-end) JEPA_TUNED=1; JEPA_ANNEAL="$2"; shift ;;
+        --jepa-backend)   JEPA_TUNED=1; JEPA_BACKEND="$2"; shift ;;
+        --jepa-layer)     JEPA_TUNED=1; JEPA_LAYER="$2"; shift ;;
+        --jepa-side)      JEPA_TUNED=1; JEPA_SIDE="$2"; shift ;;
         --output)         OUTPUT="$2"; shift ;;
         -h|--help)        usage; exit 0 ;;
         -*)               echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -207,6 +227,21 @@ fi
 if [[ $DIFIX -eq 1 ]]; then
     EXTRA+=(--difix-online --trainer-arg "difix_cycle_start_frac=$DIFIX_START")
     [[ "$DIFIX_SHARE" == none ]] || EXTRA+=(--trainer-arg "difix_pseudo_share=$DIFIX_SHARE")
+fi
+
+# Latent (JEPA-style) loss: off unless --jepa. Tuning flags without --jepa are ignored, with a warning.
+if [[ $JEPA -eq 1 ]]; then
+    [[ "$JEPA_BACKEND" == depth_anything || "$JEPA_BACKEND" == dinov2 ]] \
+        || { echo "[stream-demo] ERROR: --jepa-backend must be depth_anything or dinov2" >&2; exit 2; }
+    if [[ "$JEPA_BACKEND" == depth_anything && "$JEPA_LAYER" != -1 && ! "$JEPA_LAYER" =~ ^(3|6|9|12)$ ]]; then
+        echo "[stream-demo] ERROR: --jepa-layer for depth_anything must be -1 or 3, 6, 9, 12" >&2; exit 2
+    fi
+    EXTRA+=(--trainer-arg "latent_loss=true" --trainer-arg "latent_lambda=$JEPA_LAMBDA"
+            --trainer-arg "latent_warmup_steps=$JEPA_WARMUP" --trainer-arg "latent_anneal_end=$JEPA_ANNEAL"
+            --trainer-arg "latent_backend=$JEPA_BACKEND" --trainer-arg "latent_layer=$JEPA_LAYER"
+            --trainer-arg "latent_side=$JEPA_SIDE")
+elif [[ $JEPA_TUNED -eq 1 ]]; then
+    echo "[stream-demo] WARNING: --jepa-* tuning flags ignored without --jepa" >&2
 fi
 
 fail() { echo "[stream-demo] ERROR: $*" >&2; exit 1; }
@@ -404,6 +439,11 @@ info "output : $OUTPUT/results/stream_3dgs"
 # Effective configuration after defaults: the first log is enough to see what actually ran
 info "config : cold-start=$COLD (ace $([[ $COLD -eq 1 ]] && echo continuous || echo refit))  mapper-depth=$MAPDEPTH (w=$MAPDEPTH_W)  lbfgs=$LBFGS (every $LBFGS_EVERY)"
 info "         3dgut=$UT  difix=$DIFIX (share $DIFIX_SHARE, start $DIFIX_START)  seed=$SEED  mps=${MPS:-off}  steps=${EXTRA_STEPS:-auto}"
+if [[ $JEPA -eq 1 ]]; then
+    info "         jepa=on ($JEPA_BACKEND layer $JEPA_LAYER side $JEPA_SIDE, lambda $JEPA_LAMBDA, warmup $JEPA_WARMUP, anneal-end $JEPA_ANNEAL)"
+else
+    info "         jepa=off"
+fi
 info "command: PYTHONPATH=$ROOT $PY -u scripts/pipeline/automated_intelligent_pipeline.py $SOURCE --stream --output_dir $OUTPUT ${EXTRA[*]}"
 info "options: ${EXTRA[*]}"
 if [[ $PHONE -eq 1 || "$SOURCE" == android://* ]]; then
