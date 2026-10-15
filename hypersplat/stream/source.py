@@ -16,13 +16,15 @@ camera. Spec strings:
 A local camera or phone that drops off USB mid-run is waited for (``reconnect_timeout``) and
 reopened; ``status`` says what the source is waiting for meanwhile.
 
-Live sources never queue up: a grabber thread keeps only the newest frame, so when training
-is busy the pipeline skips frames instead of falling behind. A file can be paced "realtime"
+Live sources buffer up to ``buffer_seconds`` of frames in a FIFO filled by a grabber thread, so a
+busy moment in the pipeline does not lose frames (and their keyframes); only a backlog longer than
+the buffer drops the oldest frames. Cameras are asked for ``capture_fps`` (default 60) when given. A file can be paced "realtime"
 to rehearse the live path on a recording (frames are skipped exactly like a slow camera).
 """
 
 import logging
 import os
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass
@@ -118,11 +120,44 @@ class _LatestSlot:
             return frame
 
 
+class _FrameQueue:
+    """Bounded FIFO mailbox: put() appends (dropping the oldest when full), get() takes the oldest."""
+
+    def __init__(self, maxlen: int):
+        self._cond = threading.Condition()
+        self._frames = deque(maxlen=max(1, int(maxlen)))
+        self._closed = False
+        self.dropped = 0
+
+    def put(self, frame: Frame):
+        with self._cond:
+            if len(self._frames) == self._frames.maxlen:
+                self.dropped += 1
+            self._frames.append(frame)
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def get(self, timeout: Optional[float] = None) -> Optional[Frame]:
+        with self._cond:
+            end = None if timeout is None else time.time() + timeout
+            while not self._frames and not self._closed:
+                remaining = None if end is None else end - time.time()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
+            return self._frames.popleft() if self._frames else None
+
+
 class FrameSource:
     """Iterate frames from a file, camera or network stream (see module docstring)."""
 
     def __init__(self, spec: Union[str, int], max_side: int = 960, pace: str = "auto",
-                 reconnect_timeout: float = 300.0):
+                 reconnect_timeout: float = 300.0, capture_fps: Optional[float] = None,
+                 buffer_seconds: float = 1.0):
         self.kind, self.target = parse_source(spec)
         if self.kind == "flight":
             raise ValueError("flight:// sources are served by hypersplat.stream.flight.FrameFlightServer")
@@ -136,6 +171,8 @@ class FrameSource:
             pace = "realtime"  # a camera cannot be read faster than it produces frames
         self.pace = pace
         self.max_side = max_side
+        self.capture_fps = capture_fps
+        self.buffer_seconds = buffer_seconds
         self.reconnect_timeout = reconnect_timeout
         self.reconnects = 0
         self.status: Optional[str] = None   # e.g. "phone disconnected: ..." while reconnecting
@@ -154,6 +191,7 @@ class FrameSource:
             raise RuntimeError(f"Could not open stream source {self.spec}")
         if self.live:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # no stale driver-side queue
+            self._request_fps(self.cap)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         if not np.isfinite(self.fps) or self.fps <= 0 or self.fps > 240:
             self.fps = 30.0
@@ -197,6 +235,7 @@ class FrameSource:
                     cap = cv2.VideoCapture(self.target)
                 if cap.isOpened() and cap.read()[0]:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    self._request_fps(cap)
                     self.cap = cap
                     self.reconnects += 1
                     self.status = None
@@ -208,6 +247,16 @@ class FrameSource:
             self._stop.wait(2.0)
         self.status = f"{what} did not come back"
         return False
+
+    def _request_fps(self, cap) -> None:
+        """Ask a local camera for ``capture_fps``. UVC cameras mostly reach 60 fps only in MJPG.
+        Network streams and the phone (android://...&fps=) set their rate at the sender."""
+        if not self.capture_fps or self.kind != "camera":
+            return
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FPS, float(self.capture_fps))
+        got = cap.get(cv2.CAP_PROP_FPS)
+        logger.info(f"[Source] camera {self.spec}: asked for {self.capture_fps:g} fps, got {got:g}")
 
     def _grab_loop(self):
         t0 = time.time()
@@ -228,7 +277,7 @@ class FrameSource:
         self._slot.close()
 
     def _iter_live(self) -> Iterator[Frame]:
-        self._slot = _LatestSlot()
+        self._slot = _FrameQueue(round(self.fps * self.buffer_seconds))
         self._grabber = threading.Thread(target=self._grab_loop, name="frame-grabber", daemon=True)
         self._grabber.start()
         while not self._stop.is_set():

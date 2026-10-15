@@ -53,9 +53,13 @@ class DepthEstimator:
             import torch
             from transformers import DepthAnythingForDepthEstimation
 
+            from hypersplat.stream.hf_lock import hf_load
+
             dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
-            self.model = DepthAnythingForDepthEstimation.from_pretrained(self.model_id).to(
-                self.device, dtype).eval()
+            with hf_load():
+                # _fast_init=False: fast init swaps torch.nn.init out process-wide while it loads
+                self.model = DepthAnythingForDepthEstimation.from_pretrained(self.model_id, _fast_init=False).to(
+                    self.device, dtype).eval()
             logger.info(f"[Depth] {self.model_id} loaded on {self.device}")
         return self
 

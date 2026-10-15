@@ -31,12 +31,15 @@ Options:
   --wifi              scan the local network for an IP camera / phone camera app and use it
                       (several found: asks which; python -m hypersplat.stream.wifi lists them)
   --phone-camera C    back (default) or front
+  --fps N             capture frame rate asked of a USB phone or camera (default 60; a Wi-Fi
+                      phone app sets its own rate in the app)
   --video [FILE]      use a video file instead of a camera (default demo/input/drone_demo.mp4)
   --realtime          play a video like a live camera (frames drop when busy)
   --record-seconds S  stop recording after S seconds (training continues on what was captured)
   --record-keyframes K
                       stop recording after K keyframes (training continues)
-  --steps N           training step ceiling (default 7000 for videos, 10000 for live sources);
+  --steps N           training step ceiling (default 7000 for videos; live sources have none:
+                      they start at 2000 and grow ~1000 past each new view, like a download ETA);
                       training stops earlier once the world is reconstructed
   --target-psnr DB    held-out PSNR that counts as reconstructed once gains flatten (default 22)
   --no-auto-stop      train to the step ceiling instead of stopping on convergence
@@ -121,6 +124,9 @@ Options:
   --jepa-backend B    depth_anything (default) or dinov2
   --jepa-layer L      ViT layer: -1 last (default); depth_anything accepts 3, 6, 9, 12
   --jepa-side PX      long side fed to the ViT (default 224)
+  --adaptive-spacing  measure the rotation between adjacent keyframes (per-source spacing; logs only
+                      until a consumer uses it; off by default)
+  --debug-offered DIR save every offered frame (ACE res) and its gate decision to DIR (offers.jsonl)
   --output DIR        output directory (default demo/output/stream_demo)
   -h, --help          this help
 EOF
@@ -130,7 +136,7 @@ SOURCE="usb"
 OUTPUT="demo/output/stream_demo"
 DEMO_VIDEO="demo/input/drone_demo.mp4"
 EXTRA=()
-DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 WIFI=0 PHONE_FACING=back
+DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 WIFI=0 PHONE_FACING=back CAPTURE_FPS=60
 DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
 UT=default REFINE_POSES=0
 COLD=default LBFGS=1 LBFGS_EVERY=50 MAPDEPTH=1 MAPDEPTH_W=50
@@ -144,6 +150,7 @@ while [[ $# -gt 0 ]]; do
         --phone)          PHONE=1 ;;
         --wifi)           WIFI=1 ;;
         --phone-camera)   PHONE_FACING="$2"; shift ;;
+        --fps)            CAPTURE_FPS="$2"; shift ;;
         --video)          if [[ $# -gt 1 && "$2" != -* ]]; then SOURCE="$2"; shift; else SOURCE="$DEMO_VIDEO"; fi ;;
         --realtime)       EXTRA+=(--stream-pace realtime) ;;
         --steps)          EXTRA+=(--max_steps "$2"); EXTRA_STEPS="$2"; shift ;;
@@ -199,6 +206,8 @@ while [[ $# -gt 0 ]]; do
         --jepa-backend)   JEPA_TUNED=1; JEPA_BACKEND="$2"; shift ;;
         --jepa-layer)     JEPA_TUNED=1; JEPA_LAYER="$2"; shift ;;
         --jepa-side)      JEPA_TUNED=1; JEPA_SIDE="$2"; shift ;;
+        --adaptive-spacing) EXTRA+=(--trainer-arg "stream_adaptive_spacing=true") ;;
+        --debug-offered)  EXTRA+=(--trainer-arg "stream_debug_offered_dir=$(realpath -m "$2")"); shift ;;
         --output)         OUTPUT="$2"; shift ;;
         -h|--help)        usage; exit 0 ;;
         -*)               echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -228,6 +237,10 @@ if [[ $DIFIX -eq 1 ]]; then
     EXTRA+=(--difix-online --trainer-arg "difix_cycle_start_frac=$DIFIX_START")
     [[ "$DIFIX_SHARE" == none ]] || EXTRA+=(--trainer-arg "difix_pseudo_share=$DIFIX_SHARE")
 fi
+
+[[ "$CAPTURE_FPS" =~ ^[0-9]+$ && "$CAPTURE_FPS" -gt 0 ]] \
+    || { echo "[stream-demo] ERROR: --fps must be a positive integer" >&2; exit 2; }
+EXTRA+=(--trainer-arg "stream_capture_fps=$CAPTURE_FPS")
 
 # Latent (JEPA-style) loss: off unless --jepa. Tuning flags without --jepa are ignored, with a warning.
 if [[ $JEPA -eq 1 ]]; then
@@ -276,7 +289,7 @@ print(d["mode"] or "-", d["device"] or "-", d["serial"] or "-", d["label"] or "-
         android)
             # The trainer starts the camera stream over adb and stops it when it exits
             info "phone  : $PLABEL, $PHONE_FACING camera"
-            SOURCE="android://$PSERIAL?camera=$PHONE_FACING" ;;
+            SOURCE="android://$PSERIAL?camera=$PHONE_FACING&fps=$CAPTURE_FPS" ;;
         *)
             echo "[stream-demo] No usable Android camera found:" >&2
             "$PY" -c 'import json, sys; [print("  -", p) for p in json.load(sys.stdin)["problems"]]' <<<"$det" >&2

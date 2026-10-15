@@ -161,6 +161,11 @@ class AceSidecar:
                 self._send("shutdown")  # the sidecar terminates a running ACE job itself
                 self._outbox.put(None)
                 self._writer_thread.join(timeout)
+                if self._writer_thread.is_alive():
+                    # The sidecar stopped reading commands and the pipe is full: closing the
+                    # stream would write into it and block forever. Kill it instead (below),
+                    # which also breaks the writer thread's blocked write.
+                    raise TimeoutError("sidecar not reading commands")
                 self._writer.close()
                 self.proc.stdin.close()
                 self.proc.wait(timeout)
@@ -171,3 +176,10 @@ class AceSidecar:
             os.killpg(self.proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        # With the sidecar gone its stdin pipe is broken: a writer blocked on it fails and exits.
+        # Let it finish before interpreter shutdown (a thread stuck in pyarrow then aborts Python)
+        self._writer_thread.join(timeout)

@@ -42,7 +42,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from hypersplat.stream.latent import LatentEncoder, latent_cosine_loss, latent_lambda
+from hypersplat.stream.latent import LatentEncoder, latent_cosine_loss, latent_lambda, patch_error_weight
+from hypersplat.stream.vjepa_latent import LatentPacer
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 from trainer_schedule import (
     PlateauDetector,
@@ -301,6 +302,31 @@ class Config:
     latent_layer: int = -1
     # Long side (px) of the images fed to the ViT
     latent_side: int = 224
+    # Weight each patch by its render-vs-photo error (pooled to the ViT grid), so mismatched regions pull harder
+    latent_patch_weight: bool = False
+    # Added to the mean-1 error weight: floor for already-matched patches
+    latent_weight_floor: float = 0.1
+    # "vjepa" (default): V-JEPA 2 is the main model; the depth/DINO stream is supporting context hooked
+    # into its predictor. "feature": plain cosine on frozen DINO / Depth Anything features (baseline).
+    latent_model: Literal["feature", "vjepa"] = "vjepa"
+    # V-JEPA 2 ViT-L checkpoint (vitl.pt: target_encoder + predictor), required for latent_model="vjepa"
+    vjepa_checkpoint: Optional[str] = "/mnt/Shared/3D_WORLD_GENRATION/hf_cache/vjepa2/vitl.pt"
+    # Long side (px) of the photo / render fed to V-JEPA; multiple of 16
+    vjepa_side: int = 256
+    # Fraction of V-JEPA patches predicted (the rest are the visible context)
+    vjepa_target_frac: float = 0.5
+    # Learning rate of the secondary-token projection inside the predictor hook
+    vjepa_hook_lr: float = 1e-3
+    # V-JEPA may add this fraction of the trainer's average step time; it runs every k-th step to stay
+    # within it, with the term scaled by k. 0 runs it every step.
+    vjepa_pace_budget: float = 0.5
+    # Feed the render's alpha (3DGUT coverage, pooled per patch) to the predictor with the secondary stream
+    vjepa_alpha_condition: bool = True
+    # Weight of the alpha hole term: raise alpha where V-JEPA's latent error is high and coverage low.
+    # 0 disables it. Patches without stream depth (e.g. sky) are skipped when depth is available
+    vjepa_alpha_lambda: float = 0.2
+    # Patches with mean alpha below this count as holes for the alpha term
+    vjepa_alpha_hole_max: float = 0.5
 
     # Early stopping on a plateau of the (EMA-smoothed) training loss
     early_stopping: bool = False
@@ -354,8 +380,10 @@ class Config:
     # Train-resolution long side of streamed frames
     stream_max_side: int = 960
     # Memory budget for encoded keyframes + ACE copies + pseudo views, and keyframe cap
-    stream_budget_mb: float = 256.0
-    stream_max_keyframes: int = 400
+    stream_budget_mb: float = 384.0
+    stream_max_keyframes: int = 1000
+    # Frame rate asked of a local camera (phones over USB take it in the android:// spec)
+    stream_capture_fps: Optional[float] = 60.0
     # Keyframes collected before the first ACE map is built
     stream_bootstrap_frames: int = 24
     # Cap on the first ACE map's LR cooldown (None: the ACE preset); shorter = map sooner,
@@ -402,6 +430,11 @@ class Config:
     stream_tiers: bool = False
     stream_tier_provisional_weight: float = 0.3
     stream_replay: Optional[str] = None
+    # Per-source keyframe spacing (off by default; see hypersplat/stream/spacing.py)
+    stream_adaptive_spacing: bool = False
+    stream_spacing_min_inliers: int = 30
+    # Debug: save every offered frame and its gate decision here (offers.jsonl + jpgs)
+    stream_debug_offered_dir: Optional[str] = None
     # File sources: steps to keep training once every keyframe is localized (None: to the
     # dynamic end below)
     stream_tail_steps: Optional[int] = None
@@ -981,6 +1014,9 @@ class Runner:
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         self._latent_enc = None  # LatentEncoder, built on first use (shares the depth model)
+        self._vjepa = None  # VJEPALatentLoss, built on first use when latent_model == "vjepa"
+        self._pending_latent_ckpt = None  # saved hook/optimizer state, applied when _vjepa is built
+        self._pacer = LatentPacer(cfg.vjepa_pace_budget)  # paces the V-JEPA term against the step rate
         self.lpips = None
         try:
             if cfg.lpips_net == "alex":
@@ -1076,6 +1112,7 @@ class Runner:
         scfg = StreamConfig(
             source=cfg.stream_source, pace=cfg.stream_pace, max_side=cfg.stream_max_side,
             budget_mb=cfg.stream_budget_mb, max_keyframes=cfg.stream_max_keyframes,
+            capture_fps=cfg.stream_capture_fps,
             test_every=cfg.test_every, min_motion=cfg.stream_min_motion,
             bootstrap_frames=cfg.stream_bootstrap_frames, flight_port=cfg.stream_flight_port,
             bootstrap_cooldown=cfg.stream_bootstrap_cooldown,
@@ -1086,6 +1123,9 @@ class Runner:
             refit_recipe=cfg.stream_refit_recipe, gauge_lock=cfg.stream_gauge_lock,
             ace_mode="continuous" if cfg.stream_cold_start else cfg.stream_ace_mode, ring=cfg.stream_ring,
             cold_start=cfg.stream_cold_start, cold_focal=cfg.stream_cold_focal,
+            adaptive_spacing=cfg.stream_adaptive_spacing,
+            spacing_min_inliers=cfg.stream_spacing_min_inliers,
+            debug_offered_dir=cfg.stream_debug_offered_dir,
             mapper_depth=cfg.stream_mapper_depth, mapper_depth_frac=cfg.stream_mapper_depth_frac,
             mapper_depth_weight=cfg.stream_mapper_depth_weight,
             record=f"{cfg.result_dir}/stream_events.arrows" if cfg.stream_record else None,
@@ -2165,6 +2205,42 @@ class Runner:
         if step % (cfg.lbfgs_every * 10) == 0 or bad:
             print(f"[LBFGS] step {step}: batch loss {before:.5f} -> {after:.5f}" + (" (reverted)" if bad else ""))
 
+    def _ensure_latent_enc(self, device):
+        """Frozen DINO / Depth Anything stream encoder; shares the depth model when it is loaded."""
+        if self._latent_enc is None:
+            cfg = self.cfg
+            shared = getattr(getattr(self, "depth_estimator", None), "model", None)
+            self._latent_enc = LatentEncoder(
+                input_side=cfg.latent_side, layer=cfg.latent_layer,
+                backend=cfg.latent_backend, device=str(device),
+                model=shared if cfg.latent_backend == "depth_anything" else None,
+            ).load()
+        return self._latent_enc
+
+    def _build_vjepa(self, device):
+        """V-JEPA 2 predictive latent loss; secondary tokens come from the shared LatentEncoder."""
+        from hypersplat.stream.vjepa_latent import VJEPALatentLoss, load_vjepa2_vitl
+
+        cfg = self.cfg
+        if cfg.vjepa_checkpoint is None:
+            raise ValueError("latent_model='vjepa' needs vjepa_checkpoint (path to vitl.pt)")
+        enc, pred = load_vjepa2_vitl(cfg.vjepa_checkpoint, side=cfg.vjepa_side, device=str(device))
+        sec_dim = self._latent_enc.features(torch.zeros(1, 3, 224, 224, device=device)).shape[-1]
+        from hypersplat.stream.hf_lock import hf_load
+
+        with hf_load():  # the hook's projection is a new module: build it outside any concurrent load
+            m = VJEPALatentLoss(enc, pred, self._latent_enc, sec_dim=sec_dim, side=cfg.vjepa_side,
+                                target_frac=cfg.vjepa_target_frac).to(device)
+        self.latent_hook_optimizers = [torch.optim.Adam(m.trainable_parameters(), lr=cfg.vjepa_hook_lr)]
+        pending = self._pending_latent_ckpt
+        if pending is not None:
+            m.load_hook_state(pending["proj"])
+            for opt, state in zip(self.latent_hook_optimizers, pending["optimizers"]):
+                opt.load_state_dict(state)
+            self._pending_latent_ckpt = None
+            print("[VJEPA] restored secondary-stream projection from checkpoint")
+        return m
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -2236,6 +2312,10 @@ class Runner:
             
             # Now load state dicts
             self.splats.load_state_dict(ckpt["splats"])
+            if ckpt.get("latent_hook") is not None:
+                self._pending_latent_ckpt = {
+                    "proj": ckpt["latent_hook"], "optimizers": ckpt.get("latent_hook_optimizers", []),
+                }
             
             # Load optimizers
             if "optimizers" in ckpt:
@@ -2339,6 +2419,11 @@ class Runner:
         if difix_steps:
             print(f"[Difix-online] Rounds at steps {sorted(difix_steps)} ({cfg.difix_model_id})")
 
+        # V-JEPA latent model: built once before the loop, after resume so a saved projection is restored
+        if cfg.latent_loss and cfg.latent_model == "vjepa" and self._vjepa is None:
+            self._ensure_latent_enc(device)
+            self._vjepa = self._build_vjepa(device)
+
         # Early stopping: plateau of the EMA training loss. Disabled when the data changes
         # mid-run (streams, online Difix, GeNVS) and multi-GPU (ranks would have to agree).
         plateau = None
@@ -2363,6 +2448,7 @@ class Runner:
         difix_deferred = False
         for step in pbar:
             self._profile_tick(step)
+            self._pacer.tick(time.time())
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -2688,17 +2774,45 @@ class Runner:
             if cfg.latent_loss:
                 lam = latent_lambda(step, cfg.latent_lambda, cfg.latent_warmup_steps, cfg.latent_anneal_end)
                 if lam > 0.0:
-                    if self._latent_enc is None:
-                        shared = getattr(getattr(self, "depth_estimator", None), "model", None)
-                        self._latent_enc = LatentEncoder(
-                            input_side=cfg.latent_side, layer=cfg.latent_layer,
-                            backend=cfg.latent_backend, device=str(device),
-                            model=shared if cfg.latent_backend == "depth_anything" else None,
-                        ).load()
-                    f_render = self._latent_enc.features(colors.permute(0, 3, 1, 2).clamp(0, 1))
-                    f_target = self._latent_enc.target_features(pixels.permute(0, 3, 1, 2))
-                    latent_loss_val = latent_cosine_loss(f_render, f_target)
-                    loss = loss + lam * latent_loss_val * view_weight
+                    self._ensure_latent_enc(device)
+                    if cfg.latent_model == "vjepa":
+                        if self._vjepa is None:
+                            self._vjepa = self._build_vjepa(device)
+                        latent_loss_val = None
+                        self._vjepa_alpha_log = None
+                        if self._pacer.should_run(step):
+                            k = self._pacer.interval()
+                            t0 = time.time()
+                            use_alpha = cfg.vjepa_alpha_condition or cfg.vjepa_alpha_lambda > 0
+                            vout = self._vjepa(
+                                colors.permute(0, 3, 1, 2).clamp(0, 1), pixels.permute(0, 3, 1, 2),
+                                patch_weight=cfg.latent_patch_weight, weight_floor=cfg.latent_weight_floor,
+                                alpha=alphas.permute(0, 3, 1, 2) if use_alpha else None,
+                                alpha_condition=cfg.vjepa_alpha_condition,
+                                alpha_hole_max=cfg.vjepa_alpha_hole_max,
+                                valid=(stream_depth_gt > 0) if stream_depth_gt is not None else None,
+                            )
+                            latent_loss_val = vout.latent
+                            if vout.alpha_hole is not None and cfg.vjepa_alpha_lambda > 0:
+                                loss = loss + cfg.vjepa_alpha_lambda * vout.alpha_hole * view_weight * k
+                            self._vjepa_alpha_log = (vout.alpha_hole, vout.hole_frac)
+                            if str(device).startswith("cuda"):
+                                torch.cuda.synchronize(device)
+                            self._pacer.record(time.time() - t0)
+                            # run steps carry k steps' worth of the term, so the expected gradient is unchanged
+                            loss = loss + lam * latent_loss_val * view_weight * k
+                    else:
+                        f_render = self._latent_enc.features(colors.permute(0, 3, 1, 2).clamp(0, 1))
+                        f_target = self._latent_enc.target_features(pixels.permute(0, 3, 1, 2))
+                        weight = None
+                        if cfg.latent_patch_weight:
+                            gh, gw = self._latent_enc.grid(pixels.shape[1], pixels.shape[2])
+                            weight = patch_error_weight(
+                                colors.permute(0, 3, 1, 2).clamp(0, 1), pixels.permute(0, 3, 1, 2),
+                                (gh, gw), floor=cfg.latent_weight_floor,
+                            )
+                        latent_loss_val = latent_cosine_loss(f_render, f_target, weight)
+                        loss = loss + lam * latent_loss_val * view_weight
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -2804,6 +2918,9 @@ class Runner:
                     )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if getattr(self, "_vjepa_alpha_log", None) is not None and self._vjepa_alpha_log[0] is not None:
+                    self.writer.add_scalar("train/vjepa_alpha_hole", self._vjepa_alpha_log[0].item(), step)
+                    self.writer.add_scalar("train/vjepa_hole_frac", self._vjepa_alpha_log[1], step)
                 if latent_loss_val is not None:
                     self.writer.add_scalar("train/latent_loss", latent_loss_val.item(), step)
                     self.writer.add_scalar(
@@ -2849,6 +2966,9 @@ class Runner:
                     "bil_grid_optimizers": [opt.state_dict() for opt in self.bil_grid_optimizers],
                     "schedulers": [s.state_dict() for s in schedulers],
                 }
+                if self._vjepa is not None:
+                    data["latent_hook"] = self._vjepa.sec_proj.state_dict()
+                    data["latent_hook_optimizers"] = [o.state_dict() for o in self.latent_hook_optimizers]
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -2967,6 +3087,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in getattr(self, "latent_hook_optimizers", []):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:

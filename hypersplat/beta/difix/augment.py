@@ -285,8 +285,14 @@ class DifixFixer:
         # may have happened before a caller set it (then ~5 GB lands on the root disk)
         hub = os.environ.get("HF_HUB_CACHE") or (Path(os.environ["HF_HOME"]) / "hub" if "HF_HOME" in os.environ
                                                  else SHARED_HF_CACHE / "hub" if SHARED_HF_CACHE.is_dir() else None)
-        pipe = DifixPipeline.from_pretrained(model_id, trust_remote_code=True, torch_dtype=torch.float16,
-                                             cache_dir=str(hub) if hub else None)
+        from hypersplat.stream.hf_lock import hf_load
+
+        with hf_load():  # diffusers loads via init_empty_weights; serialise with other loading threads
+            # low_cpu_mem_usage=False: the default builds the models under accelerate's
+            # init_empty_weights, which patches nn.Module registration process-wide, so
+            # parameters other threads create meanwhile (Gaussian injection) land on meta
+            pipe = DifixPipeline.from_pretrained(model_id, trust_remote_code=True, torch_dtype=torch.float16,
+                                                 cache_dir=str(hub) if hub else None, low_cpu_mem_usage=False)
         pipe.set_progress_bar_config(disable=True)
         # The prompt is fixed: encode it once on the CPU, then drop the CLIP text encoder
         # (0.63 GB) - it never reaches the GPU. The pipeline takes prompt_embeds directly and

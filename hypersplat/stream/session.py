@@ -50,6 +50,7 @@ import pyarrow as pa
 from .gauge import Sim3, fit_sim3
 from .ring import DELTA_DTYPE, KIND_POSE, SEED_DTYPE, ShmRing
 from .keyframes import KeyframeGate
+from .spacing import SpacingTracker, relative_rotation_deg
 from .schema import VIEW_SCHEMA
 from .sidecar import AceSidecar
 from .source import FrameSource, QueueFrameSource, decode_jpeg, encode_jpeg, fit_max_side, parse_source
@@ -67,8 +68,15 @@ class StreamConfig:
     max_side: int = 960                 # train-resolution long side
     ace_short_side: int = 480           # ACE works at this short side
     jpeg_quality: int = 90
-    budget_mb: float = 256.0            # encoded keyframes + ACE copies + pseudo views
-    max_keyframes: int = 400
+    budget_mb: float = 384.0            # encoded keyframes + ACE copies + pseudo views
+    max_keyframes: int = 1000           # keep most accepted keyframes (ACE buffer ~2.4 MB host RAM each)
+    capture_fps: Optional[float] = 60.0  # asked of local cameras (phones: android://...&fps=)
+    # Per-source keyframe spacing (hypersplat/stream/spacing.py): measure the rotation between
+    # adjacent accepted keyframes; off by default, status-only until a consumer uses eps
+    adaptive_spacing: bool = False
+    spacing_min_inliers: int = 30
+    # Debug: save every offered frame (ACE res) and its gate decision to this directory
+    debug_offered_dir: Optional[str] = None
     test_every: int = 8                 # every Nth keyframe is held out for eval
     min_motion: float = 8.0             # keyframe gate novelty (0-255 mean abs diff)
     bootstrap_frames: int = 24
@@ -243,6 +251,12 @@ class StreamSession:
         self.frames_dir = self.work_dir / "frames"
         self.store = KeyframeStore(cfg.budget_mb, cfg.max_keyframes, cfg.test_every)
         self.gate = KeyframeGate(min_motion=cfg.min_motion)
+        self.spacing = SpacingTracker(min_inliers=cfg.spacing_min_inliers)
+        self._prev_kf_ace: Optional[np.ndarray] = None
+        self._offer_log = None
+        if cfg.debug_offered_dir:
+            Path(cfg.debug_offered_dir).mkdir(parents=True, exist_ok=True)
+            self._offer_log = open(Path(cfg.debug_offered_dir) / "offers.jsonl", "a", buffering=1)
         self.source = None
         self.sidecar: Optional[AceSidecar] = None
         self.flight_server = None
@@ -335,7 +349,8 @@ class StreamSession:
             self.flight_server.serve_in_background()
             logger.info(f"[Stream] Waiting for frames on {flight_location(self.cfg.source)} (Arrow Flight do_put)")
         else:
-            self.source = FrameSource(self.cfg.source, self.cfg.max_side, self.cfg.pace)
+            self.source = FrameSource(self.cfg.source, self.cfg.max_side, self.cfg.pace,
+                                      capture_fps=self.cfg.capture_fps)
             if self.cfg.flight_port:
                 from .flight import FrameFlightServer
                 self.flight_server = FrameFlightServer(f"grpc://0.0.0.0:{self.cfg.flight_port}",
@@ -438,12 +453,16 @@ class StreamSession:
                     self.stop_recording(reason)
                     break
                 res = self.gate.offer(frame.image, frame.t)
+                if self._offer_log is not None:
+                    self._log_offer(frame.image, frame.t, res)
                 self._latest_seq += 1
                 self._latest = (frame.image, frame.t, res.accept, self._latest_seq)
                 if not res.accept:
                     continue
                 self._last_accept_time = time.time()
                 self._add_keyframe(frame.image, frame.t, res.sharpness)
+                if self.cfg.adaptive_spacing:
+                    self._measure_spacing(frame.image)
         except Exception as e:
             logger.exception("[Stream] ingest failed")
             self.failed = f"ingest: {e}"
@@ -459,6 +478,31 @@ class StreamSession:
                 what = "recording stopped" if self.recording_stopped else "source ended"
                 self.failed = (f"{what} with {len(self.store)} keyframes and no map "
                                f"(bootstrap needs {self._bootstrap_target})")
+
+    def _ace_res(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        scale = min(1.0, self.cfg.ace_short_side / min(h, w))
+        if scale >= 1.0:
+            return image
+        return cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+    def _measure_spacing(self, image: np.ndarray):
+        cur = self._ace_res(image)
+        if self._prev_kf_ace is not None:
+            angle, inl = relative_rotation_deg(self._prev_kf_ace, cur)
+            self.spacing.add(angle, inl)
+        self._prev_kf_ace = cur
+
+    def _log_offer(self, image: np.ndarray, t: float, res) -> None:
+        name = f"{self.gate.offered:06d}"
+        if res.accept or self.cfg.debug_offered_dir:
+            cv2.imwrite(str(Path(self.cfg.debug_offered_dir) / f"{name}.jpg"),
+                        cv2.cvtColor(self._ace_res(image), cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+        self._offer_log.write(json.dumps({"idx": self.gate.offered, "t": round(t, 3),
+                                         "accept": res.accept, "reason": res.reason,
+                                         "novelty": round(res.novelty, 3),
+                                         "sharp": round(res.sharpness, 3)}) + "\n")
 
     def _add_keyframe(self, image: np.ndarray, t: float, sharp: float):
         h, w = image.shape[:2]
@@ -1314,6 +1358,7 @@ class StreamSession:
             "store_mb": round(s.nbytes / 2 ** 20, 2), "budget_mb": self.cfg.budget_mb,
             "map_version": self.map_version, "job": self._job, "source_ended": self.source_ended,
             "recording_stopped": self.recording_stopped,
+            **self.spacing.status(),
             "source_status": getattr(self.source, "status", None),
             "depth_maps": len(self._depth) if self.cfg.depth else None,
             "depth_rejected": self.depth_counters["rejected"] if self.cfg.depth else None,

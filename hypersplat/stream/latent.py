@@ -11,10 +11,12 @@ are frozen, but there is no ``no_grad``), so the loss back-propagates into the r
 
 import logging
 import threading
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from hypersplat.stream.hf_lock import hf_load
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +63,25 @@ class LatentEncoder:
                     from transformers import DepthAnythingForDepthEstimation as Cls
                 else:
                     from transformers import Dinov2Model as Cls
-                self.model = Cls.from_pretrained(self.model_id).to(self.device, dtype).eval()
+                with hf_load():
+                    # _fast_init=False: fast init swaps torch.nn.init out process-wide while it loads
+                    self.model = Cls.from_pretrained(self.model_id, _fast_init=False).to(self.device, dtype).eval()
                 logger.info(f"[Latent] {self.model_id} loaded on {self.device} (layer {self.layer})")
             self.model.requires_grad_(False)  # harmless for a shared model: depth runs no_grad
         return self
 
-    def _prep(self, img: torch.Tensor) -> torch.Tensor:
-        """(B, 3, H, W) float in [0, 1] -> ImageNet-normalised, resized to a 14-px multiple."""
-        _, _, h, w = img.shape
+    def grid(self, h: int, w: int) -> Tuple[int, int]:
+        """Patch grid (gh, gw) the ViT sees for an (h, w) image; ``features`` returns gh*gw tokens."""
         s = self.input_side / max(h, w)
         ih = max(PATCH, int(round(h * s / PATCH)) * PATCH)
         iw = max(PATCH, int(round(w * s / PATCH)) * PATCH)
+        return ih // PATCH, iw // PATCH
+
+    def _prep(self, img: torch.Tensor) -> torch.Tensor:
+        """(B, 3, H, W) float in [0, 1] -> ImageNet-normalised, resized to a 14-px multiple."""
+        _, _, h, w = img.shape
+        gh, gw = self.grid(h, w)
+        ih, iw = gh * PATCH, gw * PATCH
         x = F.interpolate(img, size=(ih, iw), mode="bilinear", align_corners=False, antialias=True)
         mean = torch.tensor(_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         std = torch.tensor(_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
@@ -107,6 +117,23 @@ def latent_cosine_loss(pred: torch.Tensor, target: torch.Tensor,
     if weight is not None:
         return (d * weight).sum() / weight.sum().clamp_min(1e-6)
     return d.mean()
+
+
+def patch_error_weight(render: torch.Tensor, target: torch.Tensor, grid: Tuple[int, int],
+                       floor: float = 0.1) -> torch.Tensor:
+    """Per-patch weight (B, N) from the photometric error between render and target.
+
+    ``|render - target|`` (mean over channels) is average-pooled onto the ViT patch grid, so each
+    token's weight is how far its image region is from the photo. Each image's weights are scaled
+    to mean 1, then ``floor`` is added so matched patches still contribute a little. Detached:
+    this only chooses where the latent loss pulls, it is not itself optimised.
+
+    ``render`` / ``target``: (B, 3, H, W) in [0, 1] at the same resolution."""
+    gh, gw = grid
+    err = (render.detach() - target.detach()).abs().mean(dim=1, keepdim=True)  # (B, 1, H, W)
+    pooled = F.adaptive_avg_pool2d(err.float(), (gh, gw)).flatten(1)  # (B, N)
+    w = pooled / pooled.mean(dim=1, keepdim=True).clamp_min(1e-8)
+    return w + floor
 
 
 def latent_lambda(step: int, lam: float, warmup: int, anneal_end: int) -> float:

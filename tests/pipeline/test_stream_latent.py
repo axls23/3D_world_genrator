@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from hypersplat.stream.latent import LatentEncoder, latent_cosine_loss, latent_lambda
+from hypersplat.stream.latent import LatentEncoder, latent_cosine_loss, latent_lambda, patch_error_weight
 
 
 def test_lambda_warmup_hold_and_anneal():
@@ -41,3 +41,27 @@ def test_prep_resizes_to_patch_multiple():
     x = enc._prep(torch.rand(1, 3, 270, 480))
     assert x.shape[2] % 14 == 0 and x.shape[3] % 14 == 0
     assert max(x.shape[2:]) in (224, 224 + 7, 224 - 7)
+
+
+def test_patch_error_weight_follows_error_and_has_floor():
+    enc = LatentEncoder(input_side=56, device="cpu")
+    target = torch.rand(1, 3, 28, 56)
+    render = target.clone()
+    render[:, :, :, :28] += 0.5  # left half of the image is wrong, right half matches
+    render = render.clamp(0, 1)
+    grid = enc.grid(28, 56)
+    assert grid == (2, 4)
+    w = patch_error_weight(render, target, grid, floor=0.1)
+    assert w.shape == (1, 8)
+    w = w.view(1, 2, 4)
+    assert w[..., :2].mean() > w[..., 2:].mean()  # mismatched columns weigh more
+    assert torch.all(w >= 0.1 - 1e-6)
+    assert w.mean().item() == pytest.approx(1.0 + 0.1, abs=1e-5)  # mean-1 weight plus floor
+
+
+def test_weighted_latent_loss_matches_unweighted_when_uniform():
+    pred = F.normalize(torch.randn(1, 6, 8), dim=-1)
+    target = F.normalize(torch.randn(1, 6, 8), dim=-1)
+    ones = torch.ones(1, 6)
+    assert latent_cosine_loss(pred, target, ones).item() == pytest.approx(
+        latent_cosine_loss(pred, target).item(), abs=1e-6)

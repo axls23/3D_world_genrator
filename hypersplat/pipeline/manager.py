@@ -32,6 +32,9 @@ import yaml
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Starting training budget of a live stream without --steps; it grows as views arrive
+LIVE_INITIAL_STEPS = 2000
+
 
 
 def find_newest_ckpt(ckpt_dir: Path, pattern: str = "ckpt_*_rank0.pt") -> Optional[Path]:
@@ -190,7 +193,7 @@ class PipelineConfig:
         # through an in-memory keyframe store + ACE sidecar straight into training.
         self.STREAM = getattr(args, 'stream', False)
         self.STREAM_PACE = getattr(args, 'stream_pace', 'auto')
-        self.STREAM_BUDGET_MB = getattr(args, 'stream_budget_mb', 256.0)
+        self.STREAM_BUDGET_MB = getattr(args, 'stream_budget_mb', 384.0)
         self.STREAM_FLIGHT_PORT = getattr(args, 'stream_flight_port', None)
         self.STREAM_VIEWER_PORT = getattr(args, 'stream_viewer_port', None)       # viser 3DGS viewer
         self.STREAM_DASHBOARD_PORT = getattr(args, 'stream_dashboard_port', None) # viewer | camera page
@@ -1057,23 +1060,26 @@ class IntelligentPipeline:
                                                  difix=bool(self.config.DIFIX_ONLINE))
             logger.info(f"[Config] Stream Gaussian cap: {self.config.CAP_MAX}")
 
-        # Live sources have no natural end: 10k steps unless one was given. It is a hard
-        # ceiling (--stream_max_steps_cap below): new views extend training only up to it, and
-        # the world early stop usually ends sooner
-        if "TRAINING_MAX_STEPS" not in self.config.USER_SET and kind != "file":
-            self.config.TRAINING_MAX_STEPS = 10000
+        # Live sources have no natural end. Like a download's ETA, the total starts from a short
+        # budget and grows with the data: every new view pushes the end to step + extend
+        # (StreamHorizon), and settling coverage pulls it in. Only an explicit step count is a
+        # hard ceiling (--stream_max_steps_cap below). The final step always evals and saves.
+        dynamic = "TRAINING_MAX_STEPS" not in self.config.USER_SET and kind != "file"
+        if dynamic:
+            self.config.TRAINING_MAX_STEPS = LIVE_INITIAL_STEPS
         steps = self.config.TRAINING_MAX_STEPS
         if "TRAINING_EVAL_STEPS" not in self.config.USER_SET:
-            self.config.TRAINING_EVAL_STEPS = [steps]
+            self.config.TRAINING_EVAL_STEPS = [] if dynamic else [steps]
         if "TRAINING_SAVE_STEPS" not in self.config.USER_SET:
-            self.config.TRAINING_SAVE_STEPS = [steps]
+            self.config.TRAINING_SAVE_STEPS = [] if dynamic else [steps]
         if "POSE_OPT_WARMUP" not in self.config.USER_SET:
             # Same fraction as the batch budget (the fixed 1000 was half of a 2k run)
             from hypersplat.pipeline.params.strategies.training_budget import WARMUP_FRACTION
             self.config.POSE_OPT_WARMUP = int(steps * WARMUP_FRACTION / 10.0 + 0.5) * 10
         extra = ["--stream_source", source, "--stream_pace", self.config.STREAM_PACE,
-                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB), "--ply_steps", str(steps),
-                 "--stream_max_steps_cap", str(steps)]
+                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB)]
+        if not dynamic:
+            extra += ["--ply_steps", str(steps), "--stream_max_steps_cap", str(steps)]
         if self.config.STREAM_FLIGHT_PORT:
             extra += ["--stream_flight_port", str(self.config.STREAM_FLIGHT_PORT)]
         if self.config.STREAM_DASHBOARD_PORT:
@@ -1615,7 +1621,7 @@ def main():
                              "posed by an ACE sidecar and trained on as they arrive, in memory")
     parser.add_argument("--stream-pace", dest="stream_pace", choices=["auto", "realtime", "fast"],
                         default="auto", help="auto: files as fast as training consumes, cameras live")
-    parser.add_argument("--stream-budget-mb", dest="stream_budget_mb", type=float, default=256.0,
+    parser.add_argument("--stream-budget-mb", dest="stream_budget_mb", type=float, default=384.0,
                         help="Memory budget of the keyframe store (encoded frames + pseudo views)")
     parser.add_argument("--stream-flight-port", dest="stream_flight_port", type=int, default=None,
                         help="Also serve live views/stats over Arrow Flight on this port")
