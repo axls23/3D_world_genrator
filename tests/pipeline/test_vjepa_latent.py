@@ -99,32 +99,73 @@ def test_loss_with_patch_weight_is_finite_and_zero_for_identical_inputs():
     assert loss.item() > 0.0  # the predictor still predicts masked latents, so the loss is not trivially 0
 
 
-def test_pacer_runs_every_step_until_measured_and_when_disabled():
+def _drive(p, steps, base, extra, before_take=None):
+    """Simulated trainer: ``base`` s per step, plus ``extra`` s after take() on V-JEPA steps (as backward)."""
+    now, weights, gaps, since = 0.0, [], [], 0
+    for i in range(steps):
+        p.tick(now)
+        if before_take is not None:
+            before_take(p, i)
+        since += 1
+        k = p.take()
+        now += base
+        if k:
+            weights.append(k)
+            gaps.append(since)
+            since = 0
+            now += extra
+    return now, weights, gaps
+
+
+def test_pacer_bootstraps_on_alternate_steps():
     p = LatentPacer(budget=0.5)
-    assert p.interval() == 1 and p.should_run(7)
-    p.tick(0.0); p.tick(1.0)  # base step ~1 s
-    assert p.interval() == 1  # still no V-JEPA cost measured
-    off = LatentPacer(budget=0.0)
-    off.tick(0.0); off.tick(1.0); off.record(5.0)
-    assert off.interval() == 1
+    assert p.interval() == 2 and p.cost_s is None
+    p.tick(0.0)
+    assert [p.take() for _ in range(4)] == [0, 2, 0, 2]
 
 
-def test_pacer_interval_keeps_vjepa_share_near_budget():
+def test_pacer_budget_zero_runs_every_step():
+    _, weights, _ = _drive(LatentPacer(budget=0.0), 50, base=0.4, extra=5.0)
+    assert weights == [1] * 50
+
+
+def test_pacer_cost_counts_time_after_the_call():
+    # all of the extra time lands after take() returns, as the ViT backward does in loss.backward()
     p = LatentPacer(budget=0.5, ema=0.0)
-    p.tick(0.0); p.tick(1.0)  # step 1 s without V-JEPA
-    p.record(0.4)  # call costs 0.4 s -> 0.4/(0.5*1.0) = 0.8 -> every step
-    assert p.interval() == 1
-    p.record(2.0)  # call costs 2 s -> 2/(0.5*1.0) = 4 -> every 4th step
-    assert p.interval() == 4
-    assert [s for s in range(12) if p.should_run(s)] == [0, 4, 8]
-
-
-def test_pacer_base_time_excludes_vjepa_time():
-    p = LatentPacer(budget=0.5, ema=0.0)
-    p.tick(0.0); p.tick(1.0)
-    p.record(0.6)  # this step spent 0.6 s in V-JEPA
-    p.tick(2.0)  # wall step 1.0 s, base = 1.0 - 0.6 = 0.4 s
+    _drive(p, 12, base=0.4, extra=0.6)
     assert p.base_s == pytest.approx(0.4)
+    assert p.run_s == pytest.approx(1.0)
+    assert p.cost_s == pytest.approx(0.6)
+    assert p.interval() == 3  # ceil(0.6 / (0.5 * 0.4))
+
+
+def test_pacer_weights_equal_gaps_when_interval_changes():
+    def shift(p, i):  # step times change mid-run, so the interval moves
+        if i == 150:
+            p.base_s *= 4.0
+
+    _, weights, gaps = _drive(LatentPacer(budget=0.5), 300, base=0.4, extra=1.2, before_take=shift)
+    assert weights == gaps
+    assert len(set(weights)) > 2
+
+
+def test_pacer_skips_warmup_and_discarded_steps():
+    p = LatentPacer(budget=0.5, ema=0.0)
+    p.tick(0.0); p.take()  # skip step, first of its kind: warmup
+    p.tick(5.0); p.take()  # run step, first of its kind: warmup
+    p.tick(10.0); p.take(); p.discard()  # skip step that loaded a model
+    p.tick(30.0); p.take()
+    assert p.base_s is None and p.run_s is None
+    p.tick(31.0); p.take()
+    p.tick(31.4)
+    assert p.run_s == pytest.approx(1.0) and p.base_s == pytest.approx(0.4)
+
+
+def test_pacer_refreshes_base_when_running_every_step():
+    p = LatentPacer(budget=0.5, ema=0.0, refresh=5)
+    _, weights, _ = _drive(p, 60, base=0.4, extra=0.1)  # cheap call: interval 1
+    # after bootstrap: one skip (weight 2) per 5 timed runs
+    assert weights[2:12] == [1, 1, 1, 1, 2] * 2
 
 
 def test_alpha_hole_raises_alpha_only_where_coverage_is_low():
