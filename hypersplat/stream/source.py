@@ -18,8 +18,10 @@ reopened; ``status`` says what the source is waiting for meanwhile.
 
 Live sources buffer up to ``buffer_seconds`` of frames in a FIFO filled by a grabber thread, so a
 busy moment in the pipeline does not lose frames (and their keyframes); only a backlog longer than
-the buffer drops the oldest frames. Cameras are asked for ``capture_fps`` (default 60) when given. A file can be paced "realtime"
-to rehearse the live path on a recording (frames are skipped exactly like a slow camera).
+the buffer drops the oldest frames. Cameras are asked for ``capture_fps`` (default 60) when given;
+``newest`` is the latest grabbed frame, for previews that should not trail the buffer. A file can
+be paced "realtime" to rehearse the live path on a recording (frames are skipped exactly like a
+slow camera).
 """
 
 import logging
@@ -176,6 +178,8 @@ class FrameSource:
         self.reconnect_timeout = reconnect_timeout
         self.reconnects = 0
         self.status: Optional[str] = None   # e.g. "phone disconnected: ..." while reconnecting
+        self.newest: Optional[Frame] = None  # latest grabbed frame (live), ahead of the FIFO
+        self._fps_requested = False          # capture_fps is in effect (MJPG kept frames flowing)
         self.android = None
         if self.kind == "android":
             from .android import AndroidCamera
@@ -233,9 +237,10 @@ class FrameSource:
                 else:
                     self.status = f"{what} disconnected: check the USB cable"
                     cap = cv2.VideoCapture(self.target)
-                if cap.isOpened() and cap.read()[0]:
+                if cap.isOpened():
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    self._request_fps(cap)
+                    self._request_fps(cap)  # before the check, so a broken format switch is caught
+                if cap.isOpened() and cap.read()[0]:
                     self.cap = cap
                     self.reconnects += 1
                     self.status = None
@@ -251,12 +256,34 @@ class FrameSource:
     def _request_fps(self, cap) -> None:
         """Ask a local camera for ``capture_fps``. UVC cameras mostly reach 60 fps only in MJPG.
         Network streams and the phone (android://...&fps=) set their rate at the sender."""
+        self._fps_requested = False
         if not self.capture_fps or self.kind != "camera":
             return
+        fourcc, fps = cap.get(cv2.CAP_PROP_FOURCC), cap.get(cv2.CAP_PROP_FPS)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FPS, float(self.capture_fps))
-        got = cap.get(cv2.CAP_PROP_FPS)
-        logger.info(f"[Source] camera {self.spec}: asked for {self.capture_fps:g} fps, got {got:g}")
+        if cap.read()[0]:
+            self._fps_requested = True
+            got = cap.get(cv2.CAP_PROP_FPS)
+            logger.info(f"[Source] camera {self.spec}: asked for {self.capture_fps:g} fps, got {got:g}")
+            return
+        # Not every camera speaks MJPG (some UVC, virtual, v4l2loopback): one that stops
+        # delivering frames after the switch gets its own format and rate back
+        if fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, int(fourcc))
+        if fps:
+            cap.set(cv2.CAP_PROP_FPS, float(fps))
+        logger.warning(f"[Source] camera {self.spec}: no frames in MJPG at {self.capture_fps:g} fps; "
+                       f"kept its own format ({fps:g} fps)")
+
+    def _live_rate(self) -> float:
+        """Frames per second the FIFO is sized for: the requested rate when it is known (OpenCV
+        reports ~25-30 for the phone's raw H.264 whatever the sender runs at), else the reported."""
+        if self.kind == "camera" and self._fps_requested:
+            return float(self.capture_fps)
+        if self.kind == "android" and self.android is not None:
+            return float(self.android.opts["fps"])
+        return self.fps
 
     def _grab_loop(self):
         t0 = time.time()
@@ -271,13 +298,15 @@ class FrameSource:
                 if self.kind in ("camera", "android") and not self._stop.is_set() and self._reopen():
                     continue
                 break
-            self._slot.put(Frame(index, time.time() - t0, self._prepare(bgr)))
+            frame = Frame(index, time.time() - t0, self._prepare(bgr))
+            self.newest = frame  # set before the FIFO, so it is never older than an ingested frame
+            self._slot.put(frame)
             self.frames_read += 1
             index += 1
         self._slot.close()
 
     def _iter_live(self) -> Iterator[Frame]:
-        self._slot = _FrameQueue(round(self.fps * self.buffer_seconds))
+        self._slot = _FrameQueue(round(self._live_rate() * self.buffer_seconds))
         self._grabber = threading.Thread(target=self._grab_loop, name="frame-grabber", daemon=True)
         self._grabber.start()
         while not self._stop.is_set():
