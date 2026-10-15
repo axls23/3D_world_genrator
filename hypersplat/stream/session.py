@@ -50,7 +50,7 @@ import pyarrow as pa
 from .gauge import Sim3, fit_sim3
 from .ring import DELTA_DTYPE, KIND_POSE, SEED_DTYPE, ShmRing
 from .keyframes import KeyframeGate
-from .spacing import SpacingTracker, relative_rotation_deg
+from .spacing import Features, SpacingTracker, relative_rotation_from_features, sift_features
 from .schema import VIEW_SCHEMA
 from .sidecar import AceSidecar
 from .source import FrameSource, QueueFrameSource, decode_jpeg, encode_jpeg, fit_max_side, parse_source
@@ -252,7 +252,8 @@ class StreamSession:
         self.store = KeyframeStore(cfg.budget_mb, cfg.max_keyframes, cfg.test_every)
         self.gate = KeyframeGate(min_motion=cfg.min_motion)
         self.spacing = SpacingTracker(min_inliers=cfg.spacing_min_inliers)
-        self._prev_kf_ace: Optional[np.ndarray] = None
+        # Previous keyframe's SIFT features and ACE-res (w, h): each keyframe is described once
+        self._prev_kf_feats: Optional[Tuple[Features, Tuple[int, int]]] = None
         self._offer_log = None
         if cfg.debug_offered_dir:
             Path(cfg.debug_offered_dir).mkdir(parents=True, exist_ok=True)
@@ -403,6 +404,10 @@ class StreamSession:
                 self.flight_server.shutdown()
             except Exception:
                 pass
+        # Left open if the ingest thread outlived its join: it may still be writing
+        if self._offer_log is not None and not (self._ingest is not None and self._ingest.is_alive()):
+            self._offer_log.close()
+            self._offer_log = None
         shutil.rmtree(self.work_dir, ignore_errors=True)
 
     def stop_recording(self, reason: str = "requested") -> bool:
@@ -461,8 +466,6 @@ class StreamSession:
                     continue
                 self._last_accept_time = time.time()
                 self._add_keyframe(frame.image, frame.t, res.sharpness)
-                if self.cfg.adaptive_spacing:
-                    self._measure_spacing(frame.image)
         except Exception as e:
             logger.exception("[Stream] ingest failed")
             self.failed = f"ingest: {e}"
@@ -486,19 +489,22 @@ class StreamSession:
             return image
         return cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
 
-    def _measure_spacing(self, image: np.ndarray):
-        cur = self._ace_res(image)
-        if self._prev_kf_ace is not None:
-            angle, inl = relative_rotation_deg(self._prev_kf_ace, cur)
+    def _measure_spacing(self, ace_img: np.ndarray):
+        """Rotation from the previous keyframe; ``ace_img`` is the keyframe at ACE res."""
+        cur = (sift_features(ace_img), (ace_img.shape[1], ace_img.shape[0]))
+        if self._prev_kf_feats is not None and self._prev_kf_feats[1] == cur[1]:
+            # (a resolution change between keyframes has no shared intrinsics: no sample)
+            prev, size = self._prev_kf_feats
+            angle, inl = relative_rotation_from_features(prev, cur[0], size)
             self.spacing.add(angle, inl)
-        self._prev_kf_ace = cur
+        self._prev_kf_feats = cur
 
     def _log_offer(self, image: np.ndarray, t: float, res) -> None:
         name = f"{self.gate.offered:06d}"
-        if res.accept or self.cfg.debug_offered_dir:
-            cv2.imwrite(str(Path(self.cfg.debug_offered_dir) / f"{name}.jpg"),
-                        cv2.cvtColor(self._ace_res(image), cv2.COLOR_RGB2BGR),
-                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+        # Only called with debug_offered_dir set (the log exists): every offer is saved
+        cv2.imwrite(str(Path(self.cfg.debug_offered_dir) / f"{name}.jpg"),
+                    cv2.cvtColor(self._ace_res(image), cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 85])
         self._offer_log.write(json.dumps({"idx": self.gate.offered, "t": round(t, 3),
                                          "accept": res.accept, "reason": res.reason,
                                          "novelty": round(res.novelty, 3),
@@ -508,10 +514,7 @@ class StreamSession:
         h, w = image.shape[:2]
         self.train_size = self.train_size or (w, h)
         kf = self.store.add(encode_jpeg(image, self.cfg.jpeg_quality), w, h, t, sharp)
-        # ACE copy: short side ace_short_side (never upscaled)
-        scale = min(1.0, self.cfg.ace_short_side / min(h, w))
-        ace_img = cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA) \
-            if scale < 1.0 else image
+        ace_img = self._ace_res(image)   # ACE copy: short side ace_short_side (never upscaled)
         self.file_size = self.file_size or (ace_img.shape[1], ace_img.shape[0])
         path = self.frames_dir / f"{kf.name}.jpg"
         data = encode_jpeg(ace_img, 92)
@@ -536,6 +539,8 @@ class StreamSession:
                 # Just-in-time mode: no point reading ahead of the map
                 while self._job in ("bootstrap", "seed") and not self._stop.is_set():
                     self._cond.wait(0.5)
+        if self.cfg.adaptive_spacing:
+            self._measure_spacing(ace_img)   # after the add, as before; reuses the ACE copy
 
     def _send_localize(self, kf: Keyframe):
         self._inflight += 1
