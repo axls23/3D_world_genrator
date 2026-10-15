@@ -57,11 +57,9 @@ threshold under the found pose (flat N*3), pix their image positions normalized 
 """
 
 import argparse
-import bisect
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -83,6 +81,7 @@ import dataset_io  # noqa: E402
 import dsacstar  # noqa: E402
 from ace_network import Regressor  # noqa: E402
 from stream_mapper import ContinuousMapper  # noqa: E402
+from reloc_schedule import RelocScheduler  # noqa: E402
 from dataset import CamLocDataset  # noqa: E402
 from hypersplat.stream.ring import (DELTA_DTYPE, KIND_ANCHOR, KIND_POSE,  # noqa: E402
                                     KIND_RELOC, SEED_DTYPE, SEED_MAX_POINTS, ShmRing,
@@ -140,16 +139,8 @@ class Sidecar:
         self.anchored = set()
         self.stable_count = {}
         self.extent = None
-        # Event gating: ``growth`` counts frames that joined the map. An unregistered frame that
-        # failed is retried only once the map has grown since (it may reach it now) or, failing
-        # that, after 2**fails more map versions; retries go frontier-first (keyframe index
-        # nearest a registered frame), so the map grows outward from what it covers. The mapper
-        # idles while it has nothing to learn (no adds, no eligible relocalizations, every
-        # buffered frame anchored and fitted); ``dirty`` (new depth targets, forgets) wakes it.
-        self.growth = 0
-        self.reloc_fail = {}            # frame -> (fails, growth at last try, version at last try)
-        self.dirty = True
-        self.idle_units = 0
+        # Relocalization scheduling and mapper idling (reloc_schedule.py)
+        self.sched = RelocScheduler()
         # Shared-memory rings (``rings`` command): pose / reloc rows bypass the Arrow pipe
         self.rings = None
         self.ring_lock = threading.Lock()   # one producer per ring: localize and mapper threads
@@ -478,6 +469,7 @@ class Sidecar:
         with self.net_lock:
             self.known = sorted(set(frames) | set(self.poses) | set(self.known))
             self.mapper, self.mapper_cfg = mapper, cfg
+            self.sched.configure(cfg)
         self.mapper_thread = threading.Thread(target=self._mapper_loop, name="ace-mapper", daemon=True)
         self.mapper_thread.start()
 
@@ -566,8 +558,8 @@ class Sidecar:
                 m = self.mapper
                 _logger.info(f"mapper: {m.iterations} iterations, {len(m.frames)} frames in buffer, "
                              f"{len(self.anchored)} anchored, "
-                             f"{len(self.known)} known, {len(self.reloc_fail)} waiting to retry, "
-                             f"{self.idle_units} idle units, map v{self.version}, inliers(10px) "
+                             f"{len(self.known)} known, {self.sched.waiting} waiting to retry, "
+                             f"{self.sched.idle_ticks} idle units, map v{self.version}, inliers(10px) "
                              f"{(m.inlier_ema or 0) * 100:.1f}%, {1000 * t_units / max(1, self.units):.0f} ms/unit")
                 t_log = time.time()
 
@@ -598,84 +590,26 @@ class Sidecar:
         out = write_profile(prof, self._prof_steps, self._prof_out, "sidecar")
         _logger.info("profile written: %s", out)
 
-    @staticmethod
-    def _frame_index(frame) -> int:
-        """Keyframe index from the file name (kf_000624.jpg -> 624); -1 if there is none."""
-        digits = re.findall(r"\d+", Path(frame).stem)
-        return int(digits[-1]) if digits else -1
-
-    def _note_failure(self, frame) -> None:
-        """Caller holds net_lock. An unregistered frame failed to localize at this map state."""
-        fails = self.reloc_fail.get(frame, (0, 0, 0))[0] + 1
-        self.reloc_fail[frame] = (fails, self.growth, self.version)
-
-    def _note_joined(self, frame) -> None:
-        """Caller holds net_lock. A frame joined the map: frames that failed before may now reach it."""
-        self.growth += 1
-        self.reloc_fail.pop(frame, None)
-        self.dirty = True
-
-    def _retry_ok(self, frame) -> bool:
-        st = self.reloc_fail.get(frame)
-        if st is None:
-            return True
-        fails, growth_at, version_at = st
-        cap = int(self.mapper_cfg.get("retry_backoff_cap", 64))
-        return self.growth > growth_at or self.version >= version_at + min(2 ** fails, cap)
-
-    def _pick_reloc(self):
-        """Caller holds net_lock. Next frame to relocalize, or None when nothing is worth trying.
-        Alternates between refining registered-but-unanchored frames and expanding the
-        frontier: the eligible unregistered frame whose keyframe index is nearest a registered
-        one (ACE-Zero grows a map from frames that overlap what it already covers)."""
-        thr = self.mapper_cfg["conf_threshold"]
-        registered = {f for f, (_, c) in self.poses.items() if c >= thr}
-        refine = [f for f in self.known if f in registered and f not in self.anchored]
-        frontier = [f for f in self.known if f not in registered and self._retry_ok(f)]
-        if frontier:
-            reg_idx = sorted(self._frame_index(f) for f in registered)
-
-            def gap(f):
-                i = self._frame_index(f)
-                if not reg_idx or i < 0:
-                    return (1 << 30, i)
-                j = bisect.bisect_left(reg_idx, i)
-                near = [abs(reg_idx[k] - i) for k in (j - 1, j) if 0 <= k < len(reg_idx)]
-                return (min(near), i)
-            frontier.sort(key=gap)
-        self.reloc_pos += 1
-        if refine and (not frontier or self.reloc_pos % 2):
-            return refine[(self.reloc_pos // 2) % len(refine)]
-        return frontier[0] if frontier else None
-
-    def _mapper_has_work(self, adds) -> bool:
-        """Caller holds net_lock."""
-        m, cfg = self.mapper, self.mapper_cfg
-        if adds or self.dirty:
-            return True
-        if (m.inlier_ema or 0.0) < float(cfg.get("idle_inliers", 0.85)):
-            return True
-        if any(f not in self.anchored for f in m.frames):
-            return True
-        thr = cfg["conf_threshold"]
-        return any(self.poses.get(f, (None, 0.0))[1] < thr and self._retry_ok(f) for f in self.known)
-
     def _mapper_unit(self):
         m, cfg = self.mapper, self.mapper_cfg
         with self.net_lock:
             adds, self.pending_add = self.pending_add, []
             adds = [(f, self.poses[f][0]) for f in dict.fromkeys(adds) if f in self.poses]
-            if not self._mapper_has_work(adds):
-                self.idle_units += 1
+            registered = {f for f, (_, c) in self.poses.items() if c >= cfg["conf_threshold"]}
+            busy = self.sched.has_work(adds, m.inlier_ema, m.frames, self.anchored, self.known, registered)
+            self.sched.tick(idle=not busy)
+            if not busy:
                 return
-            self.dirty = False
+            self.sched.dirty = False
         for f, w2c in adds:
+            if not Path(f).exists():
+                continue  # evicted meanwhile: nothing joined the map
             new = f not in m.slot_of
-            if Path(f).exists() and not m.add_frame(f, w2c, self.focal):
+            if not m.add_frame(f, w2c, self.focal):
                 _logger.warning("mapper buffer full: %s not added", f)
             elif new:
                 with self.net_lock:
-                    self._note_joined(f)
+                    self.sched.note_joined(f)
         for _ in range(int(cfg["iters_per_tick"])):
             m.step()
         self.units += 1
@@ -694,7 +628,8 @@ class Sidecar:
                 cen = np.stack(cen)
                 self.extent = float(np.linalg.norm(cen.max(0) - cen.min(0))) or 1.0
         with self.net_lock:
-            frame = self._pick_reloc()
+            registered = {f for f, (_, c) in self.poses.items() if c >= cfg["conf_threshold"]}
+            frame = self.sched.pick(self.known, registered, self.anchored)
             if frame is None:
                 return
             net = self.network
@@ -705,7 +640,7 @@ class Sidecar:
         if row.get("w2c") is None or row["conf"] < cfg["conf_threshold"]:
             if frame not in m.slot_of:
                 with self.net_lock:
-                    self._note_failure(frame)
+                    self.sched.note_failure(frame)
             return  # nothing adopted: the trainer keeps what it has
         w2c = np.array(row["w2c"]).reshape(4, 4)
         if frame in m.slot_of:
@@ -730,7 +665,7 @@ class Sidecar:
             _logger.warning("mapper buffer full: %s not added", frame)
         else:
             with self.net_lock:
-                self._note_joined(frame)
+                self.sched.note_joined(frame)
         with self.net_lock:
             self.poses[frame] = (w2c, row["conf"])
         self.emit([row])
@@ -769,7 +704,7 @@ class Sidecar:
                                 if row["conf"] >= self.mapper_cfg["conf_threshold"]:
                                     self.pending_add.append(row["frame"])
                                 else:
-                                    self._note_failure(row["frame"])
+                                    self.sched.note_failure(row["frame"])
                         self.emit([row])
                     elif cmd == "mapper":
                         self.start_mapper(frames, params)
@@ -780,7 +715,7 @@ class Sidecar:
                             m.depth_weight = float(params.get("depth_weight", m.depth_weight))
                             with self.net_lock:
                                 m.set_depth(frames[0], str(params["depth"]), self.focal)
-                                self.dirty = True
+                                self.sched.dirty = True
                     elif cmd == "rings":
                         self.open_rings(params)
                     elif cmd == "profile":
@@ -804,8 +739,7 @@ class Sidecar:
                                     self.known.remove(fr)
                                 self.anchored.discard(fr)
                                 self.stable_count.pop(fr, None)
-                                self.reloc_fail.pop(fr, None)
-                                self.dirty = True
+                                self.sched.forget(fr)
                                 if self.mapper is not None:
                                     self.pending_add = [f for f in self.pending_add if f != fr]
                                     self.mapper.remove_frame(fr)
