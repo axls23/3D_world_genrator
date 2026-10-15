@@ -1318,12 +1318,12 @@ class StreamSession:
 
         A live camera's newest grabbed frame wins over the last ingested one, so the previews do
         not trail the camera by the FIFO backlog; it is not a keyframe (not judged yet)."""
-        latest = self._latest  # read before ``newest``: the grabber sets that one first
+        latest = self._latest  # read before ``newest``, so ``newest`` is never the older one
         newest = getattr(self.source, "newest", None)
         if newest is None:
             return latest
-        # The source frame index orders grabbed and ingested frames alike
-        if latest is not None and latest[1] >= newest.t:
+        # Ingest caught up when it holds that very frame; the source frame index numbers both
+        if latest is not None and latest[0] is newest.image:
             return latest[0], latest[1], latest[2], newest.index + 1
         return newest.image, newest.t, False, newest.index + 1
 

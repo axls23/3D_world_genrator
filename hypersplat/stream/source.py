@@ -138,6 +138,13 @@ class _FrameQueue:
             self._frames.append(frame)
             self._cond.notify_all()
 
+    def resize(self, maxlen: int):
+        """New capacity (the source rate changed on a reconnect); shrinking drops the oldest."""
+        with self._cond:
+            maxlen = max(1, int(maxlen))
+            self.dropped += max(0, len(self._frames) - maxlen)
+            self._frames = deque(self._frames, maxlen=maxlen)
+
     def close(self):
         with self._cond:
             self._closed = True
@@ -179,7 +186,7 @@ class FrameSource:
         self.reconnects = 0
         self.status: Optional[str] = None   # e.g. "phone disconnected: ..." while reconnecting
         self.newest: Optional[Frame] = None  # latest grabbed frame (live), ahead of the FIFO
-        self._fps_requested = False          # capture_fps is in effect (MJPG kept frames flowing)
+        self._capture_rate: Optional[float] = None  # camera rate negotiated by _request_fps
         self.android = None
         if self.kind == "android":
             from .android import AndroidCamera
@@ -195,7 +202,7 @@ class FrameSource:
             raise RuntimeError(f"Could not open stream source {self.spec}")
         if self.live:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # no stale driver-side queue
-            self._request_fps(self.cap)
+            self._capture_rate = self._request_fps(self.cap)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         if not np.isfinite(self.fps) or self.fps <= 0 or self.fps > 240:
             self.fps = 30.0
@@ -237,11 +244,12 @@ class FrameSource:
                 else:
                     self.status = f"{what} disconnected: check the USB cable"
                     cap = cv2.VideoCapture(self.target)
+                rate = None
                 if cap.isOpened():
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    self._request_fps(cap)  # before the check, so a broken format switch is caught
+                    rate = self._request_fps(cap)  # before the check, so a broken format switch is caught
                 if cap.isOpened() and cap.read()[0]:
-                    self.cap = cap
+                    self.cap, self._capture_rate = cap, rate
                     self.reconnects += 1
                     self.status = None
                     logger.info(f"[Source] {what} {self.spec} reconnected")
@@ -249,38 +257,41 @@ class FrameSource:
                 cap.release()
             except Exception as e:  # phone vanished again mid-restart, camera busy, ...
                 self.status = f"{what} reconnect failed ({e}); retrying"
-            self._stop.wait(2.0)
+            self._stop.wait(min(2.0, max(0.0, end - time.time())))
         self.status = f"{what} did not come back"
         return False
 
-    def _request_fps(self, cap) -> None:
+    def _request_fps(self, cap) -> Optional[float]:
         """Ask a local camera for ``capture_fps``. UVC cameras mostly reach 60 fps only in MJPG.
-        Network streams and the phone (android://...&fps=) set their rate at the sender."""
-        self._fps_requested = False
+        Network streams and the phone (android://...&fps=) set their rate at the sender.
+        Returns the rate the camera runs at, or None when the request was not kept."""
         if not self.capture_fps or self.kind != "camera":
-            return
+            return None
         fourcc, fps = cap.get(cv2.CAP_PROP_FOURCC), cap.get(cv2.CAP_PROP_FPS)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        # Switch format only when the current one is known, so a failed switch can be undone
+        if fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FPS, float(self.capture_fps))
         if cap.read()[0]:
-            self._fps_requested = True
             got = cap.get(cv2.CAP_PROP_FPS)
             logger.info(f"[Source] camera {self.spec}: asked for {self.capture_fps:g} fps, got {got:g}")
-            return
+            # V4L2 reports the negotiated rate, which can be lower than asked
+            return float(min(got, self.capture_fps)) if 0 < got <= 240 else float(self.capture_fps)
         # Not every camera speaks MJPG (some UVC, virtual, v4l2loopback): one that stops
         # delivering frames after the switch gets its own format and rate back
         if fourcc:
             cap.set(cv2.CAP_PROP_FOURCC, int(fourcc))
         if fps:
             cap.set(cv2.CAP_PROP_FPS, float(fps))
-        logger.warning(f"[Source] camera {self.spec}: no frames in MJPG at {self.capture_fps:g} fps; "
-                       f"kept its own format ({fps:g} fps)")
+        logger.warning(f"[Source] camera {self.spec}: no frames at {self.capture_fps:g} fps"
+                       f"{' in MJPG' if fourcc else ''}; restored its own format ({fps:g} fps)")
+        return None
 
     def _live_rate(self) -> float:
         """Frames per second the FIFO is sized for: the requested rate when it is known (OpenCV
         reports ~25-30 for the phone's raw H.264 whatever the sender runs at), else the reported."""
-        if self.kind == "camera" and self._fps_requested:
-            return float(self.capture_fps)
+        if self.kind == "camera" and self._capture_rate:
+            return self._capture_rate
         if self.kind == "android" and self.android is not None:
             return float(self.android.opts["fps"])
         return self.fps
@@ -296,6 +307,8 @@ class FrameSource:
                     if self.cap.grab():
                         continue
                 if self.kind in ("camera", "android") and not self._stop.is_set() and self._reopen():
+                    # The reopened camera may run at another rate (MJPG kept or not this time)
+                    self._slot.resize(round(self._live_rate() * self.buffer_seconds))
                     continue
                 break
             frame = Frame(index, time.time() - t0, self._prepare(bgr))
