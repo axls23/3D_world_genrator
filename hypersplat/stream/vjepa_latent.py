@@ -23,6 +23,8 @@ raises opacity where geometry is missing. Patches outside ``valid`` (e.g. sky, n
 
 import logging
 import math
+import statistics
+from collections import deque
 from typing import Callable, NamedTuple, Optional
 
 import torch
@@ -50,61 +52,54 @@ class LatentPacer:
     contribution matches running it every step. A run is due once the gap reaches
     ``interval = ceil(cost / (budget * base))``; ``budget <= 0`` runs it every step.
 
-    ``base`` is the EMA of whole-step wall time on steps without V-JEPA and ``cost`` is the EMA on
+    ``base`` is the whole-step wall time on steps without V-JEPA and ``cost`` is the wall time on
     V-JEPA steps minus ``base``, so the ViT backward inside ``loss.backward()`` and GPU work queued
-    by the call are counted, which a timer around the forward misses. Until both EMAs exist, V-JEPA
-    runs on alternate steps. The first step of each kind (kernel / allocator warmup) and steps passed
-    to ``discard()`` are not timed, and one slow step can move an EMA by at most ``clip`` x.
-    With ``interval == 1`` every ``refresh`` runs one step is skipped so ``base`` stays current.
+    by the call are counted, which a timer around the forward misses. Both are medians over the last
+    ``window`` steps of each kind: eval, checkpoint, Difix or warmup steps are outliers, not cost.
+    Until each has ``min_samples``, V-JEPA runs on alternate steps. With ``interval == 1`` one step
+    in every ``refresh`` runs is skipped so ``base`` stays current.
     """
 
-    def __init__(self, budget: float, ema: float = 0.9, clip: float = 4.0, refresh: int = 20):
+    def __init__(self, budget: float, window: int = 9, min_samples: int = 3, refresh: int = 20):
         self.budget = budget
-        self.ema = ema
-        self.clip = clip
+        self.min_samples = min_samples
         self.refresh = refresh
-        self.base_s: Optional[float] = None  # step wall time without V-JEPA
-        self.run_s: Optional[float] = None  # step wall time with V-JEPA
+        self._base = deque(maxlen=window)  # step wall times without V-JEPA
+        self._run = deque(maxlen=window)  # step wall times with V-JEPA
         self._last_wall: Optional[float] = None
         self._ran = False  # the current step ran V-JEPA
-        self._discard = False  # the current step did one-off work; don't time it
-        self._warm_base = self._warm_run = False  # first step of each kind dropped
         self._gap = 0  # take() calls since the last run
         self._runs_since_base = 0
 
-    def _update(self, old: Optional[float], dt: float) -> float:
-        if old is not None:
-            dt = min(dt, self.clip * old)  # eval / checkpoint / Difix steps are not V-JEPA cost
-        return dt if old is None else self.ema * old + (1.0 - self.ema) * dt
-
     def tick(self, now: float) -> None:
         """Call once at the top of each training step with ``time.time()``."""
-        if self._last_wall is not None and not self._discard:
+        if self._last_wall is not None:
             dt = max(now - self._last_wall, 1e-6)
-            if not self._ran:
-                if self._warm_base:
-                    self.base_s = self._update(self.base_s, dt)
-                    self._runs_since_base = 0
-                self._warm_base = True
+            if self._ran:
+                self._run.append(dt)
+                self._runs_since_base += 1
             else:
-                if self._warm_run:
-                    self.run_s = self._update(self.run_s, dt)
-                    self._runs_since_base += 1
-                self._warm_run = True
+                self._base.append(dt)
+                self._runs_since_base = 0
         self._last_wall = now
         self._ran = False
-        self._discard = False
 
-    def discard(self) -> None:
-        """Don't time the current step (e.g. it built the V-JEPA model)."""
-        self._discard = True
+    def _median(self, xs) -> Optional[float]:
+        return statistics.median(xs) if len(xs) >= self.min_samples else None
+
+    @property
+    def base_s(self) -> Optional[float]:
+        return self._median(self._base)
+
+    @property
+    def run_s(self) -> Optional[float]:
+        return self._median(self._run)
 
     @property
     def cost_s(self) -> Optional[float]:
         """Extra wall time of a V-JEPA step over a step without it; None until both are timed."""
-        if self.base_s is None or self.run_s is None:
-            return None
-        return max(self.run_s - self.base_s, 0.0)
+        base, run = self.base_s, self.run_s
+        return None if base is None or run is None else max(run - base, 0.0)
 
     def interval(self) -> int:
         if self.budget <= 0:
@@ -112,9 +107,9 @@ class LatentPacer:
         cost = self.cost_s
         if cost is None:
             return 2  # bootstrap: alternate so both kinds of step get timed
-        k = max(1, math.ceil(cost / (self.budget * self.base_s) - 1e-9))  # EMA rounding at exact multiples
+        k = max(1, math.ceil(cost / (self.budget * self.base_s) - 1e-9))  # float noise at exact multiples
         if self._runs_since_base >= self.refresh:
-            k = max(k, 2)  # at k == 1 no step refreshes base_s; a stale one could pin k at 1
+            k = max(k, 2)  # at k == 1 no step refreshes base; a stale one could pin k at 1
         return k
 
     def take(self) -> int:

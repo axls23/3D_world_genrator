@@ -2778,7 +2778,6 @@ class Runner:
                     if cfg.latent_model == "vjepa":
                         if self._vjepa is None:
                             self._vjepa = self._build_vjepa(device)
-                            self._pacer.discard()  # model load is not V-JEPA step cost
                         latent_loss_val = None
                         self._vjepa_alpha_log = None
                         k = self._pacer.take()  # 0 = skip; else steps since the last run
@@ -2925,9 +2924,10 @@ class Runner:
                         latent_lambda(step, cfg.latent_lambda, cfg.latent_warmup_steps, cfg.latent_anneal_end),
                         step,
                     )
-                if cfg.latent_loss and cfg.latent_model == "vjepa" and self._pacer.cost_s is not None:
+                if cfg.latent_loss and cfg.latent_model == "vjepa":
                     self.writer.add_scalar("train/vjepa_interval", self._pacer.interval(), step)
-                    self.writer.add_scalar("train/vjepa_cost_ms", self._pacer.cost_s * 1000.0, step)
+                    if self._pacer.cost_s is not None:  # needs timed steps with and without V-JEPA
+                        self.writer.add_scalar("train/vjepa_cost_ms", self._pacer.cost_s * 1000.0, step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:

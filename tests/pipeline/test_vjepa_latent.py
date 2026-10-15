@@ -104,11 +104,11 @@ def _drive(p, steps, base, extra, before_take=None):
     now, weights, gaps, since = 0.0, [], [], 0
     for i in range(steps):
         p.tick(now)
-        if before_take is not None:
-            before_take(p, i)
         since += 1
         k = p.take()
-        now += base
+        now += base(i) if callable(base) else base
+        if before_take is not None:
+            now += before_take(i)
         if k:
             weights.append(k)
             gaps.append(since)
@@ -131,8 +131,8 @@ def test_pacer_budget_zero_runs_every_step():
 
 def test_pacer_cost_counts_time_after_the_call():
     # all of the extra time lands after take() returns, as the ViT backward does in loss.backward()
-    p = LatentPacer(budget=0.5, ema=0.0)
-    _drive(p, 12, base=0.4, extra=0.6)
+    p = LatentPacer(budget=0.5)
+    _drive(p, 30, base=0.4, extra=0.6)
     assert p.base_s == pytest.approx(0.4)
     assert p.run_s == pytest.approx(1.0)
     assert p.cost_s == pytest.approx(0.6)
@@ -140,32 +140,24 @@ def test_pacer_cost_counts_time_after_the_call():
 
 
 def test_pacer_weights_equal_gaps_when_interval_changes():
-    def shift(p, i):  # step times change mid-run, so the interval moves
-        if i == 150:
-            p.base_s *= 4.0
-
-    _, weights, gaps = _drive(LatentPacer(budget=0.5), 300, base=0.4, extra=1.2, before_take=shift)
+    # step time drops from 0.4 s to 0.1 s mid-run, so the interval moves from 3 to 12
+    _, weights, gaps = _drive(LatentPacer(budget=0.5), 300, base=lambda i: 0.4 if i < 150 else 0.1, extra=0.6)
     assert weights == gaps
-    assert len(set(weights)) > 2
+    assert 3 in weights and 12 in weights
 
 
-def test_pacer_skips_warmup_and_discarded_steps():
-    p = LatentPacer(budget=0.5, ema=0.0)
-    p.tick(0.0); p.take()  # skip step, first of its kind: warmup
-    p.tick(5.0); p.take()  # run step, first of its kind: warmup
-    p.tick(10.0); p.take(); p.discard()  # skip step that loaded a model
-    p.tick(30.0); p.take()
-    assert p.base_s is None and p.run_s is None
-    p.tick(31.0); p.take()
-    p.tick(31.4)
-    assert p.run_s == pytest.approx(1.0) and p.base_s == pytest.approx(0.4)
+def test_pacer_ignores_outlier_steps():
+    # a 20 s stall (eval, checkpoint, Difix) on the first timed steps and every 50 steps after
+    p = LatentPacer(budget=0.5)
+    _drive(p, 200, base=0.4, extra=0.6, before_take=lambda i: 20.0 if i in (1, 2) or i % 50 == 0 else 0.0)
+    assert p.cost_s == pytest.approx(0.6) and p.interval() == 3
 
 
 def test_pacer_refreshes_base_when_running_every_step():
-    p = LatentPacer(budget=0.5, ema=0.0, refresh=5)
+    p = LatentPacer(budget=0.5, refresh=5)
     _, weights, _ = _drive(p, 60, base=0.4, extra=0.1)  # cheap call: interval 1
     # after bootstrap: one skip (weight 2) per 5 timed runs
-    assert weights[2:12] == [1, 1, 1, 1, 2] * 2
+    assert weights[3:13] == [1, 1, 1, 1, 2] * 2
 
 
 def test_alpha_hole_raises_alpha_only_where_coverage_is_low():
