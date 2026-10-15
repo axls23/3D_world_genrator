@@ -53,6 +53,7 @@ from trainer_schedule import (
     floater_prune_mask,
     resolve_trainer_schedule,
 )
+from vjepa_checkpoint import default_vjepa_checkpoint, missing_vjepa_checkpoint
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -309,8 +310,9 @@ class Config:
     # "vjepa" (default): V-JEPA 2 is the main model; the depth/DINO stream is supporting context hooked
     # into its predictor. "feature": plain cosine on frozen DINO / Depth Anything features (baseline).
     latent_model: Literal["feature", "vjepa"] = "vjepa"
-    # V-JEPA 2 ViT-L checkpoint (vitl.pt: target_encoder + predictor), required for latent_model="vjepa"
-    vjepa_checkpoint: Optional[str] = "/mnt/Shared/3D_WORLD_GENRATION/hf_cache/vjepa2/vitl.pt"
+    # V-JEPA 2 ViT-L checkpoint (vitl.pt: target_encoder + predictor), required for latent_model="vjepa".
+    # Default: $HYPERSPLAT_VJEPA_CKPT, else the shared hf_cache copy
+    vjepa_checkpoint: Optional[str] = field(default_factory=default_vjepa_checkpoint)
     # Long side (px) of the photo / render fed to V-JEPA; multiple of 16
     vjepa_side: int = 256
     # Fraction of V-JEPA patches predicted (the rest are the visible context)
@@ -3897,4 +3899,10 @@ if __name__ == "__main__":
         cfg.with_ut = False
         cfg.with_eval3d = False
 
+    # Fail at startup, not at torch.load once the stream is running. Before cli(): no CUDA init or
+    # worker spawn. Eval / render runs (--ckpt) never build V-JEPA, so they skip the check.
+    if cfg.ckpt is None:
+        msg = missing_vjepa_checkpoint(cfg.latent_loss, cfg.latent_model, cfg.vjepa_checkpoint)
+        if msg is not None:
+            sys.exit(msg)
     cli(main, cfg, verbose=True)

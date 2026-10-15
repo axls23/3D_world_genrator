@@ -55,7 +55,7 @@ Every run prints the effective set on start (`config :` and `command:` lines).
 | Online Difix (share 0.15, from 50 % of the run) | on | `--no-difix` |
 | Seed 42 | on | `--seed N` |
 | Step ceiling | auto: 7000 video / 10000 live | `--steps N` |
-| Latent (JEPA-style) loss: 1 - cos of frozen-ViT features, render vs photo | off | on with `--jepa`; tune with `--jepa-lambda/-warmup/-anneal-end/-backend/-layer/-side` (not V-JEPA; failed its 300-step gate, see the evidence table) |
+| V-JEPA 2 latent loss: ViT-L is the main latent model; Depth Anything / DINOv2 features are its secondary stream, hooked into the predictor | off | on with `--jepa`; tune with `--jepa-lambda/-warmup/-anneal-end`, the secondary stream with `--jepa-backend/-layer/-side`. Needs the ViT-L checkpoint ([vitl.pt](https://dl.fbaipublicfiles.com/vjepa2/vitl.pt)) at `/mnt/Shared/3D_WORLD_GENRATION/hf_cache/vjepa2/vitl.pt` (a path in `$HYPERSPLAT_VJEPA_CKPT` replaces that default); a missing file stops the trainer at startup. Plain feature loss: `--trainer-arg latent_model=feature` (pipeline) |
 | MPS, refit recipe, gauge lock, ring, device poses, record | off | `--mps`, `--refit-recipe ace0`, `--gauge-lock`, `--cuda-ring`, `--device-poses`, `--record` |
 
 Evidence behind these defaults, with the status of each number:

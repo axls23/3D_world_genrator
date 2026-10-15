@@ -114,16 +114,20 @@ Options:
                       step for step (use the same video, --map-cache and options)
   --profile-cuda N[@S] CUDA timeline of N training steps from step S (default 500): Chrome
                       trace + sync/copy/kernel summary in <output>/results/stream_3dgs/profile
-  --jepa / --no-jepa  latent (JEPA-style) loss: 1 - cos between frozen-ViT patch features of the
-                      render and the photo, added to the photometric loss. OFF by default.
-                      Feature model: Depth Anything V2 backbone (default) or plain DINOv2
-                      (note: this is not V-JEPA; it failed its 300-step gate on the drone clip)
+  --jepa / --no-jepa  V-JEPA 2 latent loss, added to the photometric loss. OFF by default.
+                      V-JEPA 2 ViT-L is the main latent model; frozen Depth Anything V2 (default)
+                      or DINOv2 features of the photo are its secondary stream, hooked into the
+                      V-JEPA predictor. Needs the ViT-L checkpoint (vitl.pt, from
+                      https://dl.fbaipublicfiles.com/vjepa2/vitl.pt) at
+                      /mnt/Shared/3D_WORLD_GENRATION/hf_cache/vjepa2/vitl.pt; a path in
+                      $HYPERSPLAT_VJEPA_CKPT replaces that default. Without the file the
+                      trainer stops at startup
   --jepa-lambda L     latent loss weight (default 0.1)
   --jepa-warmup S     no latent loss before step S (default 0)
   --jepa-anneal-end S linearly anneal the weight to 0 at step S (default 0: hold constant)
-  --jepa-backend B    depth_anything (default) or dinov2
-  --jepa-layer L      ViT layer: -1 last (default); depth_anything accepts 3, 6, 9, 12
-  --jepa-side PX      long side fed to the ViT (default 224)
+  --jepa-backend B    secondary stream: depth_anything (default) or dinov2
+  --jepa-layer L      secondary stream ViT layer: -1 last (default); depth_anything accepts 3, 6, 9, 12
+  --jepa-side PX      long side fed to the secondary stream's ViT (default 224)
   --adaptive-spacing  measure the rotation between adjacent keyframes (per-source spacing; logs only
                       until a consumer uses it; off by default)
   --debug-offered DIR save every offered frame (ACE res) and its gate decision to DIR (offers.jsonl)
@@ -242,7 +246,7 @@ fi
     || { echo "[stream-demo] ERROR: --fps must be a positive integer" >&2; exit 2; }
 EXTRA+=(--trainer-arg "stream_capture_fps=$CAPTURE_FPS")
 
-# Latent (JEPA-style) loss: off unless --jepa. Tuning flags without --jepa are ignored, with a warning.
+# V-JEPA latent loss: off unless --jepa. Tuning flags without --jepa are ignored, with a warning.
 if [[ $JEPA -eq 1 ]]; then
     [[ "$JEPA_BACKEND" == depth_anything || "$JEPA_BACKEND" == dinov2 ]] \
         || { echo "[stream-demo] ERROR: --jepa-backend must be depth_anything or dinov2" >&2; exit 2; }
@@ -453,7 +457,7 @@ info "output : $OUTPUT/results/stream_3dgs"
 info "config : cold-start=$COLD (ace $([[ $COLD -eq 1 ]] && echo continuous || echo refit))  mapper-depth=$MAPDEPTH (w=$MAPDEPTH_W)  lbfgs=$LBFGS (every $LBFGS_EVERY)"
 info "         3dgut=$UT  difix=$DIFIX (share $DIFIX_SHARE, start $DIFIX_START)  seed=$SEED  mps=${MPS:-off}  steps=${EXTRA_STEPS:-auto}"
 if [[ $JEPA -eq 1 ]]; then
-    info "         jepa=on ($JEPA_BACKEND layer $JEPA_LAYER side $JEPA_SIDE, lambda $JEPA_LAMBDA, warmup $JEPA_WARMUP, anneal-end $JEPA_ANNEAL)"
+    info "         jepa=on (V-JEPA 2 + $JEPA_BACKEND stream layer $JEPA_LAYER side $JEPA_SIDE, lambda $JEPA_LAMBDA, warmup $JEPA_WARMUP, anneal-end $JEPA_ANNEAL)"
 else
     info "         jepa=off"
 fi

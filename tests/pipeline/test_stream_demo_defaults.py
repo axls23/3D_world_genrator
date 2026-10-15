@@ -74,3 +74,12 @@ def test_jepa_validation_fails_before_launch(args, message):
                          capture_output=True, text=True, cwd=ROOT)
     assert res.returncode == 2
     assert message in res.stderr
+
+
+def test_jepa_help_and_banner_describe_vjepa():
+    res = subprocess.run(["bash", str(SCRIPT), "--help"], capture_output=True, text=True, cwd=ROOT)
+    assert res.returncode == 0
+    assert "V-JEPA 2 ViT-L is the main latent model" in res.stdout
+    assert "HYPERSPLAT_VJEPA_CKPT" in res.stdout
+    assert "not V-JEPA" not in res.stdout
+    assert 'jepa=on (V-JEPA 2 + $JEPA_BACKEND stream' in SCRIPT.read_text()
