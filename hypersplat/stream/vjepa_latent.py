@@ -23,6 +23,8 @@ raises opacity where geometry is missing. Patches outside ``valid`` (e.g. sky, n
 
 import logging
 import math
+import statistics
+from collections import deque
 from typing import Callable, NamedTuple, Optional
 
 import torch
@@ -43,43 +45,81 @@ _STD = (0.229, 0.224, 0.225)
 class LatentPacer:
     """Paces the V-JEPA term against the trainer's own step rate.
 
-    ``budget`` is the fraction of a trainer step the V-JEPA call may add on average. The call runs
-    every ``interval`` steps, with ``interval = ceil(call_cost / (budget * step_time))``, so the
-    V-JEPA share of wall time stays near ``budget``. On run steps the term is multiplied by
-    ``interval``, so its expected contribution over time matches running it every step.
-    ``budget <= 0`` runs it every step. Times are EMAs; the step time excludes V-JEPA time.
+    ``budget`` is the fraction of a trainer step V-JEPA may add on average. Each step where the term
+    applies, the trainer calls ``take()``: 0 means skip, otherwise V-JEPA runs and the term is
+    multiplied by the returned weight, the number of steps since the last run (this one included).
+    Weights equal the actual gaps even when the interval changes, so the term's expected
+    contribution matches running it every step. A run is due once the gap reaches
+    ``interval = ceil(cost / (budget * base))``; ``budget <= 0`` runs it every step.
+
+    ``base`` is the whole-step wall time on steps without V-JEPA and ``cost`` is the wall time on
+    V-JEPA steps minus ``base``, so the ViT backward inside ``loss.backward()`` and GPU work queued
+    by the call are counted, which a timer around the forward misses. Both are medians over the last
+    ``window`` steps of each kind: eval, checkpoint, Difix or warmup steps are outliers, not cost.
+    Until each has ``min_samples``, V-JEPA runs on alternate steps. With ``interval == 1`` one step
+    in every ``refresh`` runs is skipped so ``base`` stays current.
     """
 
-    def __init__(self, budget: float, ema: float = 0.9):
+    def __init__(self, budget: float, window: int = 9, min_samples: int = 3, refresh: int = 20):
         self.budget = budget
-        self.ema = ema
-        self.base_s: Optional[float] = None  # trainer step time, V-JEPA time removed
-        self.cost_s: Optional[float] = None  # one V-JEPA call
+        self.min_samples = min_samples
+        self.refresh = refresh
+        self._base = deque(maxlen=window)  # step wall times without V-JEPA
+        self._run = deque(maxlen=window)  # step wall times with V-JEPA
         self._last_wall: Optional[float] = None
-        self._last_cost = 0.0
-
-    def _mix(self, old, new):
-        return new if old is None else self.ema * old + (1.0 - self.ema) * new
+        self._ran = False  # the current step ran V-JEPA
+        self._gap = 0  # take() calls since the last run
+        self._runs_since_base = 0
 
     def tick(self, now: float) -> None:
         """Call once at the top of each training step with ``time.time()``."""
         if self._last_wall is not None:
-            self.base_s = self._mix(self.base_s, max((now - self._last_wall) - self._last_cost, 1e-6))
+            dt = max(now - self._last_wall, 1e-6)
+            if self._ran:
+                self._run.append(dt)
+                self._runs_since_base += 1
+            else:
+                self._base.append(dt)
+                self._runs_since_base = 0
         self._last_wall = now
-        self._last_cost = 0.0
+        self._ran = False
+
+    def _median(self, xs) -> Optional[float]:
+        return statistics.median(xs) if len(xs) >= self.min_samples else None
+
+    @property
+    def base_s(self) -> Optional[float]:
+        return self._median(self._base)
+
+    @property
+    def run_s(self) -> Optional[float]:
+        return self._median(self._run)
+
+    @property
+    def cost_s(self) -> Optional[float]:
+        """Extra wall time of a V-JEPA step over a step without it; None until both are timed."""
+        base, run = self.base_s, self.run_s
+        return None if base is None or run is None else max(run - base, 0.0)
 
     def interval(self) -> int:
-        if self.budget <= 0 or self.base_s is None or self.cost_s is None:
+        if self.budget <= 0:
             return 1
-        return max(1, math.ceil(self.cost_s / (self.budget * self.base_s)))
+        cost = self.cost_s
+        if cost is None:
+            return 2  # bootstrap: alternate so both kinds of step get timed
+        k = max(1, math.ceil(cost / (self.budget * self.base_s) - 1e-9))  # float noise at exact multiples
+        if self._runs_since_base >= self.refresh:
+            k = max(k, 2)  # at k == 1 no step refreshes base; a stale one could pin k at 1
+        return k
 
-    def should_run(self, step: int) -> bool:
-        return step % self.interval() == 0
-
-    def record(self, cost_s: float) -> None:
-        """Call with the wall time of a V-JEPA call that just ran."""
-        self._last_cost = cost_s
-        self.cost_s = self._mix(self.cost_s, cost_s)
+    def take(self) -> int:
+        """Call once per step where the term applies: 0 to skip, else the weight for this run."""
+        self._gap += 1
+        if self._gap < self.interval():
+            return 0
+        k, self._gap = self._gap, 0
+        self._ran = True
+        return k
 
 
 class SecondaryHook:
