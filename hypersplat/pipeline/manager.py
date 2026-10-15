@@ -14,7 +14,7 @@ import argparse
 import logging
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, NamedTuple, Optional
 import shutil
 
 # Keep HF model downloads (Difix, ~5 GB) on the data drive, not ~/.cache on the root disk.
@@ -34,6 +34,50 @@ logger = logging.getLogger(__name__)
 
 # Starting training budget of a live stream without --steps; it grows as views arrive
 LIVE_INITIAL_STEPS = 2000
+# A live run's length is unknown up front, so its pose-opt warmup is sized for the old fixed
+# 10k live schedule (1500 steps) rather than for the 2k starting budget (300)
+LIVE_WARMUP_REF_STEPS = 10_000
+# Eval/save/PLY step past any real run: only the trainer's final step (always evals, saves
+# and exports) fires. An empty list would let the trainer's [7000, 30000] defaults apply.
+FINAL_STEP_ONLY = 10**9
+
+
+class StreamStepSettings(NamedTuple):
+    max_steps: int
+    eval_steps: List[int]
+    save_steps: List[int]
+    warmup: int
+    extra_args: List[str]   # step-related trainer args beyond --max_steps/--eval/--save_steps
+
+
+def stream_step_settings(config, kind: str) -> StreamStepSettings:
+    """Step schedule of a stream run; pure, so it can be tested without launching training.
+
+    Live sources have no natural end. Like a download's ETA, the total starts from a short
+    budget and grows with the data: every new view pushes the end to step + extend
+    (StreamHorizon), and settling coverage pulls it in. Only an explicit step count (or a
+    file source) is a hard ceiling. Values in config.USER_SET always win.
+    """
+    from hypersplat.pipeline.params.strategies.training_budget import WARMUP_FRACTION
+
+    user_set = config.USER_SET
+    dynamic = "TRAINING_MAX_STEPS" not in user_set and kind != "file"
+    steps = LIVE_INITIAL_STEPS if dynamic else config.TRAINING_MAX_STEPS
+    final = FINAL_STEP_ONLY if dynamic else steps
+    eval_steps = (config.TRAINING_EVAL_STEPS if "TRAINING_EVAL_STEPS" in user_set
+                  else [final])
+    save_steps = (config.TRAINING_SAVE_STEPS if "TRAINING_SAVE_STEPS" in user_set
+                  else [final])
+    if "POSE_OPT_WARMUP" in user_set:
+        warmup = config.POSE_OPT_WARMUP
+    else:
+        # Same fraction as the batch budget (the fixed 1000 was half of a 2k run)
+        ref = LIVE_WARMUP_REF_STEPS if dynamic else steps
+        warmup = int(ref * WARMUP_FRACTION / 10.0 + 0.5) * 10
+    extra = ["--ply_steps", str(final)]
+    if not dynamic:
+        extra += ["--stream_max_steps_cap", str(steps)]
+    return StreamStepSettings(steps, eval_steps, save_steps, warmup, extra)
 
 
 
@@ -1060,26 +1104,14 @@ class IntelligentPipeline:
                                                  difix=bool(self.config.DIFIX_ONLINE))
             logger.info(f"[Config] Stream Gaussian cap: {self.config.CAP_MAX}")
 
-        # Live sources have no natural end. Like a download's ETA, the total starts from a short
-        # budget and grows with the data: every new view pushes the end to step + extend
-        # (StreamHorizon), and settling coverage pulls it in. Only an explicit step count is a
-        # hard ceiling (--stream_max_steps_cap below). The final step always evals and saves.
-        dynamic = "TRAINING_MAX_STEPS" not in self.config.USER_SET and kind != "file"
-        if dynamic:
-            self.config.TRAINING_MAX_STEPS = LIVE_INITIAL_STEPS
-        steps = self.config.TRAINING_MAX_STEPS
-        if "TRAINING_EVAL_STEPS" not in self.config.USER_SET:
-            self.config.TRAINING_EVAL_STEPS = [] if dynamic else [steps]
-        if "TRAINING_SAVE_STEPS" not in self.config.USER_SET:
-            self.config.TRAINING_SAVE_STEPS = [] if dynamic else [steps]
-        if "POSE_OPT_WARMUP" not in self.config.USER_SET:
-            # Same fraction as the batch budget (the fixed 1000 was half of a 2k run)
-            from hypersplat.pipeline.params.strategies.training_budget import WARMUP_FRACTION
-            self.config.POSE_OPT_WARMUP = int(steps * WARMUP_FRACTION / 10.0 + 0.5) * 10
+        # Live runs grow from a short budget; see stream_step_settings
+        sched = stream_step_settings(self.config, kind)
+        steps = self.config.TRAINING_MAX_STEPS = sched.max_steps
+        self.config.TRAINING_EVAL_STEPS = sched.eval_steps
+        self.config.TRAINING_SAVE_STEPS = sched.save_steps
+        self.config.POSE_OPT_WARMUP = sched.warmup
         extra = ["--stream_source", source, "--stream_pace", self.config.STREAM_PACE,
-                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB)]
-        if not dynamic:
-            extra += ["--ply_steps", str(steps), "--stream_max_steps_cap", str(steps)]
+                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB)] + sched.extra_args
         if self.config.STREAM_FLIGHT_PORT:
             extra += ["--stream_flight_port", str(self.config.STREAM_FLIGHT_PORT)]
         if self.config.STREAM_DASHBOARD_PORT:
@@ -1102,8 +1134,12 @@ class IntelligentPipeline:
         if self.config.STREAM_TARGET_PSNR:
             extra += ["--stream_converge_target_psnr", str(self.config.STREAM_TARGET_PSNR)]
         if self.config.EARLY_STOPPING:
+            # Without a cap, max_steps is only the starting budget (it grows with new views)
+            limit = (f"max_steps {steps} is only a ceiling"
+                     if "--stream_max_steps_cap" in sched.extra_args
+                     else f"starts at {steps} steps, grows with new views")
             logger.info("[Stream] Early stop: training ends once the world is reconstructed "
-                        f"(max_steps {steps} is only a ceiling; --no-early-stopping to disable)")
+                        f"({limit}; --no-early-stopping to disable)")
         result_dir = self._run_training(None, result_name="stream_3dgs", extra_args=extra)
 
         if self.config.PRUNE:
