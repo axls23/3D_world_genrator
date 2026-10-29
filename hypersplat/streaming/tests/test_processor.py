@@ -681,8 +681,11 @@ def test_psnr_drop_is_flagged_without_the_forest_and_stored_with_the_snapshot():
     store = MemoryStore()
     out = P.Processor(store, sender).process_batch([rec(snap_psnr(i, v, rounds=i // 5)) for i, v in enumerate(readings)])
     assert out and out[-1].source == "training" and out[-1].reason.startswith("psnr_drop=-")
+    assert {a.model for a in out} == {"psnr_trend"}                         # named for the rule, not the forest
+    assert len(out) == 3                                                    # one per NEW reading (21.8, 21.2, 20.5), not per snapshot
     last = store.snaps[("job1", len(readings) - 1)]
-    assert last["psnr"] == 20.5 and last["difix_rounds"] == 3 and last["is_anomaly"]
+    assert last["psnr"] == 20.5 and last["difix_rounds"] == 3
+    assert store.snaps[("job1", 14)]["is_anomaly"] and not last["is_anomaly"]   # flagged where 20.5 first appears
     assert not store.snaps[("job1", 3)]["is_anomaly"]
     ok = P.Processor(MemoryStore(), FakeSender()).process_batch([rec(snap_psnr(i, 21.0 + 0.1 * (i // 3))) for i in range(15)])
     assert ok == []

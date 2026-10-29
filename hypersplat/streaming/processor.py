@@ -37,6 +37,8 @@ from . import contract as c
 logger = logging.getLogger(__name__)
 
 POLL_MS = 500          # poll timeout; also the worst-case reaction time to SIGINT/SIGTERM
+# anomalies raised by a trend rule are named for the rule, not for the forest that scored the row
+_RULE_MODELS = {"loss_rising": "loss_rising", "psnr_drop": "psnr_trend"}
 HEALTH_REALERT = 30   # while the head stays unhealthy, repeat the anomaly every this many samples
 MAX_RECORDS = 500      # one DB transaction per poll batch of at most this many events
 LOG_EVERY_S = 10.0     # throughput log line period
@@ -244,7 +246,9 @@ def training_row(window: Sequence[c.TrainingSnapshot], best_loss: float, peak_me
         row["is_anomaly"], reason = True, "loss_rising=%+.0f%%" % (100 * rise)
         row["anomaly_score"] = min(row["anomaly_score"] or 0.0, -rise)
     falling, drop = c.falling_psnr(window)    # held-out quality sliding: loss can look fine while PSNR drops
-    if falling and not row["is_anomaly"]:
+    # PSNR is carried forward between readings: judge only the snapshot where a new reading appears
+    new_reading = len(window) < 2 or window[-1].psnr != window[-2].psnr
+    if falling and new_reading and not row["is_anomaly"]:
         row["is_anomaly"], reason = True, "psnr_drop=-%.1fdB" % drop
         row["anomaly_score"] = min(row["anomaly_score"] or 0.0, -drop)
     return row, reason if row["is_anomaly"] else None
@@ -504,7 +508,8 @@ class Processor:
     def _anomaly(self, ev, kind: str, model: AnomalyModel, row: Dict, reason: str,
                  name: Optional[str] = None) -> c.Anomaly:
         # ts is the flagged event's own time, so a replayed tail re-sends identical messages.
-        name = name or (model.name if model is not None else "loss_rising")
+        name = name or _RULE_MODELS.get(reason.split("=", 1)[0]) or (
+            model.name if model is not None else "loss_rising")
         return c.Anomaly(job_id=ev.job_id, ts=ev.ts, source=kind, source_seq=ev.seq,
                          anomaly_id=c.anomaly_id(ev.job_id, kind, ev.seq, name), model=name,
                          score=row["anomaly_score"], reason=reason, injected=getattr(ev, "injected", None))
