@@ -29,6 +29,8 @@ from typing import Dict, Optional
 import cv2
 import numpy as np
 
+from hypersplat.stream.streamed import StreamedResults
+
 logger = logging.getLogger(__name__)
 
 FEED_FPS = 15
@@ -459,7 +461,7 @@ PAGE_STREAMING = """<!doctype html>
           <div class="map-legend"><span><i class="legend-dot"></i>Registered pose</span><span><i class="legend-dot bad"></i>Flagged pose</span></div></div>
         <div><div class="panel-head"><div><div class="section-label">Signal integrity</div><div class="panel-subtitle">Data quality and model status</div></div></div>
           <div class="quality" id="anomaly-status"><span class="quality-icon">&#9888;</span><div>
-            <strong>Anomaly model not connected</strong><p>This run does not emit anomaly scores yet. Red markers will appear here when an offline detector is integrated.</p>
+            <strong id="anomaly-title">Waiting for processor results</strong><p id="anomaly-text">Scored poses and training snapshots appear here as the streaming processor writes them.</p>
           </div></div><div class="metric-grid" id="quality-stats" style="margin-top:8px"></div></div>
       </div>
     </article>
@@ -723,12 +725,22 @@ async function tick() {
                      ["Loss trend", lossTrend], ["Gaussian growth / 100 steps", gsGrowth],
                      ["Peak GPU memory", peakGpu === null ? null : `${fmt(peakGpu)} GB`]];
     fill("quality-stats", quality);
-    const anomalies = s.anomaly_flags || [];
-    if (anomalies.length) {
-      const box = document.getElementById("anomaly-status");
+    // What the streaming processor concluded, as it arrives (s.streamed comes from PostgreSQL)
+    const st = s.streamed || {available: false, reason: "no streamed results"};
+    const box = document.getElementById("anomaly-status");
+    const title = document.getElementById("anomaly-title"), text = document.getElementById("anomaly-text");
+    const flagged = (st.poses_flagged || 0) + (st.training_flagged || 0);
+    if (!st.available) {
+      title.textContent = "Waiting for processor results"; text.textContent = st.reason || "";
+      box.style.borderColor = ""; box.style.background = "";
+    } else if (flagged) {
       box.style.borderColor = "#ff6b7866"; box.style.background = "#ff6b7812";
-      box.querySelector("strong").textContent = `${anomalies.length} flagged event${anomalies.length === 1 ? "" : "s"}`;
-      box.querySelector("p").textContent = anomalies[0].reason || "Review flagged pose or training events.";
+      title.textContent = `${flagged} flagged event${flagged === 1 ? "" : "s"} in job ${st.job_id}`;
+      text.textContent = `${st.poses_flagged} of ${st.poses_scored} scored poses, ${st.training_flagged} training. Latest: ${(s.anomaly_flags[0] || {}).reason || ""}`;
+    } else {
+      title.textContent = `No flagged events in job ${st.job_id}`;
+      text.textContent = `${st.poses_scored} poses scored so far.`;
+      box.style.borderColor = ""; box.style.background = "";
     }
   } catch (e) {
     document.getElementById("hint").textContent = "Run ended (dashboard offline)";
@@ -743,8 +755,10 @@ tick();
 
 
 class Dashboard:
-    def __init__(self, session, port: int = 8090, host: str = "127.0.0.1", tb_dir: Optional[str] = None):
+    def __init__(self, session, port: int = 8090, host: str = "127.0.0.1", tb_dir: Optional[str] = None,
+                 results=None):
         self.session = session
+        self.results = results if results is not None else StreamedResults()
         self.tb_dir = tb_dir
         self._tb = None
         self._tb_cache = (0.0, {})
@@ -768,13 +782,15 @@ class Dashboard:
     def status(self) -> Dict:
         stats = self.session.stats()
         phase, hint = self.session.phase()
+        streamed = self.results.snapshot()
         return {**stats, "phase": phase, "hint": hint, "viewer_port": self.viewer_port,
-                "training": dict(self.training)}
+                "training": dict(self.training), "streamed": streamed, "anomaly_flags": streamed["flags"]}
 
     def pose_path(self) -> Dict:
         store = getattr(self.session, "store", None)
         if store is None:
             return {"map_version": 0, "poses": []}
+        flagged = set(self.results.snapshot()["flagged_frames"])
         poses = []
         for keyframe in store.registered():
             if keyframe.w2c is None:
@@ -785,7 +801,7 @@ class Dashboard:
                 c2w = to_trainer(c2w)
             x, y, z = c2w[:3, 3]
             poses.append({"kid": keyframe.kid, "name": keyframe.name, "x": float(x), "y": float(y),
-                          "z": float(z), "confidence": float(keyframe.conf), "flagged": False})
+                          "z": float(z), "confidence": float(keyframe.conf), "flagged": keyframe.name in flagged})
         return {"map_version": int(getattr(self.session, "map_version", 0)), "poses": poses}
 
     def metrics(self, max_points: int = 300) -> Dict:

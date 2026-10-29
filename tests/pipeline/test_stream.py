@@ -1024,3 +1024,46 @@ def test_blocked_mapping_fails_session_once_nothing_can_register():
         st.update_pose(pending.kid, np.eye(4), 1.0, 1)   # it failed to register
         StreamSession._mapping_blocked(s)
         assert s.failed and "mapping stalled" in s.failed
+
+
+def test_dashboard_shows_the_processors_runtime_results():
+    """Flags come from the streamed results (PostgreSQL via StreamedResults), not from the page."""
+    import json
+    import urllib.request
+    from types import SimpleNamespace
+
+    from hypersplat.stream.dashboard import Dashboard
+
+    class Results:
+        def snapshot(self):
+            return {"available": True, "reason": "", "job_id": "live", "poses_scored": 3, "poses_flagged": 1,
+                    "training_flagged": 0, "age_s": 0.4, "flagged_frames": ["f1.jpg"],
+                    "flags": [{"source": "pose", "seq": 1, "frame": "f1.jpg", "score": -0.3, "injected": None,
+                               "reason": "pose model flagged f1.jpg (score -0.300)"}]}
+
+    class FakeSession:
+        store = SimpleNamespace(registered=lambda: [
+            SimpleNamespace(kid=i, name="f%d.jpg" % i, w2c=np.eye(4), conf=0.9) for i in range(3)])
+        map_version = 1
+
+        def stats(self):
+            return {"frames_read": 3, "keyframes": 3}
+
+        def phase(self):
+            return "tracking", "Tracking"
+
+        def latest_frame(self):
+            return None
+
+    port = _free_port()
+    dash = Dashboard(FakeSession(), port=port, results=Results()).start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        status = json.loads(urllib.request.urlopen(base + "/status.json", timeout=5).read())
+        assert status["streamed"]["job_id"] == "live" and status["anomaly_flags"][0]["frame"] == "f1.jpg"
+        poses = json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())["poses"]
+        assert [p["flagged"] for p in poses] == [False, True, False]
+        page = urllib.request.urlopen(base + "/streaming", timeout=5).read().decode()
+        assert "Anomaly model not connected" not in page and "s.streamed" in page
+    finally:
+        dash.stop()

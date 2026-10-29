@@ -3,9 +3,11 @@
     python -m hypersplat.stream.demo_events [--video demo/input/drone_demo.mp4] [--port 8090]
 
 No camera, ACE or GPU is needed: frames come from a video file (or a generated texture), camera poses
-walk a spiral with a few bad poses injected, and training loss/Gaussian count are synthetic and written
-to a TensorBoard directory the way the trainer does. Events are paced at a fixed rate so the page
-visibly updates; it is a stand-in for the live run, not a measurement.
+walk a spiral with a few bad poses injected, and training loss/Gaussian count are synthetic. Poses and
+training snapshots are sent to Kafka exactly as the live hooks send them, so the flags on the page are
+whatever the streaming processor and its models write to PostgreSQL (start the pod first); nothing is
+flagged here by hand. Events are paced at a fixed rate; it is a stand-in for the live run, not a
+measurement.
 """
 
 import argparse
@@ -20,8 +22,10 @@ import cv2
 import numpy as np
 
 from hypersplat.stream.dashboard import Dashboard
+from hypersplat.streaming import contract as c
+from hypersplat.streaming.producer import Sender
 
-BAD_POSES = {17, 18, 33}   # injected outliers drawn as red markers
+BAD_POSES = {17, 18, 33}   # camera poses the "estimator" gets wrong; sent with injected="shuffle" as ground truth
 
 
 class _Store:
@@ -38,7 +42,10 @@ class _Store:
 class DemoSession:
     """The slice of StreamSession the dashboard reads."""
 
-    def __init__(self, video: Optional[str], eps: float, total_steps: int):
+    def __init__(self, video: Optional[str], eps: float, total_steps: int, sender: Optional[Sender] = None,
+                 job_id: Optional[str] = None):
+        self.sender = sender
+        self.job_id = job_id or "demo-events-%d" % int(time.time())
         self.cap = cv2.VideoCapture(video) if video else None
         self.eps, self.total_steps = eps, total_steps
         self.store, self.map_version = _Store(), 1
@@ -92,20 +99,14 @@ class DemoSession:
                                               conf=0.35 if i in BAD_POSES else 0.9))
         self.accepted += 1
         self._last_kf = time.time()
-
-
-class DemoDashboard(Dashboard):
-    def pose_path(self) -> Dict:
-        out = super().pose_path()
-        for p in out["poses"]:
-            p["flagged"] = p["kid"] in BAD_POSES
-        return out
-
-    def status(self) -> Dict:
-        s = super().status()
-        s["anomaly_flags"] = [{"kid": p["kid"], "reason": f"Pose {p['name']} jumps away from the camera path"}
-                              for p in self.pose_path()["poses"] if p["flagged"]]
-        return s
+        if self.sender is not None:
+            t = self.store.kfs[-1]
+            w, x, y, z = 1.0, 0.0, 0.0, 0.0
+            tx, ty, tz = np.asarray(t.w2c)[:3, 3]
+            self.sender.send(c.CameraPose(
+                self.job_id, self.sender.next_seq(self.job_id), time.time(), t.name, w, x, y, z,
+                float(tx), float(ty), float(tz), 600.0, 1000.0 * t.conf,
+                injected="shuffle" if i in BAD_POSES else None, source="replay"))
 
 
 def main():
@@ -120,8 +121,9 @@ def main():
     from torch.utils.tensorboard import SummaryWriter
     tb = tempfile.mkdtemp(prefix="demo_events_tb_")
     writer = SummaryWriter(tb, flush_secs=1)
-    s = DemoSession(a.video, a.eps, a.steps)
-    dash = DemoDashboard(s, port=a.port, host=a.host, tb_dir=tb).start()
+    sender = Sender()
+    s = DemoSession(a.video, a.eps, a.steps, sender)
+    dash = Dashboard(s, port=a.port, host=a.host, tb_dir=tb).start()
     print(f"[demo-events] base UI {dash.url}   telemetry view {dash.url}/streaming   (Ctrl+C to stop)", flush=True)
     rng, i, step = np.random.default_rng(0), 0, 0
     try:
@@ -138,6 +140,9 @@ def main():
             writer.add_scalar("train/num_GS", 40000 + 90 * step, step)
             writer.add_scalar("train/mem", 3.0 + step / 2000, step)
             dash.update_training(step=step, max_steps=a.steps, num_gs=40000 + 90 * step, loss=loss)
+            sender.send(c.TrainingSnapshot(s.job_id, sender.next_seq(s.job_id), time.time(), step, float(loss),
+                                           40000 + 90 * step, 3.0 + step / 2000,
+                                           injected="loss_spike" if 1500 <= step < 1530 else None))
             time.sleep(1.0 / a.eps)
         s.ended = True
         dash.update_training(done=True)
@@ -145,6 +150,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        sender.close() if hasattr(sender, "close") else None
         dash.stop()
 
 
