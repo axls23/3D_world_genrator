@@ -1,0 +1,138 @@
+# Streaming mini-project stack (Policy & Process Map rows 5, 13, 19): Kafka (KRaft) -> topics ->
+# PostgreSQL -> processor -> Streamlit dashboard. Start it with ops/up.sh, which keeps the fixed
+# start order and trains the anomaly models on the host between topics and processor; the
+# producers (trainer/ACE hooks or replay) run on the host and connect to the EXTERNAL listener.
+#
+#   docker compose -f hypersplat/streaming/docker-compose.yml up -d        (or ops/up.sh)
+#
+# Host ports follow hypersplat/streaming/contract.py and its HYPERSPLAT_* overrides
+# (KAFKA_PORT 9094, DB_PORT 5433, DASHBOARD_PORT 8501). 8080/8081/8092 belong to gsplat-server in
+# the repository's root docker-compose.yml and are never used here.
+name: hypersplat-streaming
+
+# Python services run the repository (mounted read-only at /app) on a stock image; kafka-init
+# installs requirements.txt into the shared /venv volume once, later services reuse it.
+x-python: &python
+  image: docker.io/library/python:3.11-slim
+  working_dir: /app
+  volumes:
+    - ../..:/app:ro
+    - venv:/venv
+  environment: &python-env
+    PYTHONPATH: /app
+    PYTHONUNBUFFERED: "1"
+    # Containers reach Kafka and PostgreSQL on the compose network. The *_INTERNAL names are the
+    # contract's in-network settings; the plain names are set to the same values so modules that
+    # use the default KAFKA_BOOTSTRAP / DB_DSN also work unchanged inside a container.
+    HYPERSPLAT_KAFKA_INTERNAL: kafka:29092
+    HYPERSPLAT_KAFKA: kafka:29092
+    HYPERSPLAT_DB_DSN_INTERNAL: postgresql://hypersplat:hypersplat@db:5432/hypersplat
+    HYPERSPLAT_DB_DSN: postgresql://hypersplat:hypersplat@db:5432/hypersplat
+    HYPERSPLAT_TOPIC_PREFIX: ${HYPERSPLAT_TOPIC_PREFIX:-}
+
+services:
+  kafka:
+    image: docker.io/apache/kafka:3.9.1
+    restart: unless-stopped
+    ports:
+      # EXTERNAL listener, published on every host interface so Windows (localhost) and WSL
+      # (localhost when mirrored, else the Windows host IP) both reach it.
+      - "${HYPERSPLAT_KAFKA_PORT:-9094}:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9094,CONTROLLER://:9093
+      # Clients get these addresses back from the bootstrap call, so EXTERNAL must name an
+      # address the producer host can reach (set HYPERSPLAT_KAFKA_ADVERTISED_HOST for WSL/LAN).
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://${HYPERSPLAT_KAFKA_ADVERTISED_HOST:-localhost}:${HYPERSPLAT_KAFKA_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics come only from kafka-init (row 6)
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  kafka-init:
+    <<: *python
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # pip runs only when requirements.txt changed since the last fill (hash stamp in /venv), so
+    # restarts need no network once the volume is filled.
+    command:
+      - sh
+      - -c
+      - >-
+        h=$$(sha256sum hypersplat/streaming/requirements.txt | cut -d' ' -f1);
+        if [ "$$(cat /venv/.requirements.sha256 2>/dev/null)" != "$$h" ]; then
+        { [ -x /venv/bin/python ] || python -m venv /venv; }
+        && /venv/bin/pip install -q --disable-pip-version-check -r hypersplat/streaming/requirements.txt
+        && echo "$$h" > /venv/.requirements.sha256 || exit 1;
+        fi;
+        exec /venv/bin/python -m hypersplat.streaming.topics --wait 120 create
+
+  db:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "${HYPERSPLAT_DB_PORT:-5433}:5432"   # 5433 leaves a native PostgreSQL on 5432 alone
+    environment:
+      POSTGRES_USER: hypersplat
+      POSTGRES_PASSWORD: hypersplat
+      POSTGRES_DB: hypersplat
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hypersplat -q"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  processor:
+    <<: *python
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    command: ["/venv/bin/python", "-m", "hypersplat.streaming.processor"]
+
+  dashboard:
+    <<: *python
+    restart: unless-stopped
+    depends_on:
+      kafka-init:   # also the step that fills /venv
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    ports:
+      - "${HYPERSPLAT_DASHBOARD_PORT:-8501}:8501"
+    command:
+      - /venv/bin/python
+      - -m
+      - streamlit
+      - run
+      - hypersplat/streaming/dashboard.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+
+volumes:
+  venv:
+  kafka_data:
+  db_data:
