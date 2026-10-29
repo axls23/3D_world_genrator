@@ -174,7 +174,8 @@ after the run started counts; it is honoured during the bootstrap too). Viewer /
 `demo/run_stream_demo.sh --streaming ...` (or `run_stream_demo.bat --streaming`) sends the run's camera
 poses and training metrics to Apache Kafka with no changes to the pipeline: the hooks in
 `hypersplat/streaming` wrap the stream session and the trainer's TensorBoard writer. Start the data layers
-first with `hypersplat/streaming/ops/pod.sh up` (Kafka, Postgres, processor, Streamlit on 8501). The
+itself: `--streaming` runs `hypersplat/streaming/ops/pod.sh up` at the start when Kafka or Streamlit is not
+answering (Kafka, Postgres, processor, Streamlit on 8501); set `HYPERSPLAT_NO_POD=1` to start them yourself. The
 processor scores every event; the 8090 page's **Streaming visualization** view shows the flags for this
 run's job (`HYPERSPLAT_JOB_ID`) as they arrive. If Kafka is down events are dropped, never blocking training.
 

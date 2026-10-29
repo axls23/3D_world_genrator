@@ -33,11 +33,21 @@ export PYTHONPATH="$HERE/autohook${PYTHONPATH:+:$PYTHONPATH}"
 export HYPERSPLAT_JOB_ID="${HYPERSPLAT_JOB_ID:-$(basename "$OUTPUT")-$(date +%Y%m%d-%H%M%S)}"
 export HYPERSPLAT_STREAMING_TRAINER_ARGS="tb_every=$TB_EVERY${HYPERSPLAT_STREAMING_TRAINER_ARGS:+ $HYPERSPLAT_STREAMING_TRAINER_ARGS}"
 
-# Say plainly what is not up instead of streaming into the void (nothing is started here: the data layers
-# are the pod, ops/pod.sh up).
+# Start the data layers first (Kafka, Postgres, processor, Streamlit as one podman pod) unless they already
+# answer. ops/pod.sh up is idempotent and rebuilds nothing that has not changed. Opt out with
+# HYPERSPLAT_NO_POD=1 (data layers started elsewhere); a failure only warns: the run itself is never blocked.
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-KPORT="${HYPERSPLAT_KAFKA:-localhost:9094}"; KPORT="${KPORT##*:}"
-port_open "${KPORT//[^0-9]/}" 2>/dev/null || echo "[streaming] WARNING: Kafka is not answering on :${KPORT}; events will be dropped. Start the data layers: hypersplat/streaming/ops/pod.sh up" >&2
-port_open "${HYPERSPLAT_DASHBOARD_PORT:-8501}" || echo "[streaming] Streamlit is not running on :${HYPERSPLAT_DASHBOARD_PORT:-8501} (the 8090 button shows it greyed out). Start it with hypersplat/streaming/ops/pod.sh up" >&2
+KPORT="${HYPERSPLAT_KAFKA:-localhost:9094}"; KPORT="${KPORT##*:}"; KPORT="${KPORT//[^0-9]/}"
+SPORT="${HYPERSPLAT_DASHBOARD_PORT:-8501}"
+if [[ "${HYPERSPLAT_NO_POD:-0}" != 1 ]] && ! { port_open "$KPORT" && port_open "$SPORT"; }; then
+    if command -v podman >/dev/null 2>&1; then
+        echo "[streaming] data layers not up (Kafka :$KPORT, Streamlit :$SPORT): starting them with ops/pod.sh up" >&2
+        bash "$HERE/ops/pod.sh" up >&2 || echo "[streaming] WARNING: ops/pod.sh up failed; continuing without the data layers" >&2
+    else
+        echo "[streaming] WARNING: podman not found, so the data layers were not started (start Kafka and Postgres yourself, or set HYPERSPLAT_NO_POD=1)" >&2
+    fi
+fi
+port_open "$KPORT" || echo "[streaming] WARNING: Kafka is not answering on :${KPORT}; events will be dropped" >&2
+port_open "$SPORT" || echo "[streaming] Streamlit is not running on :${SPORT} (the 8090 button can launch it, or run ops/pod.sh up)" >&2
 echo "[streaming] job $HYPERSPLAT_JOB_ID -> Kafka ${HYPERSPLAT_KAFKA:-localhost:9094} (tb_every=$TB_EVERY)" >&2
 exec "$ROOT/demo/run_stream_demo.sh" "$@"

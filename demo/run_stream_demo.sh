@@ -138,8 +138,9 @@ Options:
   --debug-offered DIR save every offered frame (ACE res) and its gate decision to DIR (offers.jsonl)
   --output DIR        output directory (default demo/output/stream_demo)
   --streaming         send the run's poses and training metrics through Apache Kafka (hooks, no code
-                      changes): start the pod first (hypersplat/streaming/ops/pod.sh up); the 8090
-                      "Streaming visualization" view then shows what the processor flags, live
+                      changes). Starts the data layers first if they are not up (hypersplat/streaming/
+                      ops/pod.sh up: Kafka, Postgres, processor, Streamlit; HYPERSPLAT_NO_POD=1 skips
+                      it); the 8090 "Streaming visualization" view then shows what the processor flags
   --trainer-arg K=V   pass a trainer config field through (repeatable), e.g.
                       stream_review_max_idle=1 or stream_review_jepa_tol=0.08
   -h, --help          this help
