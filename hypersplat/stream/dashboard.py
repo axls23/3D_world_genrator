@@ -99,6 +99,10 @@ PAGE = """<!doctype html>
   .stat .v { font-size:18px; font-variant-numeric:tabular-nums; }
   .bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; }
   .bar > div { height:100%; width:0; background:var(--accent); transition:width .5s; }
+  .vizbtn { margin-left:auto; padding:6px 14px; border-radius:6px; border:1px solid var(--accent);
+            color:var(--accent); font-weight:600; text-decoration:none; }
+  .vizbtn:hover { background:var(--accent); color:var(--panel); }
+  .vizbtn + #stoprec { margin-left:0; }
   #stoprec { margin-left:auto; padding:6px 14px; border-radius:6px; border:1px solid var(--bad);
              background:transparent; color:var(--bad); font:inherit; font-weight:600; cursor:pointer; }
   #stoprec:hover:not(:disabled) { background:var(--bad); color:var(--panel); }
@@ -112,9 +116,10 @@ PAGE = """<!doctype html>
 <body>
 <header>
   <h1>Live 3DGS stream</h1>
-  <a href="/streaming" target="_blank" rel="noopener" style="color:var(--accent);font-size:12px">Streaming view &#8599;</a>
   <span id="phase" class="badge">starting</span>
   <span id="hint">Connecting...</span>
+  <a class="vizbtn" id="vizbtn" href="/streaming" target="_blank" rel="noopener"
+     title="Open the streaming visualization (frames, pose path, training telemetry)">Streaming visualization &#8599;</a>
   <button id="stoprec" type="button" hidden
           title="Stop taking camera frames; training continues on the keyframes collected">&#9632; Stop recording</button>
 </header>

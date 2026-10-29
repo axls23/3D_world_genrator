@@ -748,7 +748,7 @@ def test_dashboard_serves_page_status_and_feed():
         page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
         assert "/frame.jpg" in page and "viewer" in page
         assert 'id="depth-toggle"' not in page            # the base page keeps its original design
-        assert 'href="/streaming"' in page                # and links to the telemetry view
+        assert 'id="vizbtn"' in page and 'href="/streaming"' in page                # and links to the telemetry view
         telemetry = urllib.request.urlopen(base + "/streaming", timeout=5).read().decode()
         assert 'id="depth-toggle"' in telemetry and 'id="depth-overlay"' in telemetry
         assert 'fetch("/depth.jpg"' in telemetry and 'href="/"' in telemetry
