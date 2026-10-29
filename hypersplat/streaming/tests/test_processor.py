@@ -510,6 +510,10 @@ def test_kafka_to_postgres_end_to_end(pg_schema, tmp_path):
         s.close(10)
         assert s.sent == 60, s.sent
     """)
+    # The pod's broker has auto-create off (topics come only from the topics step), so create the
+    # private prefixed topics the way the stack does; on a dev broker with auto-create this is a no-op.
+    subprocess.run([sys.executable, "-m", "hypersplat.streaming.topics", "--wait", "30", "create"],
+                   env=env, check=True, timeout=60)
     subprocess.run([sys.executable, "-c", produce], env=env, check=True, timeout=60)
     subprocess.run([sys.executable, "-m", "hypersplat.streaming.processor", "--once", "--max-seconds", "60"],
                    env=env, check=True, timeout=90)
