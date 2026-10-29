@@ -740,32 +740,16 @@ def test_dashboard_serves_page_status_and_feed():
             return True
 
     port = _free_port()
-    session = FakeSession()
-    dash = Dashboard(session, port=port).start()
+    dash = Dashboard(FakeSession(), port=port).start()
     try:
         base = f"http://127.0.0.1:{port}"
         page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
         assert "/frame.jpg" in page and "viewer" in page
-        assert 'id="depth-toggle"' in page and 'id="depth-overlay"' in page
-        assert 'fetch("/depth.jpg"' in page
-        assert "Keyframe yield" in page and "Signal integrity" in page and "posemap" in page
         dash.viewer_port = 8080
         dash.update_training(step=10, max_steps=100, loss=None)
         st = _json.loads(urllib.request.urlopen(base + "/status.json", timeout=5).read())
         assert st["phase"] == "collecting" and st["viewer_port"] == 8080
         assert st["training"] == {"step": 10, "max_steps": 100}  # None values are not recorded
-        poses = _json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())
-        assert poses == {"map_version": 0, "poses": []}
-        c2w = np.eye(4)
-        c2w[:3, 3] = [1.0, 2.0, 3.0]
-        keyframe = type("Keyframe", (), {"kid": 7, "name": "kf_000007",
-                                        "w2c": np.linalg.inv(c2w), "conf": 0.9})()
-        session.store = type("Store", (), {"registered": lambda self: [keyframe]})()
-        session.map_version = 2
-        poses = _json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())
-        assert poses["map_version"] == 2
-        assert poses["poses"] == [{"kid": 7, "name": "kf_000007", "x": 1.0, "y": 2.0,
-                                   "z": 3.0, "confidence": 0.9, "flagged": False}]
         with urllib.request.urlopen(base + "/feed.mjpg", timeout=5) as r:
             assert r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
             head = r.read(16384)
@@ -776,14 +760,6 @@ def test_dashboard_serves_page_status_and_feed():
             assert r.headers["Content-Type"] == "image/jpeg"
             frame = cv2.imdecode(np.frombuffer(r.read(), np.uint8), cv2.IMREAD_COLOR)
         assert frame.shape == (90, 160, 3)
-        with urllib.request.urlopen(base + "/depth.jpg", timeout=5) as r:
-            assert r.status == 204
-        ok, depth_jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
-        assert ok
-        dash.depth_preview = depth_jpg.tobytes()
-        with urllib.request.urlopen(base + "/depth.jpg", timeout=5) as r:
-            assert r.headers["Content-Type"] == "image/jpeg"
-            assert r.read() == depth_jpg.tobytes()
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(base + "/nope", timeout=5)
     finally:

@@ -98,8 +98,7 @@ then `difix_final_tail_steps` (750) more steps on its pseudo views before the en
 of `simple_trainer.py` (logic in `examples/trainer_schedule.py`, `WorldConvergence`).
 
 The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8091) on the left once
-training starts, the camera feed on the right (keyframes flash green) with an optional depth
-heatmap overlay when `--depth` is enabled, plus bootstrap guidance,
+training starts, the camera feed on the right (keyframes flash green) with bootstrap guidance,
 training progress and stream counters. Before the first map the left pane shows what the
 pipeline needs ("move the camera slowly: 12/24 keyframes"); with `--depth` it also shows the
 live depth of the camera (~3 fps) while the first ACE map is built. The dashboard binds to localhost
