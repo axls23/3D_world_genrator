@@ -519,3 +519,18 @@ def test_kafka_to_postgres_end_to_end(pg_schema, tmp_path):
         assert conn.execute("SELECT count(*) FROM training_history").fetchone()[0] == 30
         assert conn.execute("SELECT poses_accepted, current_step FROM jobs WHERE job_id = 'kjob'"
                             ).fetchone() == (30, 290)
+
+
+def test_rising_loss_is_flagged_without_the_forest_and_not_on_a_bump():
+    losses = [1.0, 0.8, 0.6, 0.5, 0.5, 0.55, 0.62, 0.7, 0.8, 0.9, 1.0, 1.1]
+    store, sender = MemoryStore(), FakeSender()
+    proc = P.Processor(store, sender)          # no training model loaded: the trend rule stands alone
+    out = proc.process_batch([rec(snap(i, loss=v)) for i, v in enumerate(losses)])
+    assert out and all(a.source == "training" and a.reason.startswith("loss_rising=+") for a in out)
+    assert out[-1].score < 0 and store.snaps[("job1", 11)]["is_anomaly"]
+    assert not store.snaps[("job1", 2)]["is_anomaly"]
+
+    bump = [0.5, 0.49, 0.48, 0.47, 0.9, 0.46, 0.45, 0.44, 0.43, 0.43, 0.42, 0.42]
+    store2 = MemoryStore()
+    out2 = P.Processor(store2, FakeSender()).process_batch([rec(snap(i, loss=v, job="job2")) for i, v in enumerate(bump)])
+    assert out2 == []

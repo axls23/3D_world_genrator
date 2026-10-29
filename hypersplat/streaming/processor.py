@@ -233,6 +233,10 @@ def training_row(window: Sequence[c.TrainingSnapshot], best_loss: float, peak_me
     reason = None
     if model is not None and len(window) >= c.MIN_WINDOW_TO_SCORE:
         row["anomaly_score"], row["is_anomaly"], reason = model.score(feats)
+    rising, rise = c.rising_loss(window)      # the forest cannot see a slow climb (contract.rising_loss)
+    if rising and not row["is_anomaly"]:
+        row["is_anomaly"], reason = True, "loss_rising=%+.0f%%" % (100 * rise)
+        row["anomaly_score"] = min(row["anomaly_score"] or 0.0, -rise)
     return row, reason if row["is_anomaly"] else None
 
 
@@ -442,7 +446,8 @@ class Processor:
 
     def _anomaly(self, ev, kind: str, model: AnomalyModel, row: Dict, reason: str) -> c.Anomaly:
         # ts is the flagged event's own time, so a replayed tail re-sends identical messages.
-        return c.Anomaly(job_id=ev.job_id, ts=ev.ts, source=kind, source_seq=ev.seq, model=model.name,
+        return c.Anomaly(job_id=ev.job_id, ts=ev.ts, source=kind, source_seq=ev.seq,
+                         model=model.name if model is not None else "loss_rising",
                          score=row["anomaly_score"], reason=reason, injected=ev.injected)
 
     def _pose(self, st: JobState, p: c.CameraPose, upd: JobUpdate, out: List[c.Anomaly]) -> None:

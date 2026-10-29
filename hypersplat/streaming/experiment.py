@@ -215,7 +215,29 @@ def run_experiment(runs: Sequence[tm.Run], holdout: Sequence[str] = tm.DEFAULT_H
             "test_runs": sorted(r.id for r in test_runs if r.kind == kind),
             "rows": [evaluate(X, X_clean, X_bad, labels, g) for g in grid],
         }
+        if kind == tm.TRAINING:
+            out[kind]["rising"] = evaluate_rising(test_runs, seed)
     return out
+
+
+def evaluate_rising(test_runs: Sequence[tm.Run], seed: int = 0) -> Optional[Dict]:
+    """The trend rule (contract.rising_loss) on the same injected rises and clean windows.
+    A rise counts as caught when any snapshot of the injected stretch is flagged, as the
+    dashboard would show a marker there; the forest is scored per snapshot."""
+    rng = random.Random(seed)
+    inj = caught = clean = false = 0
+    for run in test_runs:
+        if run.kind != tm.TRAINING:
+            continue
+        flags = [c.rising_loss(tm.window_at(run.items, i))[0] for i in range(len(run.items))]
+        clean += len(flags)
+        false += sum(flags)
+        for i in placements(len(run.items), RISE_LEN):
+            seq, pos = inject_rise(run.items, i, rng)
+            hit = any(c.rising_loss(tm.window_at(seq, j))[0] for j in pos)
+            inj += 1
+            caught += int(hit)
+    return {"injected": inj, "caught": caught, "clean": clean, "false_alarms": false} if inj else None
 
 
 def _pct(x: float) -> str:
@@ -249,6 +271,12 @@ def to_markdown(results: Dict[str, Dict]) -> str:
                      "clean %.4f, injected %.4f."
                      % (r0["contamination"], r0["score_clean"], r0["score_bad"]))
         lines.append("")
+        rs = res.get("rising")
+        if rs:
+            lines += ["Rising-loss trend rule (`contract.rising_loss`, tau >= %.1f and rise >= %d%% over %d snapshots): "
+                      "%d / %d injected rises flagged, %d false flags in %d clean snapshots."
+                      % (c.RISING_TAU, 100 * c.RISING_MIN_RISE, c.RISING_LEN, rs["caught"], rs["injected"],
+                         rs["false_alarms"], rs["clean"]), ""]
     return "\n".join(lines)
 
 

@@ -446,6 +446,26 @@ def training_features(window: Sequence[TrainingSnapshot]) -> Dict[str, float]:
     }
 
 
+# Rising loss: the Isolation Forest sees one window's shape, so a slow climb (each step only a little
+# worse than the last) looks normal to it. A rank-trend test on the newest losses catches it instead.
+RISING_LEN = 8        # newest snapshots examined
+RISING_TAU = 0.6      # Mann-Kendall tau (-1 falling .. +1 rising) needed: mostly-increasing, not one bump
+RISING_MIN_RISE = 0.10  # and the newest 3 losses average this much above the oldest 3 (relative)
+
+
+def rising_loss(window: Sequence[TrainingSnapshot]) -> Tuple[bool, float]:
+    """(flag, relative rise) for a loss that has been climbing over the last RISING_LEN snapshots."""
+    losses = [s.loss for s in window][-RISING_LEN:]
+    if len(losses) < RISING_LEN:
+        return False, 0.0
+    pairs = [(losses[j] > losses[i]) - (losses[j] < losses[i])
+             for i in range(len(losses)) for j in range(i + 1, len(losses))]
+    tau = sum(pairs) / len(pairs)
+    first, last = _mean(losses[:3]), _mean(losses[-3:])
+    rise = (last - first) / first if first > 0 else 0.0
+    return (tau >= RISING_TAU and rise >= RISING_MIN_RISE), rise
+
+
 # Live KPIs (row 9), the column names the processor writes and the dashboard reads.
 POSE_METRICS = ("step_dist", "turn_deg", "conf_roll")
 TRAINING_METRICS = ("loss_roll", "loss_trend", "gs_growth", "best_loss", "peak_mem_gb")
