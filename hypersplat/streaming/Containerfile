@@ -1,0 +1,21 @@
+# One small image for the streaming layers that run in containers: topics CLI, processor and the
+# Streamlit dashboard. No torch or GPU stack; trainer, ACE and the 8090 demo UI stay on the host.
+#
+#   podman build -t hypersplat-streaming -f hypersplat/streaming/Containerfile .
+#
+# Generated data is not baked in: models are mounted at /app/hypersplat/streaming/models
+# (git-ignored; fit them with train_models), as in docker-compose.yml.
+FROM docker.io/library/python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /app
+
+COPY hypersplat/streaming/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY hypersplat/__init__.py hypersplat/__init__.py
+COPY hypersplat/streaming/*.py hypersplat/streaming/
+COPY hypersplat/streaming/.streamlit hypersplat/streaming/.streamlit
+
+EXPOSE 8501
+CMD ["python", "-m", "hypersplat.streaming.processor"]
