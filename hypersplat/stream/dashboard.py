@@ -21,6 +21,8 @@ camera, so exposing it on the network is an explicit choice (host="0.0.0.0").
 
 import json
 import logging
+import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,7 +106,9 @@ PAGE = """<!doctype html>
   .vizbtn { margin-left:auto; padding:6px 14px; border-radius:6px; border:1px solid var(--accent);
             color:var(--accent); font-weight:600; text-decoration:none; }
   .vizbtn:hover { background:var(--accent); color:var(--panel); }
-  .vizbtn + #stoprec { margin-left:0; }
+  .vizbtn + .vizbtn, .vizbtn + #stoprec { margin-left:0; }
+  .vizbtn.off { border-color:var(--line); color:var(--muted); }
+  .vizbtn.off:hover { background:transparent; color:var(--muted); }
   #stoprec { margin-left:auto; padding:6px 14px; border-radius:6px; border:1px solid var(--bad);
              background:transparent; color:var(--bad); font:inherit; font-weight:600; cursor:pointer; }
   #stoprec:hover:not(:disabled) { background:var(--bad); color:var(--panel); }
@@ -122,6 +126,7 @@ PAGE = """<!doctype html>
   <span id="hint">Connecting...</span>
   <a class="vizbtn" id="vizbtn" href="/streaming" target="_blank" rel="noopener"
      title="Open the streaming visualization (frames, pose path, training telemetry)">Streaming visualization &#8599;</a>
+  <a class="vizbtn" id="stbtn" href="#" target="_blank" rel="noopener">Streamlit dashboard &#8599;</a>
   <button id="stoprec" type="button" hidden
           title="Stop taking camera frames; training continues on the keyframes collected">&#9632; Stop recording</button>
 </header>
@@ -245,6 +250,14 @@ let viewerSet = false;
 async function tick() {
   try {
     const s = await (await fetch("/status.json", {cache: "no-store"})).json();
+    // The Streamlit dashboard (PostgreSQL view) runs apart from this run; link to it on this host's port
+    const stb = document.getElementById("stbtn");
+    if (stb && s.streamlit) {
+      stb.href = `${location.protocol}//${location.hostname}:${s.streamlit.port}`;
+      stb.classList.toggle("off", !s.streamlit.up);
+      stb.title = s.streamlit.up ? "Open the Streamlit dashboard (events scored by the streaming processor)"
+        : "Not running on port " + s.streamlit.port + ": start it with hypersplat/streaming/ops/pod.sh up";
+    }
     const t = s.training || {};
     const phase = s.phase === "failed" ? "failed" : t.done ? "done" : t.step !== undefined ? "training" : s.phase;
     const badge = document.getElementById("phase");
@@ -429,6 +442,7 @@ PAGE_STREAMING = """<!doctype html>
   <div class="brand"><div class="brand-mark" aria-hidden="true">&#9672;</div><div>
     <div class="eyebrow">HyperSplat / telemetry</div><h1>Live reconstruction</h1></div></div>
   <a class="viewer-link" href="/">&#8592; Base view</a>
+  <a class="viewer-link" id="stbtn" href="#" target="_blank" rel="noopener">Streamlit dashboard &#8599;</a>
   <span id="phase" class="badge">starting</span>
   <span id="source-name" class="run-meta">Connecting to source</span>
   <span id="hint">Connecting...</span>
@@ -657,6 +671,14 @@ pollPoses();
 async function tick() {
   try {
     const s = await (await fetch("/status.json", {cache: "no-store"})).json();
+    // The Streamlit dashboard (PostgreSQL view) runs apart from this run; link to it on this host's port
+    const stb = document.getElementById("stbtn");
+    if (stb && s.streamlit) {
+      stb.href = `${location.protocol}//${location.hostname}:${s.streamlit.port}`;
+      stb.classList.toggle("off", !s.streamlit.up);
+      stb.title = s.streamlit.up ? "Open the Streamlit dashboard (events scored by the streaming processor)"
+        : "Not running on port " + s.streamlit.port + ": start it with hypersplat/streaming/ops/pod.sh up";
+    }
     const t = s.training || {};
     const phase = s.phase === "failed" ? "failed" : t.done ? "done" : t.step !== undefined ? "training" : s.phase;
     const badge = document.getElementById("phase");
@@ -756,8 +778,10 @@ tick();
 
 class Dashboard:
     def __init__(self, session, port: int = 8090, host: str = "127.0.0.1", tb_dir: Optional[str] = None,
-                 results=None):
+                 results=None, streamlit_port: Optional[int] = None):
         self.session = session
+        self.streamlit_port = int(streamlit_port or os.environ.get("HYPERSPLAT_DASHBOARD_PORT") or 8501)
+        self._st_probe = (0.0, False)
         self.results = results if results is not None else StreamedResults()
         self.tb_dir = tb_dir
         self._tb = None
@@ -779,12 +803,25 @@ class Dashboard:
     def update_training(self, **info):
         self.training.update({k: v for k, v in info.items() if v is not None})
 
+    def _streamlit_up(self) -> bool:
+        """Is something listening on the Streamlit port of this host? Probed at most every 3 s."""
+        t, up = self._st_probe
+        if time.time() - t > 3.0:
+            try:
+                with socket.create_connection(("127.0.0.1", self.streamlit_port), timeout=0.3):
+                    up = True
+            except OSError:
+                up = False
+            self._st_probe = (time.time(), up)
+        return up
+
     def status(self) -> Dict:
         stats = self.session.stats()
         phase, hint = self.session.phase()
         streamed = self.results.snapshot()
         return {**stats, "phase": phase, "hint": hint, "viewer_port": self.viewer_port,
-                "training": dict(self.training), "streamed": streamed, "anomaly_flags": streamed["flags"]}
+                "training": dict(self.training), "streamed": streamed, "anomaly_flags": streamed["flags"],
+                "streamlit": {"port": self.streamlit_port, "up": self._streamlit_up()}}
 
     def pose_path(self) -> Dict:
         store = getattr(self.session, "store", None)

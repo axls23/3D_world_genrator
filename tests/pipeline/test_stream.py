@@ -1067,3 +1067,47 @@ def test_dashboard_shows_the_processors_runtime_results():
         assert "Anomaly model not connected" not in page and "s.streamed" in page
     finally:
         dash.stop()
+
+
+def test_8090_pages_open_the_streamlit_dashboard_and_report_whether_it_is_up():
+    import json
+    import socket
+    import urllib.request
+
+    from hypersplat.stream.dashboard import Dashboard
+
+    class FakeSession:
+        def stats(self):
+            return {}
+
+        def phase(self):
+            return "tracking", "x"
+
+        def latest_frame(self):
+            return None
+
+    class Results:
+        def snapshot(self):
+            return StreamedStub
+
+    StreamedStub = {"available": False, "reason": "x", "job_id": None, "poses_scored": 0, "poses_flagged": 0,
+                    "training_flagged": 0, "age_s": None, "flags": [], "flagged_frames": []}
+
+    up = socket.socket()
+    up.bind(("127.0.0.1", 0))
+    up.listen()
+    port = _free_port()
+    dash = Dashboard(FakeSession(), port=port, results=Results(), streamlit_port=up.getsockname()[1]).start()
+    down = Dashboard(FakeSession(), port=_free_port(), results=Results(), streamlit_port=_free_port()).start()
+    try:
+        status = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/status.json", timeout=5).read())
+        assert status["streamlit"] == {"port": up.getsockname()[1], "up": True}
+        status = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{down.port}/status.json", timeout=5).read())
+        assert status["streamlit"]["up"] is False
+        for path in ("/", "/streaming"):
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read().decode()
+            assert 'id="stbtn"' in page and "s.streamlit" in page, path
+    finally:
+        dash.stop()
+        down.stop()
+        up.close()

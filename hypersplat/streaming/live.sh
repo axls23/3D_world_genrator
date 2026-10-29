@@ -33,5 +33,11 @@ export PYTHONPATH="$HERE/autohook${PYTHONPATH:+:$PYTHONPATH}"
 export HYPERSPLAT_JOB_ID="${HYPERSPLAT_JOB_ID:-$(basename "$OUTPUT")-$(date +%Y%m%d-%H%M%S)}"
 export HYPERSPLAT_STREAMING_TRAINER_ARGS="tb_every=$TB_EVERY${HYPERSPLAT_STREAMING_TRAINER_ARGS:+ $HYPERSPLAT_STREAMING_TRAINER_ARGS}"
 
+# Say plainly what is not up instead of streaming into the void (nothing is started here: the data layers
+# are the pod, ops/pod.sh up).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+KPORT="${HYPERSPLAT_KAFKA##*:}"; KPORT="${KPORT:-9094}"
+port_open "${KPORT//[^0-9]/}" 2>/dev/null || echo "[streaming] WARNING: Kafka is not answering on :${KPORT}; events will be dropped. Start the data layers: hypersplat/streaming/ops/pod.sh up" >&2
+port_open "${HYPERSPLAT_DASHBOARD_PORT:-8501}" || echo "[streaming] Streamlit is not running on :${HYPERSPLAT_DASHBOARD_PORT:-8501} (the 8090 button shows it greyed out). Start it with hypersplat/streaming/ops/pod.sh up" >&2
 echo "[streaming] job $HYPERSPLAT_JOB_ID -> Kafka ${HYPERSPLAT_KAFKA:-localhost:9094} (tb_every=$TB_EVERY)" >&2
 exec "$ROOT/demo/run_stream_demo.sh" "$@"
