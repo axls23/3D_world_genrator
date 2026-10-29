@@ -41,6 +41,7 @@ _WRAPPED = "_hypersplat_streaming_hook"
 _TAP = "_hypersplat_tap"
 _START = time.strftime("%Y%m%d-%H%M%S")
 _lock = threading.Lock()
+_pub_lock = threading.Lock()    # seq hand-out + enqueue as one step (see publish_rows)
 _job = None                     # type: Optional[str]
 _focal = None                   # type: Optional[float]  # last positive focal on a map row
 _unregistered = {}              # type: Dict[str, int]
@@ -141,16 +142,21 @@ def publish_rows(kind: str, rows: List[Dict]) -> None:
             if row.get("w2c") is None:
                 _count_unregistered(job)
                 continue
-            try:
-                ev = c.pose_from_event_row(row, job, sender.next_seq(job), focal=_focal,
-                                           dropped=sender.dropped(job))
-            except c.Unregistered:
-                _count_unregistered(job)
-                continue
-            except c.InvalidEvent as e:
-                sender.drop(job, str(e))
-                continue
-            sender.send(ev)
+            # _on_event runs on the sidecar reader thread and on the ring thread. The seq is handed out and
+            # the event queued under one lock: otherwise seq 6 can be queued before seq 5, and the
+            # processor skips 5 as late (no re-ordering buffer), losing a pose. send() never blocks, so
+            # the lock is held for microseconds.
+            with _pub_lock:
+                try:
+                    ev = c.pose_from_event_row(row, job, sender.next_seq(job), focal=_focal,
+                                               dropped=sender.dropped(job))
+                except c.Unregistered:
+                    _count_unregistered(job)
+                    continue
+                except c.InvalidEvent as e:
+                    sender.drop(job, str(e))
+                    continue
+                sender.send(ev)
     except Exception:
         _warn_once("pose")
 

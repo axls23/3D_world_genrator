@@ -303,6 +303,33 @@ def test_hooks_reach_kafka(monkeypatch):
     consumer = kafka.KafkaConsumer(c.TOPIC_POSES.name, bootstrap_servers=c.KAFKA_BOOTSTRAP,
                                    auto_offset_reset="earliest", consumer_timeout_ms=5000,
                                    group_id=None)
-    got = [e for e in (c.decode(m.value) for m in consumer) if e.job_id == job]
+    # only this job's messages (by key): the shared topic may hold other jobs' or dead-lettered garbage
+    got = [c.decode(m.value) for m in consumer if m.key == job.encode()]
     consumer.close()
     assert [(e.frame, e.source) for e in got] == [("m%d.png" % i, "map") for i in range(5)]
+
+
+def test_two_threads_publishing_poses_never_invert_sequence_order(fake):
+    """StreamSession._on_event is called by the sidecar reader thread and by the ring thread. The seq is
+    handed out and the event queued by the hook, so the pair must be atomic: an event queued after a
+    higher seq would be skipped by the processor as late and silently lost from the history."""
+    import sys
+
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)               # make the interleaving that breaks a non-atomic pair likely
+    try:
+        def worker(tag):
+            for i in range(300):
+                hooks.publish_rows("pose", [_row(frame="%s%d.png" % (tag, i))])
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in "abcd"]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+    fake.flush(5.0)
+    seqs = [e.seq for e in fake.events()]
+    assert len(seqs) == 1200
+    assert seqs == sorted(seqs) and seqs == list(range(1200))
