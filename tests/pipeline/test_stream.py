@@ -1111,3 +1111,63 @@ def test_8090_pages_open_the_streamlit_dashboard_and_report_whether_it_is_up():
         dash.stop()
         down.stop()
         up.close()
+
+
+def test_launch_streamlit_starts_the_dashboard_only_when_nothing_listens(monkeypatch):
+    """The 8090 button's POST /api/launch_streamlit: open what is already running, else start
+    hypersplat/streaming/dashboard.py and wait for its port."""
+    import json
+    import socket
+    import subprocess
+    import urllib.request
+
+    from hypersplat.stream import dashboard as dmod
+
+    class Session:
+        def stats(self):
+            return {}
+
+        def phase(self):
+            return "tracking", "x"
+
+        def latest_frame(self):
+            return None
+
+    class Results:
+        def snapshot(self):
+            return {"available": False, "reason": "x", "job_id": None, "poses_scored": 0, "poses_flagged": 0,
+                    "training_flagged": 0, "age_s": None, "flags": [], "flagged_frames": []}
+
+    port = _free_port()
+    started, listeners = [], []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            started.append(cmd)
+            s = socket.socket()
+            s.bind(("127.0.0.1", port))
+            s.listen()
+            listeners.append(s)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    dash = dmod.Dashboard(Session(), port=_free_port(), results=Results(), streamlit_port=port).start()
+    try:
+        base = f"http://127.0.0.1:{dash.port}"
+
+        def post():
+            req = urllib.request.Request(base + "/api/launch_streamlit", method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+        first = post()
+        assert first["ok"] and first["started"] is True and len(started) == 1
+        assert started[0][1:4] == ["-m", "streamlit", "run"] and started[0][4].endswith("streaming/dashboard.py")
+        assert f"--server.port={port}" in started[0] or str(port) in started[0]
+        second = post()                                   # now something listens: no second process
+        assert second["ok"] and second["started"] is False and len(started) == 1
+    finally:
+        dash.stop()
+        for s in listeners:
+            s.close()

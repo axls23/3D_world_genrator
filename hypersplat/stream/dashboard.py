@@ -23,8 +23,11 @@ import json
 import logging
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
@@ -256,7 +259,7 @@ async function tick() {
       stb.href = `${location.protocol}//${location.hostname}:${s.streamlit.port}`;
       stb.classList.toggle("off", !s.streamlit.up);
       stb.title = s.streamlit.up ? "Open the Streamlit dashboard (events scored by the streaming processor)"
-        : "Not running on port " + s.streamlit.port + ": start it with hypersplat/streaming/ops/pod.sh up";
+        : "Not running on port " + s.streamlit.port + ": click to launch it (needs the pod's Postgres for data: ops/pod.sh up)";
     }
     const t = s.training || {};
     const phase = s.phase === "failed" ? "failed" : t.done ? "done" : t.step !== undefined ? "training" : s.phase;
@@ -293,6 +296,18 @@ async function tick() {
   setTimeout(tick, 1000);
 }
 tick();
+const stb2 = document.getElementById("stbtn");
+if (stb2) stb2.addEventListener("click", async (ev) => {
+  if (!stb2.classList.contains("off")) return;               // running: the link just opens it
+  ev.preventDefault();
+  const label = stb2.textContent; stb2.textContent = "Launching Streamlit...";
+  try {
+    const out = await (await fetch("/api/launch_streamlit", {method: "POST"})).json();
+    if (out.ok) window.open(`${location.protocol}//${location.hostname}:${out.port}`, "_blank");
+    else alert(out.message || "Failed to launch the Streamlit dashboard.");
+  } catch (e) { alert("Failed to launch the Streamlit dashboard."); }
+  stb2.textContent = label;
+});
 </script>
 </body>
 </html>
@@ -677,7 +692,7 @@ async function tick() {
       stb.href = `${location.protocol}//${location.hostname}:${s.streamlit.port}`;
       stb.classList.toggle("off", !s.streamlit.up);
       stb.title = s.streamlit.up ? "Open the Streamlit dashboard (events scored by the streaming processor)"
-        : "Not running on port " + s.streamlit.port + ": start it with hypersplat/streaming/ops/pod.sh up";
+        : "Not running on port " + s.streamlit.port + ": click to launch it (needs the pod's Postgres for data: ops/pod.sh up)";
     }
     const t = s.training || {};
     const phase = s.phase === "failed" ? "failed" : t.done ? "done" : t.step !== undefined ? "training" : s.phase;
@@ -770,6 +785,18 @@ async function tick() {
   setTimeout(tick, 1000);
 }
 tick();
+const stb2 = document.getElementById("stbtn");
+if (stb2) stb2.addEventListener("click", async (ev) => {
+  if (!stb2.classList.contains("off")) return;               // running: the link just opens it
+  ev.preventDefault();
+  const label = stb2.textContent; stb2.textContent = "Launching Streamlit...";
+  try {
+    const out = await (await fetch("/api/launch_streamlit", {method: "POST"})).json();
+    if (out.ok) window.open(`${location.protocol}//${location.hostname}:${out.port}`, "_blank");
+    else alert(out.message || "Failed to launch the Streamlit dashboard.");
+  } catch (e) { alert("Failed to launch the Streamlit dashboard."); }
+  stb2.textContent = label;
+});
 </script>
 </body>
 </html>
@@ -782,6 +809,8 @@ class Dashboard:
         self.session = session
         self.streamlit_port = int(streamlit_port or os.environ.get("HYPERSPLAT_DASHBOARD_PORT") or 8501)
         self._st_probe = (0.0, False)
+        self._streamlit_process = None
+        self._streamlit_lock = threading.RLock()
         self.results = results if results is not None else StreamedResults()
         self.tb_dir = tb_dir
         self._tb = None
@@ -803,10 +832,10 @@ class Dashboard:
     def update_training(self, **info):
         self.training.update({k: v for k, v in info.items() if v is not None})
 
-    def _streamlit_up(self) -> bool:
+    def _streamlit_up(self, fresh: bool = False) -> bool:
         """Is something listening on the Streamlit port of this host? Probed at most every 3 s."""
         t, up = self._st_probe
-        if time.time() - t > 3.0:
+        if fresh or time.time() - t > 3.0:
             try:
                 with socket.create_connection(("127.0.0.1", self.streamlit_port), timeout=0.3):
                     up = True
@@ -814,6 +843,34 @@ class Dashboard:
                 up = False
             self._st_probe = (time.time(), up)
         return up
+
+    def launch_streamlit(self) -> Dict:
+        """Open the Streamlit dashboard if something already listens on its port (for example the pod's),
+        else start hypersplat/streaming/dashboard.py and wait for the port. Never starts a second copy."""
+        with self._streamlit_lock:
+            if self._streamlit_up(fresh=True):
+                return {"ok": True, "started": False, "port": self.streamlit_port,
+                        "message": "Streamlit is already running."}
+            script = Path(__file__).resolve().parents[1] / "streaming" / "dashboard.py"
+            if not script.exists():
+                return {"ok": False, "message": "Streamlit entrypoint not found: %s" % script}
+            cmd = [sys.executable, "-m", "streamlit", "run", str(script), "--server.headless=true",
+                   "--browser.gatherUsageStats=false", "--server.address=0.0.0.0",
+                   "--server.port=%d" % self.streamlit_port]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as e:
+                return {"ok": False, "message": "Failed to start Streamlit: %s" % e}
+            self._streamlit_process = proc
+            for _ in range(60):
+                rc = proc.poll()
+                if rc is not None:
+                    return {"ok": False, "message": "Streamlit exited early with code %s" % rc}
+                if self._streamlit_up(fresh=True):
+                    logger.info("[Stream] Streamlit dashboard started on :%d", self.streamlit_port)
+                    return {"ok": True, "started": True, "port": self.streamlit_port, "message": "Streamlit launched."}
+                time.sleep(0.25)
+            return {"ok": False, "message": "Timed out waiting for Streamlit on port %d" % self.streamlit_port}
 
     def status(self) -> Dict:
         stats = self.session.stats()
@@ -899,6 +956,9 @@ class Dashboard:
                 if self.path.split("?")[0] == "/api/stop_recording":
                     stopped = dash.session.stop_recording("dashboard")
                     self._send(200, "application/json", json.dumps({"stopped": stopped}).encode())
+                elif self.path.split("?")[0] == "/api/launch_streamlit":
+                    out = dash.launch_streamlit()
+                    self._send(200 if out.get("ok") else 500, "application/json", json.dumps(out).encode())
                 else:
                     self._send(404, "text/plain", b"not found")
 
