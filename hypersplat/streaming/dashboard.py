@@ -47,9 +47,12 @@ MAIN_COLOR = BLUE
 OUTLINE_COLOR = TEXT
 
 _POSE_NUMERIC = ("seq", "cx", "cy", "cz", "focal", "confidence", "anomaly_score") + c.POSE_METRICS
-_TRAINING_NUMERIC = ("seq", "step", "loss", "num_gaussians", "gpu_mem_gb", "steps_per_s",
+_TRAINING_NUMERIC = ("seq", "step", "loss", "num_gaussians", "gpu_mem_gb", "steps_per_s", "psnr",
                      "anomaly_score") + c.TRAINING_METRICS
 _POSE_COLUMNS = _POSE_NUMERIC + ("ts", "frame", "is_anomaly", "injected")
+_HEALTH_NUMERIC = ("seq", "frames_read", "frames_dropped", "keyframes_accepted", "registered", "unregistered",
+                   "localize_ms", "store_mb")
+_HEALTH_COLUMNS = _HEALTH_NUMERIC + ("ts", "phase", "is_anomaly", "alert")
 _TRAINING_COLUMNS = _TRAINING_NUMERIC + ("ts", "is_anomaly", "injected")
 
 
@@ -101,10 +104,16 @@ def load_job(conn, job_id: str, limit: int = c.DASHBOARD_ROWS) -> Dict:
     training = _frame(conn, "SELECT * FROM training_history WHERE job_id = %s "
                             "ORDER BY ts DESC LIMIT %s", (job_id, limit), _TRAINING_NUMERIC,
                       _TRAINING_COLUMNS)
+    try:  # the head-of-pipeline table is newer than the other two: an older database may not have it yet
+        health = _frame(conn, "SELECT * FROM stream_health WHERE job_id = %s ORDER BY ts DESC LIMIT %s",
+                        (job_id, limit), _HEALTH_NUMERIC, _HEALTH_COLUMNS)
+    except pg_errors.UndefinedTable:
+        health = pd.DataFrame(columns=_HEALTH_COLUMNS)
     poses = poses.sort_values("seq", ignore_index=True)
     training = training.sort_values(["step", "seq"], ignore_index=True)
+    health = health.sort_values("seq", ignore_index=True)
     no_events = not len(poses) and not len(training)
-    return {"job": job, "poses": poses, "training": training,
+    return {"job": job, "poses": poses, "training": training, "health": health,
             "age_s": None if no_events or age is None else float(age)}
 
 
@@ -138,13 +147,23 @@ def _first(*vals) -> Optional[float]:
     return None
 
 
-def kpis(job: Dict, poses: pd.DataFrame, training: pd.DataFrame) -> Dict[str, Optional[float]]:
+def kpis(job: Dict, poses: pd.DataFrame, training: pd.DataFrame,
+         health: Optional[pd.DataFrame] = None) -> Dict[str, Optional[float]]:
     """Row 9 KPIs. Counters come from the jobs row (whole job); rolling values from the newest
     history row that has them ("—" while the processor's window is still filling)."""
     peak_hist = training["peak_mem_gb"].max() if "peak_mem_gb" in training else None
     max_mem = training["gpu_mem_gb"].max() if "gpu_mem_gb" in training else None
     min_loss = training["loss"].min() if "loss" in training else None
+    health = health if health is not None else pd.DataFrame()
+    drop_pct = None
+    if len(health) and "frames_read" in health:
+        read, dropped = _last(health, "frames_read"), _last(health, "frames_dropped")
+        if read is not None and dropped is not None and read + dropped > 0:
+            drop_pct = 100.0 * dropped / (read + dropped)
     return {
+        "psnr": _last(training, "psnr"),
+        "source_drop_pct": drop_pct,
+        "localize_ms": _last(health, "localize_ms") if len(health) else None,
         "rolling_loss": _last(training, "loss_roll"),
         "loss_trend": _last(training, "loss_trend"),
         "best_loss": _first(job.get("best_loss"), _last(training, "best_loss"), min_loss),
@@ -189,7 +208,13 @@ def kpi_tiles(k: Dict[str, Optional[float]]) -> List[Tuple[str, str, Optional[st
         ("Dropped events", _fmt(k["dropped"], ",.0f"), None, "off",
          "Producer queue/broker drops plus processor validation drops (row 4)"),
         ("Anomalies", _fmt(k["anomalies"], ",.0f"), None, "off",
-         "Events flagged by either Isolation Forest"),
+         "Events flagged by the models and rules (isolation forests, rising loss, PSNR drop, head of pipeline)"),
+        ("Held-out PSNR", _fmt(k["psnr"], ".2f") + ("" if k["psnr"] is None else " dB"), None, "off",
+         "Latest held-out (else probe) PSNR the trainer reported"),
+        ("Source drops", _fmt(k["source_drop_pct"], ".1f") + ("" if k["source_drop_pct"] is None else "%"), None, "off",
+         "Share of frames the source queue dropped (the head of the pipeline, stream_health)"),
+        ("Localize", _fmt(k["localize_ms"], ".0f") + ("" if k["localize_ms"] is None else " ms"), None, "off",
+         "Mean time ACE took to localize a keyframe"),
     ]
 
 
@@ -287,6 +312,22 @@ def path_figure(poses: pd.DataFrame) -> Optional[go.Figure]:
     return fig
 
 
+def health_figure(health: Optional[pd.DataFrame]) -> Optional[go.Figure]:
+    """Frames dropped at the source and keyframes that failed to localise over time; alert samples in red."""
+    if health is None or not len(health) or "frames_dropped" not in health:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=health["seq"], y=health["frames_dropped"], name="frames dropped", mode="lines",
+                             line=dict(color=WARN, width=2)))
+    fig.add_trace(go.Scatter(x=health["seq"], y=health["unregistered"], name="unregistered keyframes", mode="lines",
+                             line=dict(color=MAIN_COLOR, width=2)))
+    bad = health[_flag(health, "is_anomaly")]
+    fig.add_trace(go.Scatter(x=bad["seq"], y=bad["frames_dropped"], name="alert", mode="markers",
+                             marker=dict(color=c.ANOMALY_COLOR, size=8, line=dict(color="white", width=1)),
+                             text=bad["alert"], hovertemplate="%{text}<extra>alert</extra>"))
+    return _layout(fig, "Head of the pipeline", "sample (about 1 per second)", "count (cumulative)", 240)
+
+
 def gaussians_figure(training: pd.DataFrame) -> Optional[go.Figure]:
     if not len(training) or training["num_gaussians"].isna().all():
         return None
@@ -346,7 +387,7 @@ header[data-testid="stHeader"] {{ background: transparent; }}
 .hs-badge.stale {{ color:{WARN}; border-color:#f3b95f55; background:#f3b95f12; }}
 .hs-badge.none {{ color:{MUTED}; border-color:{LINE}; background:transparent; }}
 .hs-hint {{ color:#b6c4d5; font-size:12px; }}
-.hs-kpis {{ display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:12px; margin-bottom:6px; }}
+.hs-kpis {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(170px,1fr)); gap:12px; margin-bottom:6px; }}
 .hs-kpi {{ background:linear-gradient(145deg,#142031,#101925 72%); border:1px solid {LINE}; border-radius:14px;
            padding:13px 15px; position:relative; overflow:hidden; box-shadow:0 12px 32px #0003; }}
 .hs-kpi::after {{ content:""; position:absolute; right:-24px; top:-32px; width:90px; height:90px; border-radius:50%;
@@ -367,7 +408,8 @@ header[data-testid="stHeader"] {{ background: transparent; }}
 
 # tile label -> accent tone of its card
 _TONE = {"Rolling loss": BLUE, "Loss trend": BLUE, "Best loss": ACCENT, "Gaussians": ACCENT,
-         "Peak GPU memory": WARN, "Poses accepted": ACCENT, "Poses rejected": c.ANOMALY_COLOR,
+         "Peak GPU memory": WARN, "Poses accepted": ACCENT, "Poses rejected": c.ANOMALY_COLOR, "Held-out PSNR": ACCENT,
+         "Source drops": WARN, "Localize": BLUE,
          "Rolling confidence": BLUE, "Dropped events": WARN, "Anomalies": c.ANOMALY_COLOR}
 
 
@@ -456,7 +498,8 @@ def render(st) -> None:
 
     level, text = liveness(data["age_s"])
     st.markdown(header_html(job_id, level, text), unsafe_allow_html=True)
-    st.markdown(cards_html(kpi_tiles(kpis(data["job"], poses, training))), unsafe_allow_html=True)
+    st.markdown(cards_html(kpi_tiles(kpis(data["job"], poses, training, data.get("health")))),
+                unsafe_allow_html=True)
 
     left, right = st.columns([3, 2])
     with left:
@@ -467,6 +510,8 @@ def render(st) -> None:
             _chart(st, gaussians_figure(training), "gaussians", "No Gaussian counts yet.")
         with b, st.container(border=True):
             _chart(st, confidence_figure(poses), "confidence", "No pose confidences yet.")
+        with st.container(border=True):
+            _chart(st, health_figure(data.get("health")), "health", "No stream-health samples yet.")
     with right:
         st.markdown(quality_html(poses, training), unsafe_allow_html=True)
         with st.container(border=True):

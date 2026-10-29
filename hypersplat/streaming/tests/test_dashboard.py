@@ -155,7 +155,7 @@ def test_kpis_fall_back_and_tolerate_empty():
 def test_kpi_tiles_include_dropped_events():
     tiles = {t[0]: t[1] for t in d.kpi_tiles(d.kpis({"events_dropped": 12}, *_frames()[::-1]))}
     assert tiles["Dropped events"] == "12"
-    assert len(tiles) == 10
+    assert len(tiles) == 13                      # ten training and pose tiles + PSNR, source drops, localize
 
 
 def test_liveness():
@@ -382,3 +382,30 @@ def test_header_and_quality_cards():
     assert "hs-badge stale" in d.header_html("j<1>", "stale", "Last event 9 s ago") and "j&lt;1&gt;" in d.header_html("j<1>", "live", "x")
     poses, training = _frames()
     assert "No flagged events" in d.quality_html(poses.iloc[0:0], training.iloc[0:0])
+
+
+def _health_frame(n=12, dropped_each=1, unreg_each=0):
+    return pd.DataFrame([dict(seq=i, ts=float(i), frames_read=30 * i, frames_dropped=dropped_each * i, keyframes_accepted=3 * i,
+                              registered=3 * i - unreg_each * i, unregistered=unreg_each * i, localize_ms=30.0 + i,
+                              is_anomaly=dropped_each > 10 and i > 5, alert="frames_dropped=40%" if dropped_each > 10 and i > 5 else None)
+                         for i in range(1, n + 1)])
+
+
+def test_kpis_carry_held_out_psnr_and_the_head_of_the_pipeline():
+    training, poses = _frames()
+    training["psnr"] = [None] * (len(training) - 1) + [21.5]
+    k = d.kpis({}, poses, training, _health_frame(dropped_each=3))
+    assert k["psnr"] == 21.5
+    assert k["source_drop_pct"] == pytest.approx(100 * 36 / (360 + 36))
+    assert k["localize_ms"] == 42.0
+    tiles = {t[0]: t[1] for t in d.kpi_tiles(k)}
+    assert tiles["Held-out PSNR"] == "21.50 dB" and tiles["Source drops"].endswith("%") and tiles["Localize"] == "42 ms"
+    empty = {t[0]: t[1] for t in d.kpi_tiles(d.kpis({}, poses, training))}        # no health table rows yet
+    assert empty["Source drops"] == "—" and empty["Localize"] == "—"
+
+
+def test_health_figure_marks_alert_samples_red_and_tolerates_nothing():
+    fig = d.health_figure(_health_frame(dropped_each=14))
+    names = {t.name: t for t in fig.data}
+    assert "frames dropped" in names and names["alert"].marker.color == c.ANOMALY_COLOR and len(names["alert"].x) > 0
+    assert d.health_figure(pd.DataFrame()) is None and d.health_figure(None) is None
