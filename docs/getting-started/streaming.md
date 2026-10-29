@@ -101,7 +101,9 @@ The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8091) on 
 training starts, the camera feed on the right (keyframes flash green) with bootstrap guidance,
 training progress and stream counters. Before the first map the left pane shows what the
 pipeline needs ("move the camera slowly: 12/24 keyframes"); with `--depth` it also shows the
-live depth of the camera (~3 fps) while the first ACE map is built. The dashboard binds to localhost
+live depth of the camera (~3 fps) while the first ACE map is built.
+The header's "Streaming view" link opens `/streaming`, a telemetry view of the same run (KPIs, pose map, camera feed
+with an optional depth heatmap overlay); the base page itself is unchanged. The dashboard binds to localhost
 only; `--share` exposes it (and the camera feed) on the network. Ctrl+C once stops gracefully
 (final checkpoint + PLY), twice kills. `demo/run_demo.sh` (the web app) is unchanged.
 

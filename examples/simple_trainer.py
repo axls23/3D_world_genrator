@@ -884,6 +884,7 @@ class Runner:
                                      pool_views=cfg.difix_pool_views, depth_warp=cfg.difix_depth_warp)
 
         self.stream = None
+        self.depth_preview = None
         if cfg.stream_source:
             self._start_stream()
         else:
@@ -1185,12 +1186,13 @@ class Runner:
                                   tb_dir=f"{cfg.result_dir}/tb").start()
             print(f"[Stream] Dashboard (3D viewer | camera): {self.dashboard.url}", flush=True)
         print("[Stream] Waiting for the first ACE map...")
-        preview = None
         if self.depth_estimator is not None and self.dashboard is not None:
             from hypersplat.stream.depth import DepthPreview
             dash = self.dashboard
-            preview = DepthPreview(self.depth_estimator, self.stream.latest_frame,
-                                   lambda jpg: setattr(dash, "depth_preview", jpg)).start()
+            self.depth_preview = DepthPreview(
+                self.depth_estimator, self.stream.latest_frame,
+                lambda jpg: setattr(dash, "depth_preview", jpg), fps=1.0,
+            ).start()
         if self.difix is not None:
             # Load Difix into pinned host memory while the trainer only waits: the Hugging Face
             # load patches torch process-wide, so it must finish before any module is created
@@ -1198,15 +1200,20 @@ class Runner:
             self.difix.preload()
         try:
             map_ok = self.stream.wait_for_map(should_stop=self.stream_stop_file.requested)
+        except Exception:
+            if self.depth_preview is not None:
+                self.depth_preview.stop()
+                self.depth_preview = None
+                self.dashboard.depth_preview = None
+            raise
         finally:
             if self.difix is not None:
                 self.difix.wait_preload()
-            if preview is not None:
-                preview.stop()   # the estimator belongs to the depth worker from here on
-                self.dashboard.depth_preview = None
-                print(f"[Depth] Preview showed {preview.frames} frames while the map was built")
         if not map_ok:
             reason = self.stream.failed or ("STOP requested" if self.stream_stop_file.requested() else "stopped")
+            if self.depth_preview is not None:
+                self.depth_preview.stop()
+                self.depth_preview = None
             self.stream.stop()
             if self.dashboard is not None:
                 self.dashboard.stop()
@@ -4009,6 +4016,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         try:
             runner.train()
         finally:
+            if getattr(runner, "depth_preview", None) is not None:
+                runner.depth_preview.stop()
+                if runner.dashboard is not None:
+                    runner.dashboard.depth_preview = None
+                print(f"[Depth] Dashboard heatmap showed {runner.depth_preview.frames} frames", flush=True)
+                runner.depth_preview = None
             if runner.stream is not None:
                 print(f"[Stream] Final: {runner.stream.stats()}")
                 if getattr(runner, "device_poses", None) is not None:
