@@ -753,7 +753,7 @@ def test_dashboard_serves_page_status_and_feed():
         assert 'id="depth-toggle"' in telemetry and 'id="depth-overlay"' in telemetry
         assert 'fetch("/depth.jpg"' in telemetry and 'href="/"' in telemetry
         assert json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())["poses"] == []
-        assert "Keyframe yield" in page and "Signal integrity" in page and "posemap" in page
+        assert "Keyframe yield" in telemetry and "Signal integrity" in telemetry and "posemap" in telemetry
         dash.viewer_port = 8080
         dash.update_training(step=10, max_steps=100, loss=None)
         st = _json.loads(urllib.request.urlopen(base + "/status.json", timeout=5).read())
