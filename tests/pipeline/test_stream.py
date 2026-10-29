@@ -4,6 +4,7 @@ The ACE sidecar and Difix are replaced by fakes here; the GPU path is exercised 
 examples/simple_trainer.py with --stream_source (see docs in hypersplat/stream/session.py).
 """
 
+import json
 import os
 import socket
 import threading
@@ -740,16 +741,36 @@ def test_dashboard_serves_page_status_and_feed():
             return True
 
     port = _free_port()
-    dash = Dashboard(FakeSession(), port=port).start()
+    session = FakeSession()
+    dash = Dashboard(session, port=port).start()
     try:
         base = f"http://127.0.0.1:{port}"
         page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
         assert "/frame.jpg" in page and "viewer" in page
+        assert 'id="depth-toggle"' not in page            # the base page keeps its original design
+        assert 'id="vizbtn"' in page and 'href="/streaming"' in page                # and links to the telemetry view
+        telemetry = urllib.request.urlopen(base + "/streaming", timeout=5).read().decode()
+        assert 'id="depth-toggle"' in telemetry and 'id="depth-overlay"' in telemetry
+        assert 'fetch("/depth.jpg"' in telemetry and 'href="/"' in telemetry
+        assert json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())["poses"] == []
+        assert "Keyframe yield" in telemetry and "Signal integrity" in telemetry and "posemap" in telemetry
         dash.viewer_port = 8080
         dash.update_training(step=10, max_steps=100, loss=None)
         st = _json.loads(urllib.request.urlopen(base + "/status.json", timeout=5).read())
         assert st["phase"] == "collecting" and st["viewer_port"] == 8080
         assert st["training"] == {"step": 10, "max_steps": 100}  # None values are not recorded
+        poses = _json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())
+        assert poses == {"map_version": 0, "poses": []}
+        c2w = np.eye(4)
+        c2w[:3, 3] = [1.0, 2.0, 3.0]
+        keyframe = type("Keyframe", (), {"kid": 7, "name": "kf_000007",
+                                        "w2c": np.linalg.inv(c2w), "conf": 0.9})()
+        session.store = type("Store", (), {"registered": lambda self: [keyframe]})()
+        session.map_version = 2
+        poses = _json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())
+        assert poses["map_version"] == 2
+        assert poses["poses"] == [{"kid": 7, "name": "kf_000007", "x": 1.0, "y": 2.0,
+                                   "z": 3.0, "confidence": 0.9, "flagged": False}]
         with urllib.request.urlopen(base + "/feed.mjpg", timeout=5) as r:
             assert r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
             head = r.read(16384)
@@ -760,6 +781,14 @@ def test_dashboard_serves_page_status_and_feed():
             assert r.headers["Content-Type"] == "image/jpeg"
             frame = cv2.imdecode(np.frombuffer(r.read(), np.uint8), cv2.IMREAD_COLOR)
         assert frame.shape == (90, 160, 3)
+        with urllib.request.urlopen(base + "/depth.jpg", timeout=5) as r:
+            assert r.status == 204
+        ok, depth_jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))
+        assert ok
+        dash.depth_preview = depth_jpg.tobytes()
+        with urllib.request.urlopen(base + "/depth.jpg", timeout=5) as r:
+            assert r.headers["Content-Type"] == "image/jpeg"
+            assert r.read() == depth_jpg.tobytes()
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen(base + "/nope", timeout=5)
     finally:
@@ -995,3 +1024,90 @@ def test_blocked_mapping_fails_session_once_nothing_can_register():
         st.update_pose(pending.kid, np.eye(4), 1.0, 1)   # it failed to register
         StreamSession._mapping_blocked(s)
         assert s.failed and "mapping stalled" in s.failed
+
+
+def test_dashboard_shows_the_processors_runtime_results():
+    """Flags come from the streamed results (PostgreSQL via StreamedResults), not from the page."""
+    import json
+    import urllib.request
+    from types import SimpleNamespace
+
+    from hypersplat.stream.dashboard import Dashboard
+
+    class Results:
+        def snapshot(self):
+            return {"available": True, "reason": "", "job_id": "live", "poses_scored": 3, "poses_flagged": 1,
+                    "training_flagged": 0, "age_s": 0.4, "flagged_frames": ["f1.jpg"],
+                    "flags": [{"source": "pose", "seq": 1, "frame": "f1.jpg", "score": -0.3, "injected": None,
+                               "reason": "pose model flagged f1.jpg (score -0.300)"}]}
+
+    class FakeSession:
+        store = SimpleNamespace(registered=lambda: [
+            SimpleNamespace(kid=i, name="f%d.jpg" % i, w2c=np.eye(4), conf=0.9) for i in range(3)])
+        map_version = 1
+
+        def stats(self):
+            return {"frames_read": 3, "keyframes": 3}
+
+        def phase(self):
+            return "tracking", "Tracking"
+
+        def latest_frame(self):
+            return None
+
+    port = _free_port()
+    dash = Dashboard(FakeSession(), port=port, results=Results()).start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        status = json.loads(urllib.request.urlopen(base + "/status.json", timeout=5).read())
+        assert status["streamed"]["job_id"] == "live" and status["anomaly_flags"][0]["frame"] == "f1.jpg"
+        poses = json.loads(urllib.request.urlopen(base + "/poses.json", timeout=5).read())["poses"]
+        assert [p["flagged"] for p in poses] == [False, True, False]
+        page = urllib.request.urlopen(base + "/streaming", timeout=5).read().decode()
+        assert "Anomaly model not connected" not in page and "s.streamed" in page
+    finally:
+        dash.stop()
+
+
+def test_8090_pages_open_the_streamlit_dashboard_and_report_whether_it_is_up():
+    import json
+    import socket
+    import urllib.request
+
+    from hypersplat.stream.dashboard import Dashboard
+
+    class FakeSession:
+        def stats(self):
+            return {}
+
+        def phase(self):
+            return "tracking", "x"
+
+        def latest_frame(self):
+            return None
+
+    class Results:
+        def snapshot(self):
+            return StreamedStub
+
+    StreamedStub = {"available": False, "reason": "x", "job_id": None, "poses_scored": 0, "poses_flagged": 0,
+                    "training_flagged": 0, "age_s": None, "flags": [], "flagged_frames": []}
+
+    up = socket.socket()
+    up.bind(("127.0.0.1", 0))
+    up.listen()
+    port = _free_port()
+    dash = Dashboard(FakeSession(), port=port, results=Results(), streamlit_port=up.getsockname()[1]).start()
+    down = Dashboard(FakeSession(), port=_free_port(), results=Results(), streamlit_port=_free_port()).start()
+    try:
+        status = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/status.json", timeout=5).read())
+        assert status["streamlit"] == {"port": up.getsockname()[1], "up": True}
+        status = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{down.port}/status.json", timeout=5).read())
+        assert status["streamlit"]["up"] is False
+        for path in ("/", "/streaming"):
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read().decode()
+            assert 'id="stbtn"' in page and "s.streamlit" in page, path
+    finally:
+        dash.stop()
+        down.stop()
+        up.close()

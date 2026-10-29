@@ -50,7 +50,8 @@ def test_features():
                                            focal=600, confidence=100))
              for i in range(3)]
     f = c.pose_features(poses)
-    assert set(f) == set(c.POSE_FEATURES)
+    assert set(c.POSE_FEATURES) <= set(f)
+    assert {"step_dist", "confidence"} <= set(f)    # kept for the KPIs and the database
     assert math.isclose(f["step_dist"], 1.0) and f["turn_deg"] == 0.0
     snaps = [c.TrainingSnapshot("j", i, i, i * 10, 1.0 / (i + 1), 1000 + i, 2.0) for i in range(30)]
     t = c.training_features(snaps)
@@ -104,3 +105,51 @@ def test_topic_prefix(monkeypatch):
     finally:
         monkeypatch.delenv("HYPERSPLAT_TOPIC_PREFIX")
         importlib.reload(c)
+
+
+def _walk(scale, jump_at=None, n=12):
+    """Camera moving along x by `scale` per frame (identity rotation: C = -t); one optional jump."""
+    out = []
+    for i in range(n):
+        x = i * scale + (50 * scale if jump_at is not None and i >= jump_at else 0.0)
+        out.append(c.CameraPose("j", i, 1.0 + i, "f%d.jpg" % i, 1.0, 0.0, 0.0, 0.0, -x, 0.0, 0.0, 600.0, 0.9))
+    return out
+
+
+def test_pose_features_do_not_depend_on_scene_scale():
+    small = c.pose_features(_walk(0.01))
+    large = c.pose_features(_walk(100.0))
+    assert set(c.POSE_FEATURES) <= set(small)
+    for name in c.POSE_FEATURES:
+        assert small[name] == pytest.approx(large[name], rel=1e-6), name
+    assert small["step_ratio"] == pytest.approx(1.0)
+
+
+def test_a_jump_stands_out_at_any_scale():
+    for scale in (0.01, 100.0):
+        assert c.pose_features(_walk(scale, jump_at=11))["step_ratio"] > 20
+
+
+def _snaps(losses):
+    return [c.TrainingSnapshot("j", i, float(i), i * 10, v, 1000, 2.0) for i, v in enumerate(losses)]
+
+
+def test_rising_loss_flags_a_sustained_climb():
+    flagged, rise = c.rising_loss(_snaps([1.0, 0.8, 0.6, 0.5, 0.5, 0.55, 0.62, 0.7, 0.8, 0.9, 1.0, 1.1]))
+    assert flagged and rise > 0.5
+
+
+@pytest.mark.parametrize("losses", [
+    [1.0, 0.8, 0.65, 0.55, 0.5, 0.45, 0.42, 0.4, 0.38, 0.37, 0.36, 0.35],        # healthy descent
+    [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],                           # plateau
+    [0.5, 0.49, 0.48, 0.47, 0.9, 0.46, 0.45, 0.44, 0.43, 0.43, 0.42, 0.42],      # one bump (a Difix round)
+    [0.5, 0.52, 0.49, 0.51, 0.5, 0.52, 0.49, 0.51, 0.5, 0.51],                    # noise around a level
+])
+def test_rising_loss_ignores_descent_plateau_bump_and_noise(losses):
+    assert c.rising_loss(_snaps(losses))[0] is False
+
+
+def test_rising_loss_needs_enough_history_and_is_scale_free():
+    assert c.rising_loss(_snaps([0.1, 0.2, 0.3]))[0] is False
+    base = [0.5, 0.5, 0.52, 0.56, 0.6, 0.66, 0.72, 0.8, 0.9, 1.0]
+    assert c.rising_loss(_snaps(base))[0] is c.rising_loss(_snaps([v * 1000 for v in base]))[0] is True

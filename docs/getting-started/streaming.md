@@ -97,11 +97,13 @@ Difix on, convergence first triggers one final polish round (in chunks, training
 then `difix_final_tail_steps` (750) more steps on its pseudo views before the end. Tuning: `--stream_converge_*` options
 of `simple_trainer.py` (logic in `examples/trainer_schedule.py`, `WorldConvergence`).
 
-The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8080) on the left once
+The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8091) on the left once
 training starts, the camera feed on the right (keyframes flash green) with bootstrap guidance,
 training progress and stream counters. Before the first map the left pane shows what the
 pipeline needs ("move the camera slowly: 12/24 keyframes"); with `--depth` it also shows the
-live depth of the camera (~3 fps) while the first ACE map is built. The dashboard binds to localhost
+live depth of the camera (~3 fps) while the first ACE map is built.
+The header's "Streaming view" link opens `/streaming`, a telemetry view of the same run (KPIs, pose map, camera feed
+with an optional depth heatmap overlay); the base page itself is unchanged. The dashboard binds to localhost
 only; `--share` exposes it (and the camera feed) on the network. Ctrl+C once stops gracefully
 (final checkpoint + PLY), twice kills. `demo/run_demo.sh` (the web app) is unchanged.
 
@@ -165,7 +167,16 @@ if you need them (`--stream --difix-online --with_ut --stream-depth ...`); see
 Stop a live run gracefully (final checkpoint, PLY and eval are still written):
 `touch <output_dir>/results/stream_3dgs/STOP` or `POST /api/stream/stop` (only a STOP written
 after the run started counts; it is honoured during the bootstrap too). Viewer / dashboard:
-`--stream-viewer-port 8080 --stream-dashboard-port 8090`.
+`--stream-viewer-port 8091 --stream-dashboard-port 8090`.
+
+### Through Apache Kafka (`--streaming`)
+
+`demo/run_stream_demo.sh --streaming ...` (or `run_stream_demo.bat --streaming`) sends the run's camera
+poses and training metrics to Apache Kafka with no changes to the pipeline: the hooks in
+`hypersplat/streaming` wrap the stream session and the trainer's TensorBoard writer. Start the data layers
+first with `hypersplat/streaming/ops/pod.sh up` (Kafka, Postgres, processor, Streamlit on 8501). The
+processor scores every event; the 8090 page's **Streaming visualization** view shows the flags for this
+run's job (`HYPERSPLAT_JOB_ID`) as they arrive. If Kafka is down events are dropped, never blocking training.
 
 ### External cameras over Arrow Flight
 

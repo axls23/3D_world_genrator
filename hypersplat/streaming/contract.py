@@ -17,6 +17,7 @@ Stdlib only and py3.8-compatible: the ACE env imports this file next to stream/s
 Every setting can be overridden with the HYPERSPLAT_<NAME> environment variable named beside it.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -71,7 +72,10 @@ TOPIC_TRAINING = Topic(TOPIC_PREFIX + "hypersplat.training-measurements", 1, 7 *
                        "one TrainingSnapshot every TRAIN_LOG_EVERY steps")
 TOPIC_ANOMALIES = Topic(TOPIC_PREFIX + "hypersplat.flagged-problems", 1, 30 * _DAY_MS,
                         "one Anomaly per event the models flag")
-TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES)
+TOPIC_DEAD_LETTER = Topic(TOPIC_PREFIX + "hypersplat.dead-letter", 1, 30 * _DAY_MS,
+                          "one DeadLetter per message the processor could not decode or store")
+TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES, TOPIC_DEAD_LETTER)
+DEAD_LETTER_RAW_CHARS = 256   # how much of the bad payload is kept: enough to diagnose, never the whole thing
 
 
 # ---------------------------------------------------------------------------------------------
@@ -162,18 +166,37 @@ class Anomaly:
     score: float                 # sklearn decision_function: lower = more anomalous
     reason: str                  # top feature, e.g. "turn_deg=74.2"
     injected: Optional[str] = None
+    anomaly_id: str = ""         # stable per flagged event (anomaly_id()): consumers dedupe replays on it
 
 
-Event = Union[CameraPose, TrainingSnapshot, Anomaly]
-KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly"}
+@dataclass(frozen=True)
+class DeadLetter:
+    """A message the processor could not decode or store, kept for inspection instead of vanishing."""
+    job_id: str                  # from the Kafka key, "unknown" when the message had none
+    ts: float
+    source_topic: str
+    reason: str
+    raw: str                     # first DEAD_LETTER_RAW_CHARS characters of the payload
+
+
+def anomaly_id(job_id: str, source: str, source_seq: int, model: str) -> str:
+    """Deterministic identity of one flagged event: a replayed batch re-sends the same id, so the
+    anomalies topic is at-least-once but deduplicable (it is not exactly-once; see architecture)."""
+    return hashlib.sha1(("%s|%s|%d|%s" % (job_id, source, source_seq, model)).encode()).hexdigest()[:16]
+
+
+Event = Union[CameraPose, TrainingSnapshot, Anomaly, DeadLetter]
+KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly", DeadLetter: "dead_letter"}
 CLASS_OF = {v: k for k, v in KIND_OF.items()}
-TOPIC_OF = {CameraPose: TOPIC_POSES, TrainingSnapshot: TOPIC_TRAINING, Anomaly: TOPIC_ANOMALIES}
+TOPIC_OF = {CameraPose: TOPIC_POSES, TrainingSnapshot: TOPIC_TRAINING, Anomaly: TOPIC_ANOMALIES,
+            DeadLetter: TOPIC_DEAD_LETTER}
 
 # Fields that must be present and finite; anything else optional (row 4).
 _REQUIRED_FINITE = {
     CameraPose: ("ts", "qw", "qx", "qy", "qz", "tx", "ty", "tz", "focal", "confidence"),
     TrainingSnapshot: ("ts", "loss", "gpu_mem_gb"),
     Anomaly: ("ts", "score"),
+    DeadLetter: ("ts",),
 }
 _INT_FIELDS = {"seq", "step", "num_gaussians", "dropped", "source_seq"}
 
@@ -401,7 +424,10 @@ def _slope(ys: Sequence[float]) -> float:
 
 # Feature vectors are defined here, not in the processor or the offline trainer, so the model
 # is scored on exactly what it was fitted on (row 11, no train/serve skew).
-POSE_FEATURES = ("step_dist", "turn_deg", "confidence", "conf_ratio", "focal_ratio")
+# Scale-free on purpose: step_dist and raw confidence depend on the scene (a metre in a desk scan is
+# a jump, in a courtyard a stroll), so the model sees each pose relative to the poses before it.
+# step_dist stays in pose_features() for the KPIs and the database, just not in the model.
+POSE_FEATURES = ("step_ratio", "turn_deg", "conf_ratio", "focal_ratio")
 TRAINING_FEATURES = ("loss_ratio_best", "loss_trend", "loss_cv", "gs_growth", "mem_delta_gb")
 
 
@@ -414,10 +440,14 @@ def pose_features(window: Sequence[CameraPose]) -> Dict[str, float]:
     if prev is not None:
         a, b = camera_center(prev), camera_center(cur)
         step = math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+    past = [camera_center(p) for p in hist]
+    steps = sorted(math.dist(a, b) for a, b in zip(past, past[1:]))
+    typical = steps[len(steps) // 2] if steps else 0.0
     conf_mean = _mean([p.confidence for p in hist])
     focals = sorted(p.focal for p in hist)
     return {
         "step_dist": step,
+        "step_ratio": step / typical if typical > 0 else 1.0,
         "turn_deg": turn_deg(prev, cur) if prev is not None else 0.0,
         "confidence": cur.confidence,
         "conf_ratio": cur.confidence / conf_mean if conf_mean > 0 else 1.0,
@@ -437,6 +467,26 @@ def training_features(window: Sequence[TrainingSnapshot]) -> Dict[str, float]:
         "gs_growth": (window[-1].num_gaussians - window[0].num_gaussians) / span,
         "mem_delta_gb": window[-1].gpu_mem_gb - window[0].gpu_mem_gb,
     }
+
+
+# Rising loss: the Isolation Forest sees one window's shape, so a slow climb (each step only a little
+# worse than the last) looks normal to it. A rank-trend test on the newest losses catches it instead.
+RISING_LEN = 8        # newest snapshots examined
+RISING_TAU = 0.6      # Mann-Kendall tau (-1 falling .. +1 rising) needed: mostly-increasing, not one bump
+RISING_MIN_RISE = 0.10  # and the newest 3 losses average this much above the oldest 3 (relative)
+
+
+def rising_loss(window: Sequence[TrainingSnapshot]) -> Tuple[bool, float]:
+    """(flag, relative rise) for a loss that has been climbing over the last RISING_LEN snapshots."""
+    losses = [s.loss for s in window][-RISING_LEN:]
+    if len(losses) < RISING_LEN:
+        return False, 0.0
+    pairs = [(losses[j] > losses[i]) - (losses[j] < losses[i])
+             for i in range(len(losses)) for j in range(i + 1, len(losses))]
+    tau = sum(pairs) / len(pairs)
+    first, last = _mean(losses[:3]), _mean(losses[-3:])
+    rise = (last - first) / first if first > 0 else 0.0
+    return (tau >= RISING_TAU and rise >= RISING_MIN_RISE), rise
 
 
 # Live KPIs (row 9), the column names the processor writes and the dashboard reads.

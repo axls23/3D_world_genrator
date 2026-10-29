@@ -1,0 +1,87 @@
+# The streaming data layers as one pod for `podman kube play` (and, unchanged in shape, a cluster):
+# Kafka (KRaft) -> topics -> PostgreSQL -> processor -> Streamlit. Containers in a pod share
+# localhost, so every client uses the EXTERNAL listener at localhost:9094.
+#
+#   podman build -t hypersplat-streaming -f hypersplat/streaming/Containerfile .
+#   podman kube play hypersplat/streaming/k8s/pod.yaml          # ops/pod.sh up|down|status wraps this
+#
+# Producers (trainer/ACE hooks, replay) run on the host and use localhost:9094 (hostPort).
+# Models (git-ignored; run train_models first) are copied by ops/pod.sh into the hypersplat-models volume,
+# not bind-mounted: models/ may sit on a filesystem SELinux cannot relabel, and the volume keeps
+# every container confined.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hypersplat-streaming
+  labels: {app: hypersplat-streaming}
+spec:
+  restartPolicy: Always
+  containers:
+    - name: kafka
+      image: docker.io/apache/kafka:3.9.1
+      ports:
+        - {containerPort: 9094, hostPort: 9094}
+      env:
+        - {name: KAFKA_NODE_ID, value: "1"}
+        - {name: KAFKA_PROCESS_ROLES, value: "broker,controller"}
+        - {name: KAFKA_LISTENERS, value: "INTERNAL://:29092,EXTERNAL://:9094,CONTROLLER://:9093"}
+        - {name: KAFKA_ADVERTISED_LISTENERS, value: "INTERNAL://localhost:29092,EXTERNAL://localhost:9094"}
+        - {name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"}
+        - {name: KAFKA_CONTROLLER_LISTENER_NAMES, value: CONTROLLER}
+        - {name: KAFKA_INTER_BROKER_LISTENER_NAME, value: INTERNAL}
+        - {name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093"}
+        - {name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1"}
+        - {name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1"}
+        - {name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1"}
+        - {name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0"}
+        - {name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "false"}   # topics come only from the topics step
+        - {name: KAFKA_LOG_DIRS, value: /var/lib/kafka/data}
+      volumeMounts:
+        - {name: kafka-data, mountPath: /var/lib/kafka/data}
+    - name: db
+      image: docker.io/library/postgres:16-alpine
+      ports:
+        - {containerPort: 5432, hostPort: 5433}   # 5433 leaves a native PostgreSQL on 5432 alone
+      env:
+        - {name: POSTGRES_USER, value: hypersplat}
+        - {name: POSTGRES_PASSWORD, value: hypersplat}
+        - {name: POSTGRES_DB, value: hypersplat}
+      volumeMounts:
+        - {name: db-data, mountPath: /var/lib/postgresql/data}
+    - name: processor
+      image: localhost/hypersplat-streaming:latest
+      imagePullPolicy: Never
+      env: &appenv
+        - {name: HYPERSPLAT_KAFKA, value: "localhost:9094"}
+        - {name: HYPERSPLAT_DB_DSN, value: "postgresql://hypersplat:hypersplat@localhost:5432/hypersplat"}
+      # Start order inside one pod is by waiting: topics create retries until Kafka answers, then
+      # the DB is polled; both steps are idempotent so a restart is safe.
+      command:
+        - sh
+        - -c
+        - >-
+          python -m hypersplat.streaming.topics --wait 120 create &&
+          until python -c "import os, psycopg; psycopg.connect(os.environ['HYPERSPLAT_DB_DSN'], connect_timeout=2)" 2>/dev/null; do sleep 2; done;
+          exec python -m hypersplat.streaming.processor
+      volumeMounts:
+        - {name: models, mountPath: /app/hypersplat/streaming/models, readOnly: true}
+    - name: dashboard
+      image: localhost/hypersplat-streaming:latest
+      imagePullPolicy: Never
+      ports:
+        - {containerPort: 8501, hostPort: 8501}
+      env: *appenv
+      command:
+        - sh
+        - -c
+        - >-
+          until python -c "import os, psycopg; psycopg.connect(os.environ['HYPERSPLAT_DB_DSN'], connect_timeout=2)" 2>/dev/null; do sleep 2; done;
+          exec python -m streamlit run hypersplat/streaming/dashboard.py
+          --server.port=8501 --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false
+  volumes:
+    - name: kafka-data
+      persistentVolumeClaim: {claimName: hypersplat-kafka-data}
+    - name: db-data
+      persistentVolumeClaim: {claimName: hypersplat-db-data}
+    - name: models
+      persistentVolumeClaim: {claimName: hypersplat-models}   # filled from models/ by ops/pod.sh
