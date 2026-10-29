@@ -28,6 +28,7 @@ Options:
   --builtin           use the laptop's built-in camera (same as --camera 0)
   --phone             Android phone on the USB-C / Thunderbolt port: USB webcam mode if the phone
                       offers it, else its camera over adb (USB debugging; no app, no sudo)
+  --wait-usb          keep scanning until a USB camera or phone is connected (default for the .bat launcher)
   --wifi              scan the local network for an IP camera / phone camera app and use it
                       (several found: asks which; python -m hypersplat.stream.wifi lists them)
   --phone-camera C    back (default) or front
@@ -97,7 +98,7 @@ Options:
                       ACE maps, file fully localized before step 0 (slower; ~0.2 dB lower)
   --no-view           no viewer / dashboard / browser
   --no-browser        start the dashboard but do not open a browser
-  --viewer-port P     viser 3DGS viewer port (default 8080)
+  --viewer-port P     viser 3DGS viewer port (default 8091)
   --dashboard-port P  split-view dashboard port (default 8090)
   --share             serve the dashboard on all interfaces (exposes the camera feed!)
   --budget-mb MB      keyframe store memory budget (default 256)
@@ -147,17 +148,19 @@ OUTPUT="demo/output/stream_demo"
 DEMO_VIDEO="demo/input/drone_demo.mp4"
 EXTRA=()
 DIFIX=1 VIEW=1 BROWSER=1 PHONE=0 WIFI=0 PHONE_FACING=back CAPTURE_FPS=60
+WAIT_USB=0
 DIFIX_SHARE=0.15 DIFIX_START=0.5 SEED=42
 UT=default REFINE_POSES=0
 COLD=default LBFGS=1 LBFGS_EVERY=50 MAPDEPTH=1 MAPDEPTH_W=50
 JEPA=0 JEPA_TUNED=0 JEPA_LAMBDA=0.1 JEPA_WARMUP=0 JEPA_ANNEAL=0
 JEPA_BACKEND=depth_anything JEPA_LAYER=-1 JEPA_SIDE=224
-VIEWER_PORT=8080 DASH_PORT=8090 DASH_HOST=127.0.0.1
+VIEWER_PORT=8091 DASH_PORT=8090 DASH_HOST=127.0.0.1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --camera)         SOURCE="$2"; shift ;;
         --builtin)        SOURCE="0" ;;
         --phone)          PHONE=1 ;;
+        --wait-usb)       WAIT_USB=1 ;;
         --wifi)           WIFI=1 ;;
         --phone-camera)   PHONE_FACING="$2"; shift ;;
         --fps)            CAPTURE_FPS="$2"; shift ;;
@@ -347,7 +350,7 @@ if [[ $PHONE -eq 0 && $WIFI -eq 0 && "$SOURCE" == usb ]]; then
     if [[ -z "$SOURCE" ]]; then
         echo "[stream-demo] No external USB camera or phone found. Cameras present:" >&2
         usb_field cameras <<<"$det" | sed 's/^/  - /' >&2
-        if [[ -t 0 ]]; then
+        if [[ -t 0 || $WAIT_USB -eq 1 ]]; then
             echo "[stream-demo] >>> Connect an external USB camera (or a phone with USB debugging) now." >&2
             echo "[stream-demo]     Waiting... Ctrl+C to cancel, or rerun with --builtin for the laptop camera" >&2
             last=""

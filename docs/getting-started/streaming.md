@@ -97,8 +97,9 @@ Difix on, convergence first triggers one final polish round (in chunks, training
 then `difix_final_tail_steps` (750) more steps on its pseudo views before the end. Tuning: `--stream_converge_*` options
 of `simple_trainer.py` (logic in `examples/trainer_schedule.py`, `WorldConvergence`).
 
-The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8080) on the left once
-training starts, the camera feed on the right (keyframes flash green) with bootstrap guidance,
+The browser opens `http://localhost:8090`: the viser 3DGS viewer (port 8091) on the left once
+training starts, the camera feed on the right (keyframes flash green) with an optional depth
+heatmap overlay when `--depth` is enabled, plus bootstrap guidance,
 training progress and stream counters. Before the first map the left pane shows what the
 pipeline needs ("move the camera slowly: 12/24 keyframes"); with `--depth` it also shows the
 live depth of the camera (~3 fps) while the first ACE map is built. The dashboard binds to localhost
@@ -165,7 +166,7 @@ if you need them (`--stream --difix-online --with_ut --stream-depth ...`); see
 Stop a live run gracefully (final checkpoint, PLY and eval are still written):
 `touch <output_dir>/results/stream_3dgs/STOP` or `POST /api/stream/stop` (only a STOP written
 after the run started counts; it is honoured during the bootstrap too). Viewer / dashboard:
-`--stream-viewer-port 8080 --stream-dashboard-port 8090`.
+`--stream-viewer-port 8091 --stream-dashboard-port 8090`.
 
 ### External cameras over Arrow Flight
 
