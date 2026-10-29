@@ -6,7 +6,9 @@
 #   podman kube play hypersplat/streaming/k8s/pod.yaml          # ops/pod.sh up|down|status wraps this
 #
 # Producers (trainer/ACE hooks, replay) run on the host and use localhost:9094 (hostPort).
-# Models are read from the host's hypersplat/streaming/models (git-ignored; run train_models first).
+# Models (git-ignored; run train_models first) are copied by ops/pod.sh into the hypersplat-models volume,
+# not bind-mounted: models/ may sit on a filesystem SELinux cannot relabel, and the volume keeps
+# every container confined.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -82,4 +84,4 @@ spec:
     - name: db-data
       persistentVolumeClaim: {claimName: hypersplat-db-data}
     - name: models
-      hostPath: {path: ../models, type: Directory}
+      persistentVolumeClaim: {claimName: hypersplat-models}   # filled from models/ by ops/pod.sh
