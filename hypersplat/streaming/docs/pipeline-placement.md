@@ -46,6 +46,8 @@ flowchart LR
     SND["B4 producer queue<br/>10 000 events, background thread,<br/>drops NEWEST and counts<br/>producer.py"]
     TAPA --> SND
     TAPB --> SND
+    TAPC(["TAP C · health sampler<br/>session.stats() every second"]) --> SND
+    EV -.-> TAPC
 
     subgraph DATA["Data layers (pod)"]
         direction TB
@@ -62,7 +64,7 @@ flowchart LR
 
     classDef tap fill:#e6f7ef,stroke:#2f9a52,color:#12361f;
     classDef gap fill:#fff3e0,stroke:#e0a84a,color:#5a3b00,stroke-dasharray: 4 3;
-    class TAPA,TAPB tap;
+    class TAPA,TAPB,TAPC tap;
 ```
 
 `B1`..`B5` are the five buffers in series. `W` is the only windowing layer for scoring; `O` is the ordering
@@ -81,6 +83,7 @@ guard.
 | **Ordering: keep order** | Kafka key `job_id`, one partition per topic | Yes for this scale | One partition keeps each job in order. More partitions would still keep per-job order. |
 | **Ordering: enforce** | processor `seq` guard, `(job_id, seq)` unique in Postgres | Yes, narrow | Duplicates and late events are skipped and counted; there is no re-ordering buffer. |
 | **Windowing: scoring** | processor, 30 events per `(job, type)`, rebuilt from Postgres on restart | Yes | State lives where the models run and survives restarts. It is not in the hooks, which have to stay cheap. |
+| **Health sampling** | tap C, a 1 s thread started with the session | Yes | Reads the head of the pipeline (queue drops, gate, store, localise) where it is measured, off every hot path. |
 | **Windowing: keyframe quality** | `keyframes.py` sharpness history, `spacing.py` | Yes | A separate, earlier window for a different decision (accept this frame or not). |
 | **Serialization, validation** | `contract.encode()` in the sender thread; `decode()` in the processor | Yes | Bad events are rejected where they can be counted: producer-side drop, consumer-side dead letter. |
 | **Scoring** | processor, models loaded once | Yes | Keeps GPU threads free of model code. |
@@ -96,20 +99,29 @@ without any error. A stress test with four threads reproduced it every time (`[0
 the hook now does both steps under one lock (`hooks._pub_lock`) and the test passes. **The run that is
 already running keeps the old code; restart it to get the fix.**
 
-### 2. Gap: the head of the pipeline is invisible to Kafka
+### 2. Built: the head of the pipeline is now on Kafka (tap C)
 
-B1 drops, gate accept/reject counts, store evictions, localize latency, GPU-lease waits and depth rejections
-exist only in `session.stats()` (shown live on 8090). They never reach Kafka or Postgres, so the processor
-cannot score or store them, and a run that silently lost frames at the source looks healthy downstream.
-Recommended placement: a third tap that samples `session.stats()` about once a second into a small
-`stream-health` event (one more topic), keeping it off the pose path. Not built.
+`hooks.start_health` runs from session start (the hook wraps `StreamSession.start`) and samples
+`session.stats()` about once a second into a `StreamHealth` event on `hypersplat.stream-health`: frames read
+and dropped at the source queue, keyframes offered, accepted, registered and unregistered, evictions,
+reconnects, localise latency, depth rejections and backlog, store megabytes, and the session phase. The
+counters are cumulative, so a lost sample loses nothing. It runs before any pose or training step exists, so
+the bootstrap phase is covered too.
 
-### 3. Gap: the training tap carries only the `train/*` scalars
+The processor stores each sample in `stream_health` (idempotent on `(job_id, seq)`, window rebuilt from
+Postgres on restart) and judges the last 10 with `contract.head_alerts`: more than 20% of frames dropped at the
+source, or more than half of the new keyframes failing to localise. An unhealthy head raises one anomaly
+(`source=health`, `model=head_rules`) per episode and repeats every 30 samples, not one per second. Streamlit
+shows Source drops and Localize tiles and a head-of-the-pipeline chart with alert samples in red.
 
-`TB_TAGS` limits a snapshot to loss, Gaussian count and memory. Held-out PSNR, Difix rounds and the
-world-convergence state exist in the trainer but are not streamed, so the models cannot flag a PSNR drop.
-Recommended: extend `TB_TAGS` and the snapshot with `stream/probe_psnr` (the processor tolerates extra
-fields). Not built.
+### 3. Built: held-out PSNR and Difix rounds ride the training snapshots
+
+The trainer now writes `val/psnr` (the evaluation loop was computing it but not logging it) and
+`stream/difix_rounds`. These arrive at their own steps, so the training hook keeps the latest value
+(`STICKY_TAGS`) and carries it on the next `TrainingSnapshot` as `psnr` and `difix_rounds`; held-out PSNR wins
+over the convergence probe's. The processor stores both columns and applies `contract.falling_psnr`: with at
+least 3 distinct readings, a latest reading 0.5 dB or more below the best earlier one and still falling is
+flagged once, on the snapshot where the new reading appears, as `psnr_drop=-N dB` (`model=psnr_trend`).
 
 ### 4. Inconsistent drop policies, deliberate but undocumented elsewhere
 
@@ -137,5 +149,6 @@ loss appear only in finding 2's gap.
 
 The tools are in the right stages: buffers at every thread or process boundary, ordering assigned at the
 producer and enforced at the sink, windows in the processor where the models and the durable state are. One
-placement defect (finding 1) was found and fixed. Two gaps remain: head-of-pipeline health (2) and
-extra training metrics (3).
+placement defect (finding 1) was found and fixed, and both gaps (2 and 3) are now built and verified through
+the pod: a synthetic source dropping 40% of frames raised one `head_rules` anomaly, and a PSNR slide raised
+`psnr_trend` anomalies once per new reading.

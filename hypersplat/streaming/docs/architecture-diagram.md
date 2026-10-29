@@ -88,6 +88,7 @@ flowchart TB
         B[["hypersplat.training-measurements<br/>key = job_id, retention 7 d"]]
         C[["hypersplat.flagged-problems<br/>key = job_id, retention 30 d"]]
         D[["hypersplat.dead-letter<br/>bad messages with reason + first 256 chars"]]
+        E[["hypersplat.stream-health<br/>head of the pipeline, about 1 per second"]]
     end
 
     subgraph SUB["Subscribers"]
