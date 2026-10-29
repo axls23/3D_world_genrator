@@ -401,7 +401,10 @@ def _slope(ys: Sequence[float]) -> float:
 
 # Feature vectors are defined here, not in the processor or the offline trainer, so the model
 # is scored on exactly what it was fitted on (row 11, no train/serve skew).
-POSE_FEATURES = ("step_dist", "turn_deg", "confidence", "conf_ratio", "focal_ratio")
+# Scale-free on purpose: step_dist and raw confidence depend on the scene (a metre in a desk scan is
+# a jump, in a courtyard a stroll), so the model sees each pose relative to the poses before it.
+# step_dist stays in pose_features() for the KPIs and the database, just not in the model.
+POSE_FEATURES = ("step_ratio", "turn_deg", "conf_ratio", "focal_ratio")
 TRAINING_FEATURES = ("loss_ratio_best", "loss_trend", "loss_cv", "gs_growth", "mem_delta_gb")
 
 
@@ -414,10 +417,14 @@ def pose_features(window: Sequence[CameraPose]) -> Dict[str, float]:
     if prev is not None:
         a, b = camera_center(prev), camera_center(cur)
         step = math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+    past = [camera_center(p) for p in hist]
+    steps = sorted(math.dist(a, b) for a, b in zip(past, past[1:]))
+    typical = steps[len(steps) // 2] if steps else 0.0
     conf_mean = _mean([p.confidence for p in hist])
     focals = sorted(p.focal for p in hist)
     return {
         "step_dist": step,
+        "step_ratio": step / typical if typical > 0 else 1.0,
         "turn_deg": turn_deg(prev, cur) if prev is not None else 0.0,
         "confidence": cur.confidence,
         "conf_ratio": cur.confidence / conf_mean if conf_mean > 0 else 1.0,

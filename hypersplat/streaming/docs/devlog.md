@@ -99,8 +99,10 @@ PRs open into `feat/streaming`: #28 docs (U8), #29 dashboard (U6), #30 replay (U
 check `gh pr list`). Nothing is merged yet and the end-to-end replay demo has not been run.
 
 Open issues to fix after merge:
-- Pose features depend on scene scale: pose model over-flags the phone capture (precision ~0.35-0.40). Normalize
-  `step_dist` by window median, use `conf_ratio` instead of raw `confidence` (contract.py, then retrain).
+- ~~Pose features depend on scene scale~~ Fixed: the model now sees `step_ratio` (step / median recent step), `turn_deg`,
+  `conf_ratio`, `focal_ratio`; `step_dist` and `confidence` stay in the database. Replay of record1 with 6 shuffled poses:
+  flagged 33/593 (was 307/593), injected caught 4/6 (was 0/6). Same-scene holdout at contamination 0.05: blur 40/40,
+  shuffle 0/16 (was 16/16); at 0.10: all 56 caught, 0/36 false alarms. Default contamination left at 0.05; shuffles need 0.10.
 - Training model misses rising loss (0/128); live logging every 10 steps vs 100 in past TB runs changes window scale.
 - `producer.py`: kafka-python ignores `max_block_ms` while bootstrapping (sender thread blocks ~30 s on a dead broker);
   add `bootstrap_timeout_ms` to `PRODUCER_CONFIG`.

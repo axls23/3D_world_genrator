@@ -50,7 +50,8 @@ def test_features():
                                            focal=600, confidence=100))
              for i in range(3)]
     f = c.pose_features(poses)
-    assert set(f) == set(c.POSE_FEATURES)
+    assert set(c.POSE_FEATURES) <= set(f)
+    assert {"step_dist", "confidence"} <= set(f)    # kept for the KPIs and the database
     assert math.isclose(f["step_dist"], 1.0) and f["turn_deg"] == 0.0
     snaps = [c.TrainingSnapshot("j", i, i, i * 10, 1.0 / (i + 1), 1000 + i, 2.0) for i in range(30)]
     t = c.training_features(snaps)
@@ -104,3 +105,26 @@ def test_topic_prefix(monkeypatch):
     finally:
         monkeypatch.delenv("HYPERSPLAT_TOPIC_PREFIX")
         importlib.reload(c)
+
+
+def _walk(scale, jump_at=None, n=12):
+    """Camera moving along x by `scale` per frame (identity rotation: C = -t); one optional jump."""
+    out = []
+    for i in range(n):
+        x = i * scale + (50 * scale if jump_at is not None and i >= jump_at else 0.0)
+        out.append(c.CameraPose("j", i, 1.0 + i, "f%d.jpg" % i, 1.0, 0.0, 0.0, 0.0, -x, 0.0, 0.0, 600.0, 0.9))
+    return out
+
+
+def test_pose_features_do_not_depend_on_scene_scale():
+    small = c.pose_features(_walk(0.01))
+    large = c.pose_features(_walk(100.0))
+    assert set(c.POSE_FEATURES) <= set(small)
+    for name in c.POSE_FEATURES:
+        assert small[name] == pytest.approx(large[name], rel=1e-6), name
+    assert small["step_ratio"] == pytest.approx(1.0)
+
+
+def test_a_jump_stands_out_at_any_scale():
+    for scale in (0.01, 100.0):
+        assert c.pose_features(_walk(scale, jump_at=11))["step_ratio"] > 20

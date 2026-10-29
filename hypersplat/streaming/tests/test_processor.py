@@ -240,7 +240,7 @@ def test_jump_is_flagged_and_sent(model_dir, with_stats):
     assert [a.source_seq for a in out] == [20]
     a = out[0]
     assert (a.source, a.model, a.injected) == ("pose", c.POSE_MODEL, "shuffle")
-    assert a.reason.startswith("step_dist=" if with_stats else "turn_deg=")
+    assert a.reason.startswith("step_ratio=")
     assert a.score == pytest.approx(row["anomaly_score"])
     sender.flush()
     assert [e.source_seq for e in sender.events()] == [20]
@@ -258,11 +258,11 @@ def test_reason_uses_z_scores_when_stats_stored():
         def predict(self, X):
             return [-1]
 
-    feats = dict(step_dist=5.0, turn_deg=3.0, confidence=1000.0, conf_ratio=1.0, focal_ratio=1.0)
+    feats = dict(step_ratio=5.0, turn_deg=3.0, conf_ratio=1.0, focal_ratio=1.0)
     plain = P.AnomalyModel("m", Est(), c.POSE_FEATURES)
-    assert plain.score(feats) == (-0.1, True, "confidence=1000")
-    z = P.AnomalyModel("m", Est(), c.POSE_FEATURES, mean=[4.0, 0.0, 1000.0, 1.0, 1.0],
-                       std=[1.0, 0.5, 100.0, 0.1, 0.1])
+    assert plain.score(feats) == (-0.1, True, "step_ratio=5")
+    z = P.AnomalyModel("m", Est(), c.POSE_FEATURES, mean=[4.0, 0.0, 1.0, 1.0],
+                       std=[1.0, 0.5, 0.1, 0.1])
     assert z.score(feats)[2] == "turn_deg=3"
 
 
