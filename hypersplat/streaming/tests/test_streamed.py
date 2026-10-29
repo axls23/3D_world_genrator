@@ -58,3 +58,13 @@ def test_results_are_cached_for_the_ttl(db):
     assert s.snapshot()["poses_flagged"] == 0           # inside the ttl: no second query
     s.ttl = 0
     assert s.snapshot()["poses_flagged"] == 1
+
+
+@needs_pg
+def test_the_live_run_pins_its_own_job_through_the_hooks_env(db, monkeypatch):
+    """live.sh exports HYPERSPLAT_JOB_ID for the hooks; the 8090 view must read that same job even when
+    another job was updated more recently."""
+    _job(db, "mine", [("m0.jpg", True, -0.2)])
+    _job(db, "other-newer", [("o0.jpg", False, 0.2)])
+    monkeypatch.setenv("HYPERSPLAT_JOB_ID", "mine")
+    assert StreamedResults(ttl=0).snapshot()["job_id"] == "mine"

@@ -19,7 +19,7 @@ RETRY_AFTER_S = 5.0     # after a failed read, do not hammer a dead database
 class StreamedResults:
     def __init__(self, dsn: Optional[str] = None, job_id: Optional[str] = None, ttl: float = 1.5):
         self.dsn, self.ttl = dsn, ttl
-        self.job_id = job_id or os.environ.get("HYPERSPLAT_JOB") or None
+        self.job_id = job_id or os.environ.get("HYPERSPLAT_JOB") or os.environ.get("HYPERSPLAT_JOB_ID") or None
         self._lock = threading.Lock()
         self._cache = (0.0, self._down("not read yet"))
 

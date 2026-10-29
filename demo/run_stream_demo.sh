@@ -137,11 +137,26 @@ Options:
                       until a consumer uses it; off by default)
   --debug-offered DIR save every offered frame (ACE res) and its gate decision to DIR (offers.jsonl)
   --output DIR        output directory (default demo/output/stream_demo)
+  --streaming         send the run's poses and training metrics through Apache Kafka (hooks, no code
+                      changes): start the pod first (hypersplat/streaming/ops/pod.sh up); the 8090
+                      "Streaming visualization" view then shows what the processor flags, live
   --trainer-arg K=V   pass a trainer config field through (repeatable), e.g.
                       stream_review_max_idle=1 or stream_review_jepa_tol=0.08
   -h, --help          this help
 EOF
 }
+
+# --streaming: re-run through hypersplat/streaming/live.sh, which turns the Kafka hooks on for every
+# Python process of the demo (live.sh execs this script again with HYPERSPLAT_STREAMING=1).
+if [[ "${HYPERSPLAT_STREAMING:-0}" != 1 ]]; then
+    for a in "$@"; do
+        if [[ "$a" == --streaming ]]; then
+            rest=()
+            for b in "$@"; do [[ "$b" == --streaming ]] || rest+=("$b"); done
+            exec bash "$ROOT/hypersplat/streaming/live.sh" "${rest[@]}"
+        fi
+    done
+fi
 
 SOURCE="usb"
 OUTPUT="demo/output/stream_demo"
@@ -161,6 +176,7 @@ while [[ $# -gt 0 ]]; do
         --builtin)        SOURCE="0" ;;
         --phone)          PHONE=1 ;;
         --wait-usb)       WAIT_USB=1 ;;
+        --streaming)      ;;   # handled before this loop (re-exec through live.sh)
         --wifi)           WIFI=1 ;;
         --phone-camera)   PHONE_FACING="$2"; shift ;;
         --fps)            CAPTURE_FPS="$2"; shift ;;
