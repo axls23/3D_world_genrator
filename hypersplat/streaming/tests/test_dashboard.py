@@ -248,11 +248,19 @@ def _app():
 
 
 def _messages(at):
-    return " ".join(e.value for e in list(at.info) + list(at.warning) + list(at.success))
+    # the liveness text now sits in the header card (markdown), the empty/error states stay st.info/warning
+    return " ".join(e.value for e in list(at.info) + list(at.warning) + list(at.success) + list(at.markdown))
 
 
 def _tiles(at):
-    return {m.label: m.value for m in at.metric}
+    """{label: value} of the KPI cards (rendered as HTML in the telemetry skin)."""
+    import html
+    import re
+    out = {}
+    for md in at.markdown:
+        for label, value in re.findall(r'<div class="k">(.*?)</div><div class="v">(.*?)</div>', md.value):
+            out[html.unescape(label)] = html.unescape(value)
+    return out
 
 
 def _plotly_traces(at):
@@ -360,3 +368,17 @@ def test_app_database_down(monkeypatch):
     at = _app()
     msg = _messages(at)
     assert "Waiting for the database at 127.0.0.1:1/none" in msg and "secret" not in msg
+
+
+def test_cards_html_carries_every_tile_with_its_tone():
+    tiles = d.kpi_tiles(d.kpis({"events_dropped": 12, "anomalies": 3}, *_frames()[::-1]))
+    out = d.cards_html(tiles)
+    assert out.count('class="hs-kpi"') == len(tiles)
+    assert '<div class="k">Dropped events</div><div class="v">12</div>' in out
+    assert c.ANOMALY_COLOR in out                      # Anomalies / Poses rejected carry the red tone
+
+
+def test_header_and_quality_cards():
+    assert "hs-badge stale" in d.header_html("j<1>", "stale", "Last event 9 s ago") and "j&lt;1&gt;" in d.header_html("j<1>", "live", "x")
+    poses, training = _frames()
+    assert "No flagged events" in d.quality_html(poses.iloc[0:0], training.iloc[0:0])

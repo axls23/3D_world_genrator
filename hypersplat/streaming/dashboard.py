@@ -16,6 +16,7 @@ SQL and dataframe shaping live in plain functions (load_jobs, load_job, kpis, *_
 tests call without Streamlit.
 """
 
+import html
 import math
 import sys
 from pathlib import Path
@@ -37,9 +38,13 @@ CONNECT_TIMEOUT_S = 3     # a dead database must not hang a 2 s refresh
 STALE_AFTER_S = 3 * c.DASHBOARD_REFRESH_S  # no event for this long: producer paused or stopped
 
 # Series colours; red (contract.ANOMALY_COLOR) is reserved for flagged events.
-RAW_COLOR = "#a6acb5"
-MAIN_COLOR = "#1f6fb4"
-OUTLINE_COLOR = "#222222"
+# Palette and look follow the 8090 telemetry view (PR #34 design): dark navy panels, teal accent.
+BG, PANEL, LINE = "#0a0f17", "#111a27", "#253448"
+TEXT, MUTED = "#e8eef5", "#8999ad"
+ACCENT, BLUE, WARN = "#49d6b3", "#68a9ff", "#f3b95f"
+RAW_COLOR = MUTED
+MAIN_COLOR = BLUE
+OUTLINE_COLOR = TEXT
 
 _POSE_NUMERIC = ("seq", "cx", "cy", "cz", "focal", "confidence", "anomaly_score") + c.POSE_METRICS
 _TRAINING_NUMERIC = ("seq", "step", "loss", "num_gaussians", "gpu_mem_gb", "steps_per_s",
@@ -212,11 +217,13 @@ def _flag(df: pd.DataFrame, col: str) -> pd.Series:
 
 
 def _layout(fig: go.Figure, title: str, x: str, y: str, height: int) -> go.Figure:
-    fig.update_layout(title=title, height=height, margin=dict(l=10, r=10, t=40, b=10),
+    fig.update_layout(title=dict(text=title, font=dict(size=13, color=TEXT)), height=height,
+                      margin=dict(l=10, r=10, t=40, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)", font=dict(color=MUTED, size=11),
                       legend=dict(orientation="h", yanchor="bottom", y=1.0, x=1, xanchor="right"),
                       hovermode="closest")
-    fig.update_xaxes(title=x)
-    fig.update_yaxes(title=y)
+    fig.update_xaxes(title=x, gridcolor=LINE, zerolinecolor=LINE)
+    fig.update_yaxes(title=y, gridcolor=LINE, zerolinecolor=LINE)
     return fig
 
 
@@ -323,6 +330,78 @@ def flagged_table(poses: pd.DataFrame, training: pd.DataFrame) -> pd.DataFrame:
 # Streamlit page
 # ---------------------------------------------------------------------------------------------
 
+THEME_CSS = f"""<style>
+.stApp {{ background: radial-gradient(ellipse at 12% -15%, #17334a 0, transparent 35%), {BG}; color:{TEXT}; }}
+header[data-testid="stHeader"] {{ background: transparent; }}
+.block-container {{ padding-top: 1.2rem; max-width: 1500px; }}
+.hs-head {{ display:flex; align-items:center; gap:14px; padding:6px 0 14px; flex-wrap:wrap; }}
+.hs-mark {{ width:34px; height:34px; display:grid; place-items:center; border-radius:11px; color:{ACCENT};
+            background:#49d6b31a; border:1px solid #49d6b344; font-size:20px; }}
+.hs-eyebrow {{ color:{MUTED}; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.13em; }}
+.hs-title {{ font-size:15px; font-weight:700; margin:0; }}
+.hs-badge {{ display:inline-flex; align-items:center; gap:7px; padding:5px 10px; border-radius:999px; font-size:10px;
+             font-weight:800; letter-spacing:.08em; text-transform:uppercase; border:1px solid #49d6b344;
+             color:{ACCENT}; background:#49d6b30f; }}
+.hs-badge::before {{ content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }}
+.hs-badge.stale {{ color:{WARN}; border-color:#f3b95f55; background:#f3b95f12; }}
+.hs-badge.none {{ color:{MUTED}; border-color:{LINE}; background:transparent; }}
+.hs-hint {{ color:#b6c4d5; font-size:12px; }}
+.hs-kpis {{ display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:12px; margin-bottom:6px; }}
+.hs-kpi {{ background:linear-gradient(145deg,#142031,#101925 72%); border:1px solid {LINE}; border-radius:14px;
+           padding:13px 15px; position:relative; overflow:hidden; box-shadow:0 12px 32px #0003; }}
+.hs-kpi::after {{ content:""; position:absolute; right:-24px; top:-32px; width:90px; height:90px; border-radius:50%;
+                  background:var(--tone); opacity:.09; }}
+.hs-kpi .k {{ color:{MUTED}; font-size:10px; font-weight:750; text-transform:uppercase; letter-spacing:.1em; }}
+.hs-kpi .v {{ margin-top:6px; font-size:24px; line-height:1.1; font-weight:720; letter-spacing:-.03em;
+              font-variant-numeric:tabular-nums; }}
+.hs-kpi .n {{ margin-top:5px; color:{MUTED}; font-size:11px; min-height:14px; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ background:linear-gradient(145deg,#142031,#101925 72%);
+    border:1px solid {LINE} !important; border-radius:14px !important; box-shadow:0 12px 32px #0003; }}
+.hs-quality {{ display:flex; gap:10px; padding:11px 12px; border-radius:10px; border:1px solid #f3b95f44;
+               background:#f3b95f0b; margin-bottom:8px; }}
+.hs-quality.ok {{ border-color:#49d6b344; background:#49d6b30b; }}
+.hs-quality b {{ display:block; font-size:12px; }}
+.hs-quality span {{ color:{MUTED}; font-size:11px; }}
+@media (max-width: 900px) {{ .hs-kpis {{ grid-template-columns:repeat(2, minmax(0,1fr)); }} }}
+</style>"""
+
+# tile label -> accent tone of its card
+_TONE = {"Rolling loss": BLUE, "Loss trend": BLUE, "Best loss": ACCENT, "Gaussians": ACCENT,
+         "Peak GPU memory": WARN, "Poses accepted": ACCENT, "Poses rejected": c.ANOMALY_COLOR,
+         "Rolling confidence": BLUE, "Dropped events": WARN, "Anomalies": c.ANOMALY_COLOR}
+
+
+def header_html(job_id: str, level: str, text: str) -> str:
+    label = {"live": "live", "stale": "stale", "none": "waiting"}[level]
+    return ('<div class="hs-head"><div class="hs-mark">&#9672;</div><div><div class="hs-eyebrow">HyperSplat / streaming'
+            '</div><div class="hs-title">Live reconstruction</div></div>'
+            '<span class="hs-badge %s">%s</span><span class="hs-hint">%s &middot; job %s</span></div>'
+            % (level, label, html.escape(text), html.escape(job_id)))
+
+
+def cards_html(tiles) -> str:
+    """The KPI tiles as the telemetry view's cards (same data as st.metric, different skin)."""
+    cards = []
+    for label, value, delta, _, help_ in tiles:
+        cards.append('<div class="hs-kpi" style="--tone:%s" title="%s"><div class="k">%s</div><div class="v">%s</div>'
+                     '<div class="n">%s</div></div>'
+                     % (_TONE.get(label, ACCENT), html.escape(help_, quote=True), html.escape(label),
+                        html.escape(value), html.escape(delta or "")))
+    return '<div class="hs-kpis">%s</div>' % "".join(cards)
+
+
+def quality_html(poses: pd.DataFrame, training: pd.DataFrame) -> str:
+    """The telemetry view's anomaly card: what the models flagged in the rows in view."""
+    n_pose = int(_flag(poses, "is_anomaly").sum()) if len(poses) else 0
+    n_train = int(_flag(training, "is_anomaly").sum()) if len(training) else 0
+    if n_pose + n_train == 0:
+        return ('<div class="hs-quality ok"><div><b>No flagged events</b><span>Pose and training models are '
+                'quiet in the rows in view.</span></div></div>')
+    return ('<div class="hs-quality"><div><b>%d flagged event%s</b><span>%d pose, %d training (isolation '
+            'forest or rising-loss trend). Red markers on the charts.</span></div></div>'
+            % (n_pose + n_train, "" if n_pose + n_train == 1 else "s", n_pose, n_train))
+
+
 def _where(dsn: str) -> str:
     """host:port/dbname of the DSN, without the password, for the error message."""
     try:
@@ -376,23 +455,22 @@ def render(st) -> None:
     poses, training = data["poses"], data["training"]
 
     level, text = liveness(data["age_s"])
-    {"live": st.success, "stale": st.warning, "none": st.info}[level](text)
-
-    tiles = kpi_tiles(kpis(data["job"], poses, training))
-    for row in (tiles[:5], tiles[5:]):
-        for col, (label, value, delta, delta_color, help_) in zip(st.columns(len(row)), row):
-            col.metric(label, value, delta, delta_color=delta_color, help=help_, border=True)
+    st.markdown(header_html(job_id, level, text), unsafe_allow_html=True)
+    st.markdown(cards_html(kpi_tiles(kpis(data["job"], poses, training))), unsafe_allow_html=True)
 
     left, right = st.columns([3, 2])
     with left:
-        _chart(st, loss_figure(training), "loss", "No training snapshots yet.")
+        with st.container(border=True):
+            _chart(st, loss_figure(training), "loss", "No training snapshots yet.")
         a, b = st.columns(2)
-        with a:
+        with a, st.container(border=True):
             _chart(st, gaussians_figure(training), "gaussians", "No Gaussian counts yet.")
-        with b:
+        with b, st.container(border=True):
             _chart(st, confidence_figure(poses), "confidence", "No pose confidences yet.")
     with right:
-        _chart(st, path_figure(poses), "path", "No camera poses yet.")
+        st.markdown(quality_html(poses, training), unsafe_allow_html=True)
+        with st.container(border=True):
+            _chart(st, path_figure(poses), "path", "No camera poses yet.")
 
     flagged = flagged_table(poses, training)
     with st.expander("Flagged events in view (%d)" % len(flagged)):
@@ -405,7 +483,7 @@ def main() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="HyperSplat stream", layout="wide")
-    st.title("HyperSplat live reconstruction")
+    st.markdown(THEME_CSS, unsafe_allow_html=True)
     if hasattr(st, "fragment"):
         # Only the fragment reruns on the timer; each run opens its own connection (row 17).
         st.fragment(run_every=c.DASHBOARD_REFRESH_S)(render)(st)
