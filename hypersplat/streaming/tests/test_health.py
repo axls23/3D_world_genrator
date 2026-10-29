@@ -14,7 +14,7 @@ from hypersplat.streaming import health as h
 from hypersplat.streaming.producer import FakeSender
 
 T0 = dt.datetime(2026, 10, 29, 12, 0, 0, tzinfo=dt.timezone.utc)
-POSES, TRAIN, ANOM, _DEAD = (t.name for t in c.TOPICS)
+POSES, TRAIN, ANOM, *_ = (t.name for t in c.TOPICS)
 
 
 def _job(poses, snaps, anomalies=3, age_s=1.0, at=T0):

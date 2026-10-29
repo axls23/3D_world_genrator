@@ -1321,6 +1321,8 @@ class Runner:
                                            loss=getattr(self, "_last_loss", None),
                                            difix_rounds=self.difix.rounds if self.difix else None)
         if self.world_rank == 0 and cfg.tb_every > 0 and step % max(cfg.tb_every, cfg.stream_sync_every) == 0:
+            if self.difix is not None:
+                self.writer.add_scalar("stream/difix_rounds", self.difix.rounds, step)
             st = s.stats()
             for key in ("keyframes", "registered", "unregistered", "pseudo", "store_mb", "map_version",
                         "frames_dropped"):
@@ -3577,6 +3579,8 @@ class Runner:
                 json.dump(stats, f)
             # save stats to tensorboard
             for k, v in stats.items():
+                if isinstance(v, (int, float)):   # val/psnr feeds the streaming hook's held-out quality
+                    self.writer.add_scalar(f"{stage}/{k}", v, step)
                 self.writer.flush()
 
         # Online GeNVS Step

@@ -27,7 +27,7 @@ class MemoryStore:
     """Same interface and ON CONFLICT semantics as PgStore, in dicts; commit/rollback snapshot."""
 
     def __init__(self):
-        self.jobs, self.poses, self.snaps = {}, {}, {}
+        self.jobs, self.poses, self.snaps, self.health = {}, {}, {}, {}
         self._saved = None
         self.commit()
 
@@ -69,6 +69,13 @@ class MemoryStore:
         assert set(row) == set(P.TRAINING_COLUMNS)
         return self._insert(self.snaps, row)
 
+    def health_tail(self, job_id, before_seq, n):
+        return self._tail(self.health, job_id, before_seq, n)
+
+    def insert_health(self, row):
+        assert set(row) == set(P.HEALTH_COLUMNS)
+        return self._insert(self.health, row)
+
     def update_job(self, p):
         j = self.jobs[p["job_id"]]
         for k in ("current_step", "current_loss", "num_gaussians"):
@@ -84,11 +91,11 @@ class MemoryStore:
 
     def commit(self):
         import copy
-        self._saved = copy.deepcopy((self.jobs, self.poses, self.snaps))
+        self._saved = copy.deepcopy((self.jobs, self.poses, self.snaps, self.health))
 
     def rollback(self):
         import copy
-        self.jobs, self.poses, self.snaps = copy.deepcopy(self._saved)
+        self.jobs, self.poses, self.snaps, self.health = copy.deepcopy(self._saved)
 
     def close(self):
         pass
@@ -595,7 +602,7 @@ def test_out_of_order_events_are_counted_not_silently_lost():
     store = MemoryStore()
     proc = P.Processor(store)
     proc.process_batch([rec(pose(5)), rec(pose(3)), rec(pose(5)), rec(snap(7)), rec(snap(2))])
-    assert proc.skipped == {"pose": 2, "training": 1}                      # 3 is late, the second 5 a duplicate
+    assert proc.skipped == {"pose": 2, "training": 1, "health": 0}                      # 3 is late, the second 5 a duplicate
     assert ("job1", 3) not in store.poses
 
 
@@ -622,3 +629,68 @@ def test_consumer_lag_is_end_offset_minus_position_and_never_raises():
             raise RuntimeError("coordinator not available")
 
     assert P.consumer_lag(Broken()) is None            # unknown, not zero
+
+
+# ---- stream-health tap and PSNR in the processor ---------------------------------------------------
+
+def health(seq, read=None, dropped=0, accepted=None, unreg=0, job="job1"):
+    read = 30 * seq if read is None else read
+    accepted = 3 * seq if accepted is None else accepted
+    return c.StreamHealth(job, seq, 1000.0 + seq, frames_read=read, frames_dropped=dropped, keyframes_offered=read // 2,
+                          keyframes_accepted=accepted, keyframes=accepted, registered=accepted - unreg,
+                          unregistered=unreg, localize_ms=30.0, phase="tracking")
+
+
+def test_health_samples_are_stored_once_and_a_replay_changes_nothing():
+    store = MemoryStore()
+    batch = [rec(health(i)) for i in range(1, 8)]
+    P.Processor(store).process_batch(batch)
+    before = dict(store.health)
+    assert len(before) == 7 and all(not r["is_anomaly"] for r in before.values())
+    P.Processor(store).process_batch(batch)                 # crash between DB commit and offset commit
+    assert dict(store.health) == before
+
+
+def test_a_run_dropping_frames_at_the_source_is_flagged_once_not_every_second():
+    sender = FakeSender()
+    store = MemoryStore()
+    proc = P.Processor(store, sender)
+    out = proc.process_batch([rec(health(i, dropped=14 * i)) for i in range(1, 26)])      # ~32% dropped
+    sender.flush()
+    assert out and all(a.source == "health" and a.model == "head_rules" for a in out)
+    assert out[0].reason.startswith("frames_dropped=") and out[0].anomaly_id
+    assert len(out) < 10                                                                    # throttled, not 1 per sample
+    flagged = [r["seq"] for r in store.health.values() if r["is_anomaly"]]
+    assert flagged and store.health[("job1", flagged[0])]["alert"].startswith("frames_dropped=")
+    again = P.Processor(MemoryStore(), FakeSender()).process_batch([rec(health(i, dropped=14 * i)) for i in range(1, 26)])
+    assert [a.anomaly_id for a in again] == [a.anomaly_id for a in out]                     # replay-safe identity
+
+
+def test_a_healthy_source_raises_nothing():
+    out = P.Processor(MemoryStore(), FakeSender()).process_batch([rec(health(i, dropped=i)) for i in range(1, 26)])
+    assert out == []
+
+
+def snap_psnr(seq, psnr, loss=0.1, rounds=None, job="job1"):
+    return c.TrainingSnapshot(job, seq, 1000.0 + seq, seq * 10, loss, 1000, 2.0, psnr=psnr, difix_rounds=rounds)
+
+
+def test_psnr_drop_is_flagged_without_the_forest_and_stored_with_the_snapshot():
+    readings = [22.0] * 4 + [22.4] * 4 + [21.8] * 3 + [21.2] * 3 + [20.5] * 3
+    sender = FakeSender()
+    store = MemoryStore()
+    out = P.Processor(store, sender).process_batch([rec(snap_psnr(i, v, rounds=i // 5)) for i, v in enumerate(readings)])
+    assert out and out[-1].source == "training" and out[-1].reason.startswith("psnr_drop=-")
+    last = store.snaps[("job1", len(readings) - 1)]
+    assert last["psnr"] == 20.5 and last["difix_rounds"] == 3 and last["is_anomaly"]
+    assert not store.snaps[("job1", 3)]["is_anomaly"]
+    ok = P.Processor(MemoryStore(), FakeSender()).process_batch([rec(snap_psnr(i, 21.0 + 0.1 * (i // 3))) for i in range(15)])
+    assert ok == []
+
+
+def test_psnr_window_is_rebuilt_after_a_restart():
+    readings = [22.0] * 4 + [22.4] * 4 + [21.8] * 3 + [21.2] * 3
+    store = MemoryStore()
+    P.Processor(store).process_batch([rec(snap_psnr(i, v)) for i, v in enumerate(readings)])
+    out = P.Processor(store, FakeSender()).process_batch([rec(snap_psnr(len(readings) + i, 20.5)) for i in range(3)])
+    assert out and out[0].reason.startswith("psnr_drop=-")                # needed the pre-restart readings

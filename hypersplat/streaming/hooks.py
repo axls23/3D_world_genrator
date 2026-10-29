@@ -161,11 +161,65 @@ def publish_rows(kind: str, rows: List[Dict]) -> None:
         _warn_once("pose")
 
 
+HEALTH_EVERY_S = 1.0
+_HEALTH_FIELDS = ("frames_read", "frames_dropped", "keyframes_offered", "keyframes_accepted", "keyframes",
+                  "registered", "unregistered", "evicted", "reconnects", "localize_ms", "depth_rejected",
+                  "depth_backlog", "store_mb")
+
+
+def start_health(session, every: float = HEALTH_EVERY_S) -> threading.Thread:
+    """Sample session.stats() into one StreamHealth per ``every`` seconds until the session stops.
+
+    This is the head of the pipeline (source queue, gate, store, localisation) that the pose and training
+    taps cannot see: it runs from session start, before any pose or training step exists. A failing stats
+    call skips that sample; nothing here can raise into the session.
+    """
+    stop = getattr(session, "_stop", None) or threading.Event()
+
+    def run():
+        while not stop.is_set():
+            try:
+                stats = session.stats()
+                sender = _sender()
+                job = job_id()
+                data = {k: stats.get(k) for k in _HEALTH_FIELDS if stats.get(k) is not None}
+                try:
+                    phase = session.phase()[0]
+                except Exception:
+                    phase = ""
+                with _pub_lock:
+                    sender.send(c.validate(c.StreamHealth, dict(data, job_id=job, seq=sender.next_seq(job + "#health"),
+                                                                ts=time.time(), phase=phase)))
+            except c.InvalidEvent:
+                pass
+            except Exception:
+                _warn_once("health")
+            stop.wait(every)
+
+    t = threading.Thread(target=run, name="hypersplat-stream-health", daemon=True)
+    t.start()
+    return t
+
+
 def _patch_session(mod) -> None:
     cls = mod.StreamSession
     orig = cls._on_event
     if getattr(orig, _WRAPPED, False):
         return
+
+    orig_start = cls.start
+
+    @functools.wraps(orig_start)
+    def start(self, *args, **kwargs):
+        out = orig_start(self, *args, **kwargs)
+        try:
+            start_health(self)
+        except Exception:
+            _warn_once("health")
+        return out
+
+    setattr(start, _WRAPPED, True)
+    cls.start = start
 
     @functools.wraps(orig)
     def _on_event(self, kind, rows):
@@ -190,9 +244,19 @@ class _TrainTap(object):
         self.scalars = {}           # type: Dict[str, float]
         self.done_step = None       # type: Optional[int]
         self.rate_from = None       # (step, t) of the last emitted snapshot
+        self.sticky = {}            # type: Dict[str, float]  latest PSNR / Difix scalars, carried forward
+        self.sticky_at_step = {}    # type: Dict[str, float]  what was known when the pending step began
 
     def add(self, tag: str, value, step) -> None:
-        if tag not in c.TB_TAGS or step is None:
+        if step is None:
+            return
+        if tag in c.STICKY_TAGS:
+            # logged at its own step (an evaluation, a probe, a Difix round): remember it for the next
+            # snapshot rather than letting it start a snapshot of its own
+            with self.lock:
+                self.sticky[tag] = float(value)
+            return
+        if tag not in c.TB_TAGS:
             return
         step = int(step)
         with self.lock:
@@ -202,6 +266,7 @@ class _TrainTap(object):
                 self._emit()
             if self.step is None:
                 self.step, self.t = step, time.monotonic()
+                self.sticky_at_step = dict(self.sticky)
             self.scalars[tag] = float(value)
 
     def flush(self) -> None:
@@ -211,7 +276,7 @@ class _TrainTap(object):
     def _emit(self) -> None:
         if self.step is None:
             return
-        step, t, scalars = self.step, self.t, self.scalars
+        step, t, scalars = self.step, self.t, dict(self.scalars, **self.sticky_at_step)
         self.step, self.scalars, self.done_step = None, {}, step
         rate = None
         if self.rate_from is not None:
@@ -247,7 +312,7 @@ def _patch_tb(mod) -> None:
     def add_scalar(self, tag, scalar_value, global_step=None, *args, **kwargs):
         out = orig_add(self, tag, scalar_value, global_step, *args, **kwargs)
         try:
-            if tag in c.TB_TAGS:
+            if tag in c.TB_TAGS or tag in c.STICKY_TAGS:
                 _tap(self).add(tag, scalar_value, global_step)
         except Exception:
             _warn_once("training")
@@ -374,7 +439,7 @@ def uninstall() -> None:
     """Restore the original methods and forget all hook state (tests)."""
     global _sender_factory, _job, _focal
     session = sys.modules.get(SESSION_MODULE)
-    targets = [(getattr(session, "StreamSession", None), ("_on_event",))]
+    targets = [(getattr(session, "StreamSession", None), ("_on_event", "start"))]
     tb = sys.modules.get(TB_MODULE)
     targets.append((getattr(tb, "SummaryWriter", None), ("add_scalar", "flush", "close")))
     for cls, names in targets:

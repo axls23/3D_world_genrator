@@ -74,7 +74,9 @@ TOPIC_ANOMALIES = Topic(TOPIC_PREFIX + "hypersplat.flagged-problems", 1, 30 * _D
                         "one Anomaly per event the models flag")
 TOPIC_DEAD_LETTER = Topic(TOPIC_PREFIX + "hypersplat.dead-letter", 1, 30 * _DAY_MS,
                           "one DeadLetter per message the processor could not decode or store")
-TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES, TOPIC_DEAD_LETTER)
+TOPIC_HEALTH = Topic(TOPIC_PREFIX + "hypersplat.stream-health", 1, 7 * _DAY_MS,
+                     "one StreamHealth sample about every second: the head of the pipeline")
+TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES, TOPIC_DEAD_LETTER, TOPIC_HEALTH)
 DEAD_LETTER_RAW_CHARS = 256   # how much of the bad payload is kept: enough to diagnose, never the whole thing
 
 
@@ -153,6 +155,31 @@ class TrainingSnapshot:
     steps_per_s: Optional[float] = None  # streaming on/off throughput comparison
     dropped: int = 0
     injected: Optional[str] = None
+    psnr: Optional[float] = None         # latest held-out (val/psnr) else convergence-probe PSNR, carried forward
+    difix_rounds: Optional[int] = None   # online Difix rounds completed so far, carried forward
+
+
+@dataclass(frozen=True)
+class StreamHealth:
+    """The head of the pipeline (source, gate, store, localisation), sampled from StreamSession.stats().
+    Cumulative counters, so a dropped sample loses nothing: the next one carries the totals."""
+    job_id: str
+    seq: int
+    ts: float
+    frames_read: int = 0
+    frames_dropped: int = 0          # source queue overflow
+    keyframes_offered: int = 0
+    keyframes_accepted: int = 0
+    keyframes: int = 0               # in the store now
+    registered: int = 0
+    unregistered: int = 0
+    evicted: int = 0
+    reconnects: int = 0
+    localize_ms: Optional[float] = None
+    depth_rejected: Optional[int] = None
+    depth_backlog: Optional[int] = None
+    store_mb: Optional[float] = None
+    phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,11 +212,12 @@ def anomaly_id(job_id: str, source: str, source_seq: int, model: str) -> str:
     return hashlib.sha1(("%s|%s|%d|%s" % (job_id, source, source_seq, model)).encode()).hexdigest()[:16]
 
 
-Event = Union[CameraPose, TrainingSnapshot, Anomaly, DeadLetter]
-KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly", DeadLetter: "dead_letter"}
+Event = Union[CameraPose, TrainingSnapshot, Anomaly, DeadLetter, StreamHealth]
+KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly", DeadLetter: "dead_letter",
+           StreamHealth: "stream_health"}
 CLASS_OF = {v: k for k, v in KIND_OF.items()}
 TOPIC_OF = {CameraPose: TOPIC_POSES, TrainingSnapshot: TOPIC_TRAINING, Anomaly: TOPIC_ANOMALIES,
-            DeadLetter: TOPIC_DEAD_LETTER}
+            DeadLetter: TOPIC_DEAD_LETTER, StreamHealth: TOPIC_HEALTH}
 
 # Fields that must be present and finite; anything else optional (row 4).
 _REQUIRED_FINITE = {
@@ -197,8 +225,12 @@ _REQUIRED_FINITE = {
     TrainingSnapshot: ("ts", "loss", "gpu_mem_gb"),
     Anomaly: ("ts", "score"),
     DeadLetter: ("ts",),
+    StreamHealth: ("ts",),
 }
-_INT_FIELDS = {"seq", "step", "num_gaussians", "dropped", "source_seq"}
+_INT_FIELDS = {"seq", "step", "num_gaussians", "dropped", "source_seq", "frames_read", "frames_dropped",
+               "keyframes_offered", "keyframes_accepted", "keyframes", "registered", "unregistered", "evicted",
+               "reconnects"}
+_OPTIONAL_INT_FIELDS = {"difix_rounds", "depth_rejected", "depth_backlog"}   # None = not measured
 
 
 class InvalidEvent(ValueError):
@@ -227,12 +259,12 @@ def validate(cls, data: Dict) -> Event:
     for name in _REQUIRED_FINITE[cls]:
         if not _finite(kw.get(name)):
             raise InvalidEvent("%s: %s=%r" % (KIND_OF[cls], name, kw.get(name)))
-    for name in names & _INT_FIELDS:
-        if name in kw:
+    for name in names & (_INT_FIELDS | _OPTIONAL_INT_FIELDS):
+        if name in kw and not (kw[name] is None and name in _OPTIONAL_INT_FIELDS):
             if not _finite(kw[name]) or int(kw[name]) != kw[name] or kw[name] < 0:
                 raise InvalidEvent("%s: %s=%r" % (KIND_OF[cls], name, kw[name]))
             kw[name] = int(kw[name])
-    for name in ("l1", "ssim", "grad_norm", "steps_per_s"):
+    for name in ("l1", "ssim", "grad_norm", "steps_per_s", "psnr", "localize_ms", "store_mb"):
         if kw.get(name) is not None and not _finite(kw[name]):
             kw[name] = None  # optional measurement went bad: keep the event, drop the value
     if not kw.get("job_id"):
@@ -359,11 +391,25 @@ TB_TAGS = {
     "train/ssimloss": "ssim",
     "train/grad_norm": "grad_norm",
 }
+# Scalars the trainer logs at their own steps (an evaluation, a convergence probe, a Difix round), not on the
+# train/* cadence. The hook keeps the latest value and carries it on the next snapshot instead of making a
+# snapshot of their own. Held-out PSNR wins over the cheaper probe PSNR.
+STICKY_TAGS = {
+    "stream/probe_psnr": "probe_psnr",
+    "val/psnr": "eval_psnr",
+    "stream/difix_rounds": "difix_rounds",
+}
 
 
 def snapshot_from_scalars(step: int, scalars: Dict[str, float], job_id: str, seq: int,
                           ts: Optional[float] = None, **extra) -> TrainingSnapshot:
     data = {TB_TAGS[k]: v for k, v in scalars.items() if k in TB_TAGS}
+    sticky = {STICKY_TAGS[k]: v for k, v in scalars.items() if k in STICKY_TAGS}
+    psnr = sticky.get("eval_psnr", sticky.get("probe_psnr"))
+    if psnr is not None:
+        data["psnr"] = psnr
+    if sticky.get("difix_rounds") is not None:
+        data["difix_rounds"] = sticky["difix_rounds"]
     data.update(job_id=job_id, seq=seq, step=step, ts=time.time() if ts is None else ts, **extra)
     return validate(TrainingSnapshot, data)
 
@@ -489,6 +535,51 @@ def rising_loss(window: Sequence[TrainingSnapshot]) -> Tuple[bool, float]:
     return (tau >= RISING_TAU and rise >= RISING_MIN_RISE), rise
 
 
+# Falling PSNR: held-out quality is measured rarely (an evaluation, a convergence probe) and carried forward
+# on every snapshot until the next reading, so the rule works on distinct readings, not on snapshots.
+PSNR_READINGS = 3          # distinct readings needed before judging
+PSNR_DROP_DB = 0.5         # the latest reading is this far below the best earlier one in the window...
+# ...and the last two readings are still falling (a recovery is not an alert)
+
+
+def falling_psnr(window: Sequence[TrainingSnapshot]) -> Tuple[bool, float]:
+    """(flag, dB below the best reading in the window) when held-out PSNR is sliding."""
+    readings: List[float] = []
+    for s in window:
+        if s.psnr is not None and (not readings or s.psnr != readings[-1]):
+            readings.append(s.psnr)
+    if len(readings) < PSNR_READINGS:
+        return False, 0.0
+    drop = max(readings[:-1]) - readings[-1]
+    return (drop >= PSNR_DROP_DB and readings[-1] < readings[-2]), max(0.0, drop)
+
+
+# The head of the pipeline: judged on the last HEAD_WINDOW health samples (cumulative counters, so the
+# change across the window is what counts).
+HEAD_WINDOW = 10
+HEAD_MIN_SAMPLES = 5
+HEAD_DROP_RATE = 0.20      # more than this share of frames read were dropped at the source queue
+HEAD_UNREG_RATE = 0.50     # more than this share of the keyframes in the window failed to localise
+
+
+def head_alerts(samples: Sequence[StreamHealth]) -> List[str]:
+    """Reasons the head of the pipeline looks unhealthy over the recent samples ([] when fine or unjudgeable)."""
+    w = list(samples)[-HEAD_WINDOW:]
+    if len(w) < HEAD_MIN_SAMPLES:
+        return []
+    first, last = w[0], w[-1]
+    out = []
+    read = last.frames_read - first.frames_read
+    dropped = last.frames_dropped - first.frames_dropped
+    if read > 0 and dropped / (read + dropped) > HEAD_DROP_RATE:
+        out.append("frames_dropped=%.0f%% of frames in the last %d samples" % (100 * dropped / (read + dropped), len(w)))
+    new_kf = last.keyframes_accepted - first.keyframes_accepted
+    failed = last.unregistered - first.unregistered
+    if new_kf > 0 and failed / new_kf > HEAD_UNREG_RATE:
+        out.append("unregistered=%d of %d new keyframes could not be localised" % (failed, new_kf))
+    return out
+
+
 # Live KPIs (row 9), the column names the processor writes and the dashboard reads.
 POSE_METRICS = ("step_dist", "turn_deg", "conf_roll")
 TRAINING_METRICS = ("loss_roll", "loss_trend", "gs_growth", "best_loss", "peak_mem_gb")
@@ -568,11 +659,33 @@ CREATE TABLE IF NOT EXISTS training_history (
     gs_growth     DOUBLE PRECISION,
     best_loss     DOUBLE PRECISION,
     peak_mem_gb   DOUBLE PRECISION,
+    psnr          DOUBLE PRECISION,
+    difix_rounds  INTEGER,
     anomaly_score DOUBLE PRECISION,
     is_anomaly    BOOLEAN NOT NULL DEFAULT false,
     injected      TEXT,
     PRIMARY KEY (job_id, seq)
 );
+-- databases created before PSNR and Difix rounds were streamed
+ALTER TABLE training_history ADD COLUMN IF NOT EXISTS psnr DOUBLE PRECISION;
+ALTER TABLE training_history ADD COLUMN IF NOT EXISTS difix_rounds INTEGER;
+
+CREATE TABLE IF NOT EXISTS stream_health (          -- the head of the pipeline, about one row per second
+    job_id            TEXT NOT NULL REFERENCES jobs(job_id),
+    seq               INTEGER NOT NULL,
+    ts                TIMESTAMPTZ NOT NULL,
+    frames_read       INTEGER, frames_dropped INTEGER,
+    keyframes_offered INTEGER, keyframes_accepted INTEGER, keyframes INTEGER,
+    registered        INTEGER, unregistered INTEGER, evicted INTEGER, reconnects INTEGER,
+    localize_ms       DOUBLE PRECISION,
+    depth_rejected    INTEGER, depth_backlog INTEGER,
+    store_mb          DOUBLE PRECISION,
+    phase             TEXT,
+    is_anomaly        BOOLEAN NOT NULL DEFAULT false,
+    alert             TEXT,
+    PRIMARY KEY (job_id, seq)
+);
+CREATE INDEX IF NOT EXISTS stream_health_job_ts ON stream_health (job_id, ts DESC);
 
 -- Growth plan (row 15): the dashboard only reads the newest DASHBOARD_ROWS of one job, which
 -- these indexes serve without scanning old jobs; old jobs are archived=true, not deleted.

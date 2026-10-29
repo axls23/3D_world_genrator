@@ -153,3 +153,49 @@ def test_rising_loss_needs_enough_history_and_is_scale_free():
     assert c.rising_loss(_snaps([0.1, 0.2, 0.3]))[0] is False
     base = [0.5, 0.5, 0.52, 0.56, 0.6, 0.66, 0.72, 0.8, 0.9, 1.0]
     assert c.rising_loss(_snaps(base))[0] is c.rising_loss(_snaps([v * 1000 for v in base]))[0] is True
+
+
+# ---- stream-health tap and PSNR (head-of-pipeline visibility, held-out quality) -------------------
+
+def _health(seq, read, dropped, accepted=10, unreg=0, reg=10, **kw):
+    return c.StreamHealth("j", seq, float(seq), frames_read=read, frames_dropped=dropped, keyframes_offered=read // 2,
+                          keyframes_accepted=accepted, keyframes=accepted, registered=reg, unregistered=unreg, **kw)
+
+
+def test_stream_health_is_a_topic_event_and_round_trips():
+    h = _health(1, 100, 3, localize_ms=35.5, depth_rejected=2, evicted=1, phase="tracking")
+    topic, key, value = c.encode(h)
+    assert topic == c.TOPIC_HEALTH.name and key == b"j" and c.TOPIC_HEALTH in c.TOPICS
+    assert c.decode(value) == h and len(value) < c.MAX_MESSAGE_BYTES
+
+
+def test_head_alerts_flag_a_run_that_loses_frames_at_the_source():
+    ok = [_health(i, 30 * i, i) for i in range(1, 12)]                       # 3% dropped
+    assert c.head_alerts(ok) == []
+    bad = [_health(i, 30 * i, 12 * i) for i in range(1, 12)]                  # 40% dropped
+    assert any(a.startswith("frames_dropped") for a in c.head_alerts(bad))
+    lost = [_health(i, 30 * i, 0, accepted=3 * i, unreg=2 * i, reg=i) for i in range(1, 12)]
+    assert any(a.startswith("unregistered") for a in c.head_alerts(lost))      # most keyframes not localised
+    assert c.head_alerts(ok[:2]) == []                                         # not enough history to judge
+
+
+def test_training_snapshot_carries_psnr_and_difix_rounds():
+    s = c.snapshot_from_scalars(10, {"train/loss": 0.1, "train/num_GS": 5, "train/mem": 1.0,
+                                     "stream/probe_psnr": 21.5, "val/psnr": 22.0, "stream/difix_rounds": 3}, "j", 0)
+    assert s.psnr == 22.0 and s.difix_rounds == 3                              # held-out beats the probe
+    assert c.snapshot_from_scalars(10, {"train/loss": 0.1, "train/num_GS": 5, "train/mem": 1.0,
+                                        "stream/probe_psnr": 21.5}, "j", 0).psnr == 21.5
+
+
+def _psnr(vals):
+    return [c.TrainingSnapshot("j", i, float(i), i * 10, 0.1, 100, 1.0, psnr=v) for i, v in enumerate(vals)]
+
+
+def test_falling_psnr_flags_a_sustained_drop_and_ignores_repeats_noise_and_gaps():
+    drop = _psnr([22.0, 22.0, 22.4, 22.4, 22.4, 21.9, 21.9, 21.2, 21.2, 20.6])        # sticky repeats, then falling
+    flagged, db = c.falling_psnr(drop)
+    assert flagged and db >= c.PSNR_DROP_DB
+    assert not c.falling_psnr(_psnr([21.0, 21.4, 21.9, 22.3, 22.6]))[0]               # improving
+    assert not c.falling_psnr(_psnr([22.0, 22.1, 21.9, 22.0, 22.1, 21.95]))[0]        # noise within 0.5 dB
+    assert not c.falling_psnr(_psnr([22.0, 20.0]))[0]                                  # too few readings
+    assert not c.falling_psnr(_psnr([None, None, None, None, None]))[0]                # no psnr at all

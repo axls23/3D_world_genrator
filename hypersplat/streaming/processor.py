@@ -37,6 +37,7 @@ from . import contract as c
 logger = logging.getLogger(__name__)
 
 POLL_MS = 500          # poll timeout; also the worst-case reaction time to SIGINT/SIGTERM
+HEALTH_REALERT = 30   # while the head stays unhealthy, repeat the anomaly every this many samples
 MAX_RECORDS = 500      # one DB transaction per poll batch of at most this many events
 LOG_EVERY_S = 10.0     # throughput log line period
 # --once with no partitions assigned yet: give up after this. Longer than the broker's 45 s
@@ -177,10 +178,14 @@ class RestoredPose(c.CameraPose):
 class JobState:
     poses: deque = field(default_factory=lambda: deque(maxlen=c.WINDOW))   # scored sources only
     snaps: deque = field(default_factory=lambda: deque(maxlen=c.WINDOW))
+    health: deque = field(default_factory=lambda: deque(maxlen=c.HEAD_WINDOW))
     poses_loaded: bool = False
     snaps_loaded: bool = False
+    health_loaded: bool = False
     last_pose_seq: int = -1
     last_snap_seq: int = -1
+    last_health_seq: int = -1
+    health_alerting: bool = False   # the previous sample was already in alert (one anomaly per episode)
     best_loss: Optional[float] = None
     peak_mem_gb: Optional[float] = None
     dropped_base: int = 0       # jobs.events_dropped found at restart
@@ -229,6 +234,7 @@ def training_row(window: Sequence[c.TrainingSnapshot], best_loss: float, peak_me
                num_gaussians=s.num_gaussians, gpu_mem_gb=s.gpu_mem_gb, steps_per_s=s.steps_per_s,
                loss_roll=_mean([w.loss for w in window]), loss_trend=feats["loss_trend"],
                gs_growth=feats["gs_growth"], best_loss=best_loss, peak_mem_gb=peak_mem_gb,
+               psnr=s.psnr, difix_rounds=s.difix_rounds,
                anomaly_score=None, is_anomaly=False, injected=s.injected)
     reason = None
     if model is not None and len(window) >= c.MIN_WINDOW_TO_SCORE:
@@ -237,6 +243,10 @@ def training_row(window: Sequence[c.TrainingSnapshot], best_loss: float, peak_me
     if rising and not row["is_anomaly"]:
         row["is_anomaly"], reason = True, "loss_rising=%+.0f%%" % (100 * rise)
         row["anomaly_score"] = min(row["anomaly_score"] or 0.0, -rise)
+    falling, drop = c.falling_psnr(window)    # held-out quality sliding: loss can look fine while PSNR drops
+    if falling and not row["is_anomaly"]:
+        row["is_anomaly"], reason = True, "psnr_drop=-%.1fdB" % drop
+        row["anomaly_score"] = min(row["anomaly_score"] or 0.0, -drop)
     return row, reason if row["is_anomaly"] else None
 
 
@@ -267,7 +277,10 @@ POSE_COLUMNS = ("job_id", "seq", "ts", "frame", "cx", "cy", "cz", "focal", "conf
                 "step_dist", "turn_deg", "conf_roll", "anomaly_score", "is_anomaly", "injected")
 TRAINING_COLUMNS = ("job_id", "seq", "ts", "step", "loss", "num_gaussians", "gpu_mem_gb",
                     "steps_per_s", "loss_roll", "loss_trend", "gs_growth", "best_loss",
-                    "peak_mem_gb", "anomaly_score", "is_anomaly", "injected")
+                    "peak_mem_gb", "psnr", "difix_rounds", "anomaly_score", "is_anomaly", "injected")
+HEALTH_COLUMNS = ("job_id", "seq", "ts", "frames_read", "frames_dropped", "keyframes_offered",
+                  "keyframes_accepted", "keyframes", "registered", "unregistered", "evicted", "reconnects",
+                  "localize_ms", "depth_rejected", "depth_backlog", "store_mb", "phase", "is_anomaly", "alert")
 
 
 def _insert_sql(table: str, cols: Sequence[str]) -> str:
@@ -278,6 +291,7 @@ def _insert_sql(table: str, cols: Sequence[str]) -> str:
 
 _INSERT_POSE = _insert_sql("pose_history", POSE_COLUMNS)
 _INSERT_TRAINING = _insert_sql("training_history", TRAINING_COLUMNS)
+_INSERT_HEALTH = _insert_sql("stream_health", HEALTH_COLUMNS)
 
 # LEAST/GREATEST skip NULLs in PostgreSQL, so the first value simply lands.
 _UPDATE_JOB = """
@@ -331,10 +345,23 @@ class PgStore:
     def training_tail(self, job_id: str, before_seq: int, n: int) -> List[Dict]:
         cur = self.conn.execute(
             "SELECT seq, extract(epoch FROM ts)::float8, step, loss, num_gaussians, gpu_mem_gb, "
-            "steps_per_s, injected FROM training_history WHERE job_id = %s AND seq < %s "
+            "steps_per_s, psnr, difix_rounds, injected FROM training_history WHERE job_id = %s AND seq < %s "
             "ORDER BY seq DESC LIMIT %s", (job_id, before_seq, n))
-        keys = ("seq", "ts", "step", "loss", "num_gaussians", "gpu_mem_gb", "steps_per_s", "injected")
+        keys = ("seq", "ts", "step", "loss", "num_gaussians", "gpu_mem_gb", "steps_per_s", "psnr",
+                "difix_rounds", "injected")
         return [dict(zip(keys, r)) for r in reversed(cur.fetchall())]
+
+    def health_tail(self, job_id: str, before_seq: int, n: int) -> List[Dict]:
+        cur = self.conn.execute(
+            "SELECT seq, extract(epoch FROM ts)::float8, frames_read, frames_dropped, keyframes_offered, "
+            "keyframes_accepted, keyframes, registered, unregistered, evicted, reconnects "
+            "FROM stream_health WHERE job_id = %s AND seq < %s ORDER BY seq DESC LIMIT %s", (job_id, before_seq, n))
+        keys = ("seq", "ts", "frames_read", "frames_dropped", "keyframes_offered", "keyframes_accepted",
+                "keyframes", "registered", "unregistered", "evicted", "reconnects")
+        return [dict(zip(keys, r)) for r in reversed(cur.fetchall())]
+
+    def insert_health(self, row: Dict) -> bool:
+        return self.conn.execute(_INSERT_HEALTH, row).rowcount == 1
 
     def insert_pose(self, row: Dict) -> bool:
         return self.conn.execute(_INSERT_POSE, row).rowcount == 1
@@ -401,7 +428,7 @@ class Processor:
         self.inserted = 0
         self.anomalies = 0
         self.drops = 0
-        self.skipped = {"pose": 0, "training": 0}   # seq at or below the last handled: duplicate or late
+        self.skipped = {"pose": 0, "training": 0, "health": 0}   # seq at or below the last handled: duplicate or late
 
     # -- state ---------------------------------------------------------------------------------
     def _job(self, job_id: str) -> JobState:
@@ -431,8 +458,16 @@ class Processor:
             st.snaps.append(c.TrainingSnapshot(
                 job_id=job_id, seq=r["seq"], ts=r["ts"], step=r["step"], loss=r["loss"],
                 num_gaussians=r["num_gaussians"] or 0, gpu_mem_gb=r["gpu_mem_gb"] or 0.0,
-                steps_per_s=r["steps_per_s"], injected=r["injected"]))
+                steps_per_s=r["steps_per_s"], psnr=r.get("psnr"), difix_rounds=r.get("difix_rounds"),
+                injected=r["injected"]))
         st.snaps_loaded = True
+
+    def _preload_health(self, st: JobState, job_id: str, before_seq: int) -> None:
+        for r in self.store.health_tail(job_id, before_seq, c.HEAD_WINDOW):
+            st.health.append(c.StreamHealth(job_id=job_id, seq=r["seq"], ts=r["ts"], **{
+                k: r[k] for k in ("frames_read", "frames_dropped", "keyframes_offered", "keyframes_accepted",
+                                  "keyframes", "registered", "unregistered", "evicted", "reconnects")}))
+        st.health_loaded = True
 
     # -- events --------------------------------------------------------------------------------
     def _skip(self, kind: str, job_id: str, seq: int, last: int) -> None:
@@ -466,12 +501,13 @@ class Processor:
             self._job(job_id).decode_drops += 1
             touched.setdefault(job_id, JobUpdate())
 
-    def _anomaly(self, ev, kind: str, model: AnomalyModel, row: Dict, reason: str) -> c.Anomaly:
+    def _anomaly(self, ev, kind: str, model: AnomalyModel, row: Dict, reason: str,
+                 name: Optional[str] = None) -> c.Anomaly:
         # ts is the flagged event's own time, so a replayed tail re-sends identical messages.
-        name = model.name if model is not None else "loss_rising"
+        name = name or (model.name if model is not None else "loss_rising")
         return c.Anomaly(job_id=ev.job_id, ts=ev.ts, source=kind, source_seq=ev.seq,
                          anomaly_id=c.anomaly_id(ev.job_id, kind, ev.seq, name), model=name,
-                         score=row["anomaly_score"], reason=reason, injected=ev.injected)
+                         score=row["anomaly_score"], reason=reason, injected=getattr(ev, "injected", None))
 
     def _pose(self, st: JobState, p: c.CameraPose, upd: JobUpdate, out: List[c.Anomaly]) -> None:
         if p.seq <= st.last_pose_seq:  # already handled (and committed) by this process
@@ -519,12 +555,39 @@ class Processor:
         if reason is not None:
             out.append(self._anomaly(s, "training", self.training_model, row, reason))
 
+    def _health(self, st: JobState, h: c.StreamHealth, upd: JobUpdate, out: List[c.Anomaly]) -> None:
+        """One head-of-pipeline sample: stored, judged by c.head_alerts over the recent samples, and one
+        anomaly per episode (not one per second) while the head stays unhealthy."""
+        if h.seq <= st.last_health_seq:
+            self._skip("health", h.job_id, h.seq, st.last_health_seq)
+            return
+        if not st.health_loaded:
+            self._preload_health(st, h.job_id, h.seq)
+        st.last_health_seq = h.seq
+        st.health.append(h)
+        alerts = c.head_alerts(list(st.health))
+        row = dict(job_id=h.job_id, seq=h.seq, ts=h.ts, frames_read=h.frames_read, frames_dropped=h.frames_dropped,
+                   keyframes_offered=h.keyframes_offered, keyframes_accepted=h.keyframes_accepted,
+                   keyframes=h.keyframes, registered=h.registered, unregistered=h.unregistered, evicted=h.evicted,
+                   reconnects=h.reconnects, localize_ms=h.localize_ms, depth_rejected=h.depth_rejected,
+                   depth_backlog=h.depth_backlog, store_mb=h.store_mb, phase=h.phase, is_anomaly=bool(alerts),
+                   alert=alerts[0] if alerts else None)
+        inserted = self.store.insert_health(row)
+        if inserted:
+            self.inserted += 1
+        new_episode = bool(alerts) and (not st.health_alerting or h.seq % HEALTH_REALERT == 0)
+        st.health_alerting = bool(alerts)
+        if new_episode:
+            if inserted:
+                upd.anomalies += 1
+            out.append(self._anomaly(h, "health", None, {"anomaly_score": -1.0}, alerts[0], name="head_rules"))
+
     def handle(self, topic: str, key, value: bytes, touched: Dict[str, JobUpdate],
                out: List[c.Anomaly]) -> None:
         self.events += 1
         try:
             ev = c.decode(value)
-            if not isinstance(ev, (c.CameraPose, c.TrainingSnapshot)):
+            if not isinstance(ev, (c.CameraPose, c.TrainingSnapshot, c.StreamHealth)):
                 raise c.InvalidEvent("%s event on %s" % (c.KIND_OF[type(ev)], topic))
             _check_db_range(ev)
         except c.InvalidEvent as e:
@@ -532,8 +595,11 @@ class Processor:
             self._drop(key, e, touched)
             return
         st = self._job(ev.job_id)
-        st.producer_dropped = max(st.producer_dropped, ev.dropped)
         upd = touched.setdefault(ev.job_id, JobUpdate())
+        if isinstance(ev, c.StreamHealth):
+            self._health(st, ev, upd, out)
+            return
+        st.producer_dropped = max(st.producer_dropped, ev.dropped)
         if isinstance(ev, c.CameraPose):
             self._pose(st, ev, upd, out)
         else:
@@ -586,7 +652,7 @@ def _kafka_consumer(on_rebalance):
             on_rebalance()
 
     consumer = KafkaConsumer(bootstrap_servers=c.KAFKA_BOOTSTRAP, **c.CONSUMER_CONFIG)
-    consumer.subscribe([c.TOPIC_POSES.name, c.TOPIC_TRAINING.name], listener=_Listener())
+    consumer.subscribe([c.TOPIC_POSES.name, c.TOPIC_TRAINING.name, c.TOPIC_HEALTH.name], listener=_Listener())
     return consumer
 
 

@@ -333,3 +333,60 @@ def test_two_threads_publishing_poses_never_invert_sequence_order(fake):
     seqs = [e.seq for e in fake.events()]
     assert len(seqs) == 1200
     assert seqs == sorted(seqs) and seqs == list(range(1200))
+
+
+def test_psnr_and_difix_rounds_ride_the_next_snapshot_not_a_snapshot_of_their_own(fake):
+    from torch.utils.tensorboard.writer import SummaryWriter
+    import tempfile
+
+    w = SummaryWriter(tempfile.mkdtemp())
+    for step in (10, 20, 30):
+        if step == 20:
+            w.add_scalar("val/psnr", 22.5, 15)           # logged at its own step, between two train steps
+            w.add_scalar("stream/difix_rounds", 2, 16)
+        w.add_scalar("train/loss", 0.1, step)
+        w.add_scalar("train/num_GS", 100, step)
+        w.add_scalar("train/mem", 1.0, step)
+        w.flush()
+    w.close()
+    fake.flush(5.0)
+    snaps = [e for e in fake.events() if isinstance(e, c.TrainingSnapshot)]
+    assert [s.step for s in snaps] == [10, 20, 30]       # no snapshot made of the PSNR step alone
+    assert [s.psnr for s in snaps] == [None, 22.5, 22.5]  # step 10 predates the reading; it is carried forward
+    assert [s.difix_rounds for s in snaps] == [None, 2, 2]
+
+
+def test_health_sampler_publishes_session_stats_and_survives_a_failing_stats_call(fake):
+    calls = {"n": 0}
+
+    class Session:
+        _stop = threading.Event()
+
+        def stats(self):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("stats not ready")
+            return dict(frames_read=10 * calls["n"], frames_dropped=calls["n"], keyframes_offered=5, keyframes_accepted=4,
+                        keyframes=4, registered=3, unregistered=1, evicted=0, reconnects=0, localize_ms=35.5,
+                        depth_rejected=None, depth_backlog=2, store_mb=1.5)
+
+        def phase(self):
+            return "tracking", "x"
+
+    s = Session()
+    t = hooks.start_health(s, every=0.05)
+    time.sleep(0.4)
+    s._stop.set()
+    t.join(2.0)
+    fake.flush(5.0)
+    got = [e for e in fake.events() if isinstance(e, c.StreamHealth)]
+    assert len(got) >= 3 and [h.seq for h in got] == list(range(len(got)))
+    assert got[0].frames_read == 10 and got[0].localize_ms == 35.5 and got[0].phase == "tracking"
+    assert got[0].depth_rejected is None and got[0].depth_backlog == 2
+    assert not t.is_alive()
+
+
+def test_start_wraps_the_session_so_health_starts_with_it(fake):
+    from hypersplat.stream.session import StreamSession
+
+    assert getattr(StreamSession.start, hooks._WRAPPED, False)
