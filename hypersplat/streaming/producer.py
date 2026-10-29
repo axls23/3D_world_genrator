@@ -66,6 +66,14 @@ class Sender:
         with self._lock:
             return self._dropped[job_id]
 
+    def stats(self, job_id: Optional[str] = None) -> dict:
+        """What this sender is losing, for logs and dashboards: events sent, dropped (one job, or all),
+        how full the queue is, and whether the broker connection is up."""
+        with self._lock:
+            dropped = self._dropped[job_id] if job_id is not None else sum(self._dropped.values())
+        return {"sent": self.sent, "dropped": dropped, "queue_depth": self._q.qsize(),
+                "queue_max": self._q.maxsize, "broker_up": self._producer is not None}
+
     def send(self, event: c.Event) -> bool:
         """Queue one event; False if it was dropped. Never blocks, never raises."""
         if self._closed.is_set():

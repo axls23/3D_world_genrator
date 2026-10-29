@@ -538,3 +538,87 @@ def test_rising_loss_is_flagged_without_the_forest_and_not_on_a_bump():
     store2 = MemoryStore()
     out2 = P.Processor(store2, FakeSender()).process_batch([rec(snap(i, loss=v, job="job2")) for i, v in enumerate(bump)])
     assert out2 == []
+
+
+# ---- second-order engineering: identity, dead letters, loss visibility, silent skips -------------
+
+def test_anomaly_id_is_stable_across_replays_and_unique_per_flagged_event(model_dir):
+    fit_pose_model(model_dir)
+    model = P.load_model(c.POSE_MODEL, c.POSE_FEATURES)
+    batch = [rec(pose(i)) for i in range(15)] + [rec(bad(15, x=80.0)), rec(bad(16, x=160.0))]
+    first = P.Processor(MemoryStore(), pose_model=model).process_batch(batch)
+    again = P.Processor(MemoryStore(), pose_model=model).process_batch(batch)   # replay after a crash
+    assert first and [a.anomaly_id for a in first] == [a.anomaly_id for a in again]
+    assert all(a.anomaly_id for a in first) and len({a.anomaly_id for a in first}) == len(first)
+    wire = c.decode(c.encode(first[0])[2])
+    assert wire.anomaly_id == first[0].anomaly_id                          # consumers can dedupe on it
+    assert c.anomaly_id("j", "pose", 1, "m") != c.anomaly_id("j", "training", 1, "m")
+
+
+def test_undecodable_messages_go_to_a_dead_letter_topic_with_their_reason():
+    sender = FakeSender()
+    proc = P.Processor(MemoryStore(), sender)
+    proc.process_batch([(c.TOPIC_POSES.name, b"job1", b"{not json"), rec(pose(0)),
+                        (c.TOPIC_TRAINING.name, b"job1", b"x" * 2000)])
+    sender.flush()
+    dead = [e for e in sender.events() if isinstance(e, c.DeadLetter)]
+    assert [d.source_topic for d in dead] == [c.TOPIC_POSES.name, c.TOPIC_TRAINING.name]
+    assert all(d.job_id == "job1" and d.reason for d in dead)
+    assert len(dead[1].raw) <= c.DEAD_LETTER_RAW_CHARS                      # bounded, never the whole payload
+    assert c.TOPIC_DEAD_LETTER in c.TOPICS and proc.drops == 2
+
+
+def test_a_dead_letter_that_cannot_be_sent_never_stops_the_batch():
+    class Broken(FakeSender):
+        def send(self, event):
+            if isinstance(event, c.DeadLetter):
+                raise RuntimeError("broker down")
+            return super().send(event)
+
+    store = MemoryStore()
+    P.Processor(store, Broken()).process_batch([(c.TOPIC_POSES.name, b"job1", b"junk"), rec(pose(0))])
+    assert ("job1", 0) in store.poses
+
+
+def test_sender_reports_what_it_is_losing():
+    s = FakeSender(queue_max=2)
+    s._closed.set()                      # stop the sender thread so the queue fills
+    s._thread.join(timeout=1)
+    s._closed.clear()
+    sent = [s.send(pose(i)) for i in range(5)]
+    stats = s.stats("job1")
+    assert stats["dropped"] == sent.count(False) > 0 and stats["queue_depth"] <= 2
+    assert set(stats) >= {"sent", "dropped", "queue_depth", "queue_max", "broker_up"}
+
+
+def test_out_of_order_events_are_counted_not_silently_lost():
+    store = MemoryStore()
+    proc = P.Processor(store)
+    proc.process_batch([rec(pose(5)), rec(pose(3)), rec(pose(5)), rec(snap(7)), rec(snap(2))])
+    assert proc.skipped == {"pose": 2, "training": 1}                      # 3 is late, the second 5 a duplicate
+    assert ("job1", 3) not in store.poses
+
+
+def test_consumer_lag_is_end_offset_minus_position_and_never_raises():
+    class TP(str):
+        pass
+
+    a, b = TP("a"), TP("b")
+
+    class Consumer:
+        def assignment(self):
+            return {a, b}
+
+        def end_offsets(self, tps):
+            return {a: 100, b: 40}
+
+        def position(self, tp):
+            return {a: 90, b: 40}[tp]
+
+    assert P.consumer_lag(Consumer()) == 10
+
+    class Broken(Consumer):
+        def end_offsets(self, tps):
+            raise RuntimeError("coordinator not available")
+
+    assert P.consumer_lag(Broken()) is None            # unknown, not zero

@@ -17,6 +17,7 @@ Stdlib only and py3.8-compatible: the ACE env imports this file next to stream/s
 Every setting can be overridden with the HYPERSPLAT_<NAME> environment variable named beside it.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -71,7 +72,10 @@ TOPIC_TRAINING = Topic(TOPIC_PREFIX + "hypersplat.training-measurements", 1, 7 *
                        "one TrainingSnapshot every TRAIN_LOG_EVERY steps")
 TOPIC_ANOMALIES = Topic(TOPIC_PREFIX + "hypersplat.flagged-problems", 1, 30 * _DAY_MS,
                         "one Anomaly per event the models flag")
-TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES)
+TOPIC_DEAD_LETTER = Topic(TOPIC_PREFIX + "hypersplat.dead-letter", 1, 30 * _DAY_MS,
+                          "one DeadLetter per message the processor could not decode or store")
+TOPICS = (TOPIC_POSES, TOPIC_TRAINING, TOPIC_ANOMALIES, TOPIC_DEAD_LETTER)
+DEAD_LETTER_RAW_CHARS = 256   # how much of the bad payload is kept: enough to diagnose, never the whole thing
 
 
 # ---------------------------------------------------------------------------------------------
@@ -162,18 +166,37 @@ class Anomaly:
     score: float                 # sklearn decision_function: lower = more anomalous
     reason: str                  # top feature, e.g. "turn_deg=74.2"
     injected: Optional[str] = None
+    anomaly_id: str = ""         # stable per flagged event (anomaly_id()): consumers dedupe replays on it
 
 
-Event = Union[CameraPose, TrainingSnapshot, Anomaly]
-KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly"}
+@dataclass(frozen=True)
+class DeadLetter:
+    """A message the processor could not decode or store, kept for inspection instead of vanishing."""
+    job_id: str                  # from the Kafka key, "unknown" when the message had none
+    ts: float
+    source_topic: str
+    reason: str
+    raw: str                     # first DEAD_LETTER_RAW_CHARS characters of the payload
+
+
+def anomaly_id(job_id: str, source: str, source_seq: int, model: str) -> str:
+    """Deterministic identity of one flagged event: a replayed batch re-sends the same id, so the
+    anomalies topic is at-least-once but deduplicable (it is not exactly-once; see architecture)."""
+    return hashlib.sha1(("%s|%s|%d|%s" % (job_id, source, source_seq, model)).encode()).hexdigest()[:16]
+
+
+Event = Union[CameraPose, TrainingSnapshot, Anomaly, DeadLetter]
+KIND_OF = {CameraPose: "pose", TrainingSnapshot: "training", Anomaly: "anomaly", DeadLetter: "dead_letter"}
 CLASS_OF = {v: k for k, v in KIND_OF.items()}
-TOPIC_OF = {CameraPose: TOPIC_POSES, TrainingSnapshot: TOPIC_TRAINING, Anomaly: TOPIC_ANOMALIES}
+TOPIC_OF = {CameraPose: TOPIC_POSES, TrainingSnapshot: TOPIC_TRAINING, Anomaly: TOPIC_ANOMALIES,
+            DeadLetter: TOPIC_DEAD_LETTER}
 
 # Fields that must be present and finite; anything else optional (row 4).
 _REQUIRED_FINITE = {
     CameraPose: ("ts", "qw", "qx", "qy", "qz", "tx", "ty", "tz", "focal", "confidence"),
     TrainingSnapshot: ("ts", "loss", "gpu_mem_gb"),
     Anomaly: ("ts", "score"),
+    DeadLetter: ("ts",),
 }
 _INT_FIELDS = {"seq", "step", "num_gaussians", "dropped", "source_seq"}
 

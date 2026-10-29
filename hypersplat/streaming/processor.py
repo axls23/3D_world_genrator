@@ -401,6 +401,7 @@ class Processor:
         self.inserted = 0
         self.anomalies = 0
         self.drops = 0
+        self.skipped = {"pose": 0, "training": 0}   # seq at or below the last handled: duplicate or late
 
     # -- state ---------------------------------------------------------------------------------
     def _job(self, job_id: str) -> JobState:
@@ -434,6 +435,27 @@ class Processor:
         st.snaps_loaded = True
 
     # -- events --------------------------------------------------------------------------------
+    def _skip(self, kind: str, job_id: str, seq: int, last: int) -> None:
+        """A replayed duplicate or a late event: harmless to the history (the insert is idempotent and the
+        window is count-based on arrival order), but never silent."""
+        self.skipped[kind] += 1
+        n = self.skipped[kind]
+        if n == 1 or n % 100 == 0:
+            logger.info("[processor] skipped %d %s event(s) at or below the last handled seq; latest %s seq %d <= %d",
+                        n, kind, job_id, seq, last)
+
+    def _dead_letter(self, topic: str, key, value, err: Exception) -> None:
+        """Keep a bounded copy of a bad message on the dead-letter topic. Best effort: it must never fail
+        the batch, so a broken sender only costs the copy (the drop is still counted)."""
+        if self.sender is None:
+            return
+        try:
+            raw = value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
+            self.sender.send(c.DeadLetter(job_id=_job_of_key(key) or "unknown", ts=time.time(), source_topic=topic,
+                                          reason=str(err)[:200], raw=raw[:c.DEAD_LETTER_RAW_CHARS]))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[processor] dead letter not sent: %s", e)
+
     def _drop(self, key, err: Exception, touched: Dict[str, JobUpdate]) -> None:
         self.drops += 1
         job_id = _job_of_key(key)
@@ -446,12 +468,14 @@ class Processor:
 
     def _anomaly(self, ev, kind: str, model: AnomalyModel, row: Dict, reason: str) -> c.Anomaly:
         # ts is the flagged event's own time, so a replayed tail re-sends identical messages.
+        name = model.name if model is not None else "loss_rising"
         return c.Anomaly(job_id=ev.job_id, ts=ev.ts, source=kind, source_seq=ev.seq,
-                         model=model.name if model is not None else "loss_rising",
+                         anomaly_id=c.anomaly_id(ev.job_id, kind, ev.seq, name), model=name,
                          score=row["anomaly_score"], reason=reason, injected=ev.injected)
 
     def _pose(self, st: JobState, p: c.CameraPose, upd: JobUpdate, out: List[c.Anomaly]) -> None:
         if p.seq <= st.last_pose_seq:  # already handled (and committed) by this process
+            self._skip("pose", p.job_id, p.seq, st.last_pose_seq)
             return
         if not st.poses_loaded:
             self._preload_poses(st, p.job_id, p.seq)
@@ -476,6 +500,7 @@ class Processor:
     def _training(self, st: JobState, s: c.TrainingSnapshot, upd: JobUpdate,
                   out: List[c.Anomaly]) -> None:
         if s.seq <= st.last_snap_seq:
+            self._skip("training", s.job_id, s.seq, st.last_snap_seq)
             return
         if not st.snaps_loaded:
             self._preload_snaps(st, s.job_id, s.seq)
@@ -503,6 +528,7 @@ class Processor:
                 raise c.InvalidEvent("%s event on %s" % (c.KIND_OF[type(ev)], topic))
             _check_db_range(ev)
         except c.InvalidEvent as e:
+            self._dead_letter(topic, key, value, e)
             self._drop(key, e, touched)
             return
         st = self._job(ev.job_id)
@@ -564,6 +590,19 @@ def _kafka_consumer(on_rebalance):
     return consumer
 
 
+def consumer_lag(consumer) -> Optional[int]:
+    """Events on the assigned partitions this consumer has not read yet; None when it cannot be told
+    (a lag of 0 must mean caught up, never "unknown")."""
+    try:
+        assigned = list(consumer.assignment())
+        if not assigned:
+            return None
+        end = consumer.end_offsets(assigned)
+        return int(sum(max(0, end[tp] - consumer.position(tp)) for tp in assigned))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _caught_up(consumer) -> bool:
     assigned = consumer.assignment()
     if not assigned:
@@ -604,9 +643,12 @@ def run(once: bool = False, max_seconds: Optional[float] = None, log_every: floa
                            (not consumer.assignment() and now - t0 > ONCE_WAIT_ASSIGN_S)):
                 break
             if now - last_log >= max(log_every, 0.1):
-                logger.info("[processor] %.1f events/s, %d events, %d inserted, %d anomalies, %d drops",
+                out = sender.stats() if sender is not None else {}
+                logger.info("[processor] %.1f events/s, %d events, %d inserted, %d anomalies, %d drops, "
+                            "%d skipped, lag %s, out-queue %s/%s, out-dropped %s",
                             (proc.events - last_events) / (now - last_log), proc.events,
-                            proc.inserted, proc.anomalies, proc.drops)
+                            proc.inserted, proc.anomalies, proc.drops, sum(proc.skipped.values()),
+                            consumer_lag(consumer), out.get("queue_depth"), out.get("queue_max"), out.get("dropped"))
                 last_log, last_events = now, proc.events
             if max_seconds is not None and now - t0 >= max_seconds:
                 break
